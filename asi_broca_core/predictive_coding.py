@@ -1,9 +1,12 @@
 """Predictive-coding style discrepancy between top-down lexical grafts and inputs.
 
-Computes teacher-forcing cross-entropy with Broca lexical priming enabled versus a
-baseline forward pass with grafts disabled. A strictly positive gap means the host
-assigns lower likelihood to the observed tokens when forced toward the substrate
-plan — the scalar surprise signal used by ``BrocaMind``.
+Teacher-forced cross-entropy compares logits from ``lm_head(final_hidden.pre)``
+vs ``lm_head(final_hidden.post)`` in a **single** transformer forward per step
+(when the host returns ``return_cache`` with pre/post graft states). That avoids
+an extra full forward with all grafts disabled.
+
+Falls back to a two-pass graft-on/graft-off loop for hosts without ``lm_head`` or
+cache support.
 """
 
 from __future__ import annotations
@@ -51,6 +54,8 @@ def lexical_plan_cross_entropy_mean(
     total_nll = 0.0
     row = list(prefix_ids)
     graft_cm = model.grafts_enabled(grafts_on) if hasattr(model, "grafts_enabled") else nullcontext()
+    lm_head = getattr(model, "lm_head", None)
+
     with graft_cm:
         for step, tgt in enumerate(target_ids):
             tid = int(tgt)
@@ -60,11 +65,27 @@ def lexical_plan_cross_entropy_mean(
                 extra["broca_plan_token_ids"] = torch.tensor([list(plan_ids)], device=device)
                 extra["broca_step"] = torch.tensor([min(step, max(0, len(plan_ids) - 1))], device=device)
                 extra["tokenizer"] = tokenizer
-            logits = model(batch_ids, mask, extra_state=extra if extra else None)
+
             last_pos = int(mask.long().sum().item()) - 1
-            logp = F.log_softmax(logits[0, last_pos], dim=-1)[tid]
-            total_nll -= float(logp.item())
+
+            if grafts_on and lm_head is not None:
+                out = model(batch_ids, mask, extra_state=extra, return_cache=True)
+                if isinstance(out, tuple):
+                    _, cache = out
+                    h_post = cache.get("final_hidden.post")
+                    if h_post is not None:
+                        dtype = lm_head.weight.dtype
+                        logits_row = lm_head(h_post.to(dtype))[0, last_pos]
+                        total_nll -= float(F.log_softmax(logits_row, dim=-1)[tid])
+                        row.append(tid)
+                        continue
+
+            logits = model(batch_ids, mask, extra_state=extra if extra else None)
+            if isinstance(logits, tuple):
+                logits = logits[0]
+            total_nll -= float(F.log_softmax(logits[0, last_pos], dim=-1)[tid])
             row.append(tid)
+
     return total_nll / float(len(target_ids))
 
 
@@ -77,11 +98,63 @@ def lexical_surprise_gap(
     plan_words: Sequence[str],
     prefix: str | None = None,
 ) -> tuple[float, float, float]:
-    """Returns ``(mean_nll_graft, mean_nll_plain, gap)`` where ``gap = graft - plain``."""
+    """``(mean_nll_graft, mean_nll_plain, gap)`` with ``gap = graft - plain``."""
 
     prefix_ids = tokenizer.encode(prefix if prefix is not None else SPEECH_BRIDGE_PREFIX)
     target_ids = tokenizer.encode(utterance)
     plan_ids = tokenizer.encode_plan_words(list(plan_words))
+
+    if not target_ids:
+        return 0.0, 0.0, 0.0
+
+    device = next(model.parameters()).device
+    pad_id = int(tokenizer.pad_id)
+    row = list(prefix_ids)
+    sum_graft = 0.0
+    sum_plain = 0.0
+    lm_head = getattr(model, "lm_head", None)
+
+    graft_cm = model.grafts_enabled(True) if hasattr(model, "grafts_enabled") else nullcontext()
+    use_dual = True
+    with graft_cm:
+        for step, tgt in enumerate(target_ids):
+            tid = int(tgt)
+            batch_ids, mask = _batch_from_ids([row], pad_id, device=device)
+            extra = {
+                "broca_plan_token_ids": torch.tensor([list(plan_ids)], device=device),
+                "broca_step": torch.tensor([min(step, max(0, len(plan_ids) - 1))], device=device),
+                "tokenizer": tokenizer,
+            }
+            last_pos = int(mask.long().sum().item()) - 1
+
+            if lm_head is None:
+                use_dual = False
+                break
+
+            out = model(batch_ids, mask, extra_state=extra, return_cache=True)
+            if not isinstance(out, tuple):
+                use_dual = False
+                break
+            _, cache = out
+            h_pre = cache.get("final_hidden.pre")
+            h_post = cache.get("final_hidden.post")
+            if h_pre is None or h_post is None:
+                use_dual = False
+                break
+
+            dtype = lm_head.weight.dtype
+            logits_plain = lm_head(h_pre.to(dtype))[0, last_pos]
+            logits_graft = lm_head(h_post.to(dtype))[0, last_pos]
+            sum_plain -= float(F.log_softmax(logits_plain, dim=-1)[tid])
+            sum_graft -= float(F.log_softmax(logits_graft, dim=-1)[tid])
+            row.append(tid)
+
+    if use_dual and len(target_ids) > 0:
+        n = float(len(target_ids))
+        ce_p = sum_plain / n
+        ce_g = sum_graft / n
+        return ce_g, ce_p, float(ce_g - ce_p)
+
     ce_g = lexical_plan_cross_entropy_mean(
         model,
         tokenizer,

@@ -50,7 +50,7 @@ DEFAULT_ARCHITECTURE_EVAL_CASES: tuple[ArchitectureEvalCase, ...] = (
         task_type="active_inference",
         prompt="what action should i take ?",
         expected_answer="listen",
-        expected_speech="i should listen first .",
+        expected_speech="i should listen .",
     ),
     ArchitectureEvalCase(
         id="causal_treatment",

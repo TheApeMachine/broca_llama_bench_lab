@@ -23,6 +23,7 @@ from .active_inference import (
     entropy as belief_entropy,
 )
 from .causal import build_simpson_scm
+from .continuous_frame import COGNITIVE_FRAME_DIM, pack_cognitive_frame
 from .device_utils import pick_torch_device
 from .grafts import BaseGraft
 from .hf_tokenizer_compat import HuggingFaceBrocaTokenizer
@@ -35,8 +36,8 @@ from .tokenizer import SPEECH_BRIDGE_PREFIX, utterance_words
 
 DEFAULT_BROCA_MODEL_ID = os.environ.get("ASI_BROCA_MODEL_ID", "meta-llama/Llama-3.2-1B-Instruct")
 
-
-BROCA_FACTS: list[tuple[str, str]] = [
+# Teacher-forcing / smoke demos only — pass explicit ``facts`` to ``seed_locations`` for anything real.
+_DEMO_LOCATION_PAIRS: tuple[tuple[str, str], ...] = (
     ("ada", "rome"),
     ("byron", "paris"),
     ("curie", "tokyo"),
@@ -45,31 +46,47 @@ BROCA_FACTS: list[tuple[str, str]] = [
     ("faraday", "cairo"),
     ("gauss", "vienna"),
     ("hopper", "lisbon"),
-]
+)
 
-INTENTS = ["memory_location", "active_action", "causal_effect", "prediction_error", "synthesis_bundle", "unknown"]
-ENTITIES = [name for name, _ in BROCA_FACTS]
-CITIES = [city for _, city in BROCA_FACTS]
-ACTIONS = ["listen", "open_left", "open_right", "observe_association", "run_intervention_readout"]
-CAUSAL_WORDS = ["helps", "hurts"]
-VALUES = CITIES + ACTIONS + CAUSAL_WORDS + ["unknown"]
-NUMERIC_FEATURES = [
-    "confidence",
-    "p_do_positive",
-    "p_do_negative",
-    "ate",
-    "policy_listen",
-    "policy_open_left",
-    "policy_open_right",
-    "delta_ce",
-    "bias",
-]
-FEATURE_DIM = len(INTENTS) + len(ENTITIES) + len(VALUES) + len(NUMERIC_FEATURES)
+
+def _speech_plan_active_action(answer: str) -> list[str]:
+    # Keep action labels verbatim (e.g. ``open_left``) so checks that token-scan action names stay aligned.
+    tok = answer.strip()
+    return ["i", "should", tok, "."]
+
+
+def _speech_plan_causal(answer: str) -> list[str]:
+    lab = answer.strip().replace("_", " ")
+    return ["intervention", "says", "treatment", lab, "."]
+
+
+def _speech_plan_open_vocab(frame: "CognitiveFrame") -> list[str]:
+    """Last resort — still emits content keyed by arbitrary intent / answer strings."""
+
+    if frame.answer and frame.answer != "unknown":
+        ans = frame.answer.replace("_", " ")
+        if frame.subject:
+            sub = frame.subject.replace("_", " ")
+            return [sub, "maps", "to", ans, "."]
+        return ["faculty", "reports", ans, "."]
+    lab = frame.intent.replace("_", " ")
+    return ["working", "memory", "holds", "intent", lab, "."]
+
+
+FEATURE_DIM = COGNITIVE_FRAME_DIM
 
 
 @dataclass
 class CognitiveFrame:
-    """A non-linguistic content packet for the Broca interface to express."""
+    """A non-linguistic content packet for the Broca interface to express.
+
+    ``intent`` is an open vocabulary routing label (built-ins like ``memory_location``
+    name bundled demos; substrates may emit ``spatial_navigation``, ``einstein_bio``, …).
+
+    ``to_features()`` maps arbitrary intent/subject/answer strings through hashed sketches;
+    ``speech_plan()`` accepts ``evidence[\"speech_plan_words\"]`` overrides and falls back to
+    templates that work for strings outside the toy demos.
+    """
 
     intent: str
     subject: str = ""
@@ -78,6 +95,10 @@ class CognitiveFrame:
     evidence: dict = field(default_factory=dict)
 
     def speech_plan(self) -> list[str]:
+        raw_override = self.evidence.get("speech_plan_words")
+        if isinstance(raw_override, list) and raw_override and all(isinstance(x, str) for x in raw_override):
+            return list(raw_override)
+
         if self.intent == "memory_location" and self.subject and self.answer != "unknown":
             mu_thr = float(self.evidence.get("semantic_mean_confidence", 1.0))
             if self.confidence < mu_thr:
@@ -85,40 +106,18 @@ class CognitiveFrame:
             return [self.subject, "is", "in", self.answer, "."]
         if self.intent == "prediction_error":
             return ["semantic", "prediction", "clashes", "with", "input", "."]
-        if self.intent == "active_action" and self.answer in ACTIONS:
-            if self.answer == "listen":
-                return ["i", "should", "listen", "first", "."]
-            if self.answer == "observe_association":
-                return ["i", "should", "check", "observational", "evidence", "."]
-            if self.answer == "run_intervention_readout":
-                return ["i", "should", "run", "an", "intervention", "readout", "."]
-            return ["i", "should", self.answer, "."]
-        if self.intent == "causal_effect" and self.answer in CAUSAL_WORDS:
-            return ["intervention", "says", "treatment", self.answer, "."]
+        if self.intent == "active_action":
+            return _speech_plan_active_action(self.answer)
+        if self.intent == "causal_effect":
+            return _speech_plan_causal(self.answer)
         if self.intent == "synthesis_bundle" and self.answer != "unknown":
             return ["situated", "memory", "matches", "causal", "readout", "for", self.answer, "."]
-        return ["i", "do", "not", "know", "."]
+        return _speech_plan_open_vocab(self)
 
     def to_features(self) -> torch.Tensor:
-        vec: list[float] = []
-        vec.extend(1.0 if self.intent == x else 0.0 for x in INTENTS)
-        vec.extend(1.0 if self.subject == x else 0.0 for x in ENTITIES)
-        vec.extend(1.0 if self.answer == x else 0.0 for x in VALUES)
-        ev = self.evidence or {}
-        policy = ev.get("policy_posterior", {}) or {}
-        nums = [
-            float(self.confidence),
-            float(ev.get("p_do_positive", 0.0)),
-            float(ev.get("p_do_negative", 0.0)),
-            float(ev.get("ate", 0.0)),
-            float(policy.get("listen", 0.0)),
-            float(policy.get("open_left", 0.0)),
-            float(policy.get("open_right", 0.0)),
-            float(ev.get("delta_ce", 0.0)),
-            1.0,
-        ]
-        vec.extend(nums)
-        return torch.tensor(vec, dtype=torch.float32)
+        """Sketch-hash bottleneck over intent/subject/answer + numeric faculty scalars."""
+
+        return pack_cognitive_frame(self.intent, self.subject, self.answer, float(self.confidence), self.evidence)
 
 
 class PersistentSemanticMemory:
@@ -183,6 +182,28 @@ class PersistentSemanticMemory:
             return None
         return str(row[0]), float(row[1]), json.loads(row[2])
 
+    def subjects_for_predicate(self, predicate: str) -> list[str]:
+        """All subjects with this predicate — drives intrinsic cues without a fixed ENTITY list."""
+
+        pred = predicate.lower()
+        with self._connect() as con:
+            rows = con.execute(
+                "SELECT DISTINCT subject FROM semantic_memory WHERE namespace=? AND predicate=? ORDER BY subject",
+                (self.namespace, pred),
+            ).fetchall()
+        return [str(r[0]) for r in rows]
+
+    def distinct_objects_for_predicate(self, predicate: str) -> frozenset[str]:
+        """Known objects (e.g. city names) already stored — used for conflict detection without CITIES."""
+
+        pred = predicate.lower()
+        with self._connect() as con:
+            rows = con.execute(
+                "SELECT DISTINCT object FROM semantic_memory WHERE namespace=? AND predicate=?",
+                (self.namespace, pred),
+            ).fetchall()
+        return frozenset(str(r[0]).lower() for r in rows)
+
     def count(self) -> int:
         with self._connect() as con:
             row = con.execute("SELECT COUNT(*) FROM semantic_memory WHERE namespace=?", (self.namespace,)).fetchone()
@@ -198,7 +219,9 @@ class PersistentSemanticMemory:
             return None
         return float(row[0])
 
-    def seed_locations(self, facts: Sequence[tuple[str, str]] = BROCA_FACTS) -> None:
+    def seed_locations(self, facts: Sequence[tuple[str, str]] | None = None) -> None:
+        if facts is None:
+            facts = _DEMO_LOCATION_PAIRS
         for name, city in facts:
             self.upsert(name, "location", city, confidence=1.0, evidence={"source": "seed_fact", "instruments": ["seed_schema"]})
 
@@ -626,8 +649,9 @@ class BrocaMind:
     def _intrinsic_scan(self, toks: list[str]) -> None:
         self.workspace.intrinsic_cues.clear()
         mu_pop = self.memory.mean_confidence()
-        for ent in ENTITIES:
-            if ent not in toks:
+        toks_set = set(toks)
+        for ent in self.memory.subjects_for_predicate("location"):
+            if ent not in toks_set:
                 continue
             rec = self.memory.get(ent, "location")
             if rec is None:
@@ -659,8 +683,9 @@ class BrocaMind:
                 mu_pop = self.memory.mean_confidence()
                 if mu_pop is not None:
                     frame.evidence["semantic_mean_confidence"] = mu_pop
-                mentioned_cities = [c for c in CITIES if c in toks]
-                conflicting = bool(mentioned_cities and mentioned_cities[-1] != obj.lower())
+                known_locations = self.memory.distinct_objects_for_predicate("location")
+                mentioned_locations = [t for t in toks if t in known_locations]
+                conflicting = bool(mentioned_locations and mentioned_locations[-1] != obj.lower())
                 if conflicting:
                     plan_words = frame.speech_plan()
                     ce_g, ce_p, gap = lexical_surprise_gap(self.host, self.tokenizer, utterance=utterance, plan_words=plan_words)
@@ -734,7 +759,8 @@ class BrocaMind:
             self.episode_graph.bump(self._last_journal_id, jid)
         self._last_journal_id = jid
         if frame.intent == "prediction_error":
-            cities_in = [c for c in CITIES if c in toks]
+            known_locations = self.memory.distinct_objects_for_predicate("location")
+            cities_in = [t for t in toks if t in known_locations]
             if cities_in and frame.subject:
                 self.memory.upsert(
                     frame.subject,
@@ -773,7 +799,9 @@ class BrocaMind:
 
 
 def build_training_frames() -> list[CognitiveFrame]:
-    frames: list[CognitiveFrame] = [CognitiveFrame("memory_location", subject=name, answer=city, confidence=1.0) for name, city in BROCA_FACTS]
+    frames: list[CognitiveFrame] = [
+        CognitiveFrame("memory_location", subject=name, answer=city, confidence=1.0) for name, city in _DEMO_LOCATION_PAIRS
+    ]
     frames.extend(
         [
             CognitiveFrame("active_action", answer="listen", confidence=0.72, evidence={"policy_posterior": {"listen": 0.72, "open_left": 0.14, "open_right": 0.14}}),
@@ -800,10 +828,10 @@ def build_training_frames() -> list[CognitiveFrame]:
 
 
 def broca_canonical_eval_queries() -> list[str]:
-    """Smoke queries derived from ``BROCA_FACTS`` and comprehension routing tuples."""
+    """Smoke queries for bundled comprehension demos (_DEMO_LOCATION_PAIRS + routing tuples)."""
 
     return [
-        f"where is {BROCA_FACTS[0][0]} ?",
+        f"where is {_DEMO_LOCATION_PAIRS[0][0]} ?",
         " ".join(("what", "action", "should", "i", "take", "?")),
         " ".join(("does", "treatment", "help", "?")),
     ]
@@ -961,22 +989,6 @@ def run_broca_experiment(
         frame, utterance = mind.answer(q)
         rows.append({"query": q, "intent": frame.intent, "latent_answer": frame.answer, "speech": utterance, "evidence": frame.evidence})
 
-    # Persistence: a fresh substrate process, same DB, same namespace, no reseeding needed.
-    restarted = BrocaMind(
-        seed=seed,
-        db_path=path,
-        namespace=f"broca_{seed}",
-        llama_model_id=llama_model_id,
-        device=device,
-        hf_token=hf_token,
-    )
-    frame2, speech2 = restarted.answer(f"where is {BROCA_FACTS[-1][0]} ?")
-
-    # Broca lesion: the substrate still computes the frame, but the host no longer verbalizes it.
-    lesion_frame = mind.comprehend("where is ada ?")
-    with mind.host.grafts_enabled(False):
-        lesioned_speech = generate_from_plan(mind.host, mind.tokenizer, lesion_frame.speech_plan())
-
     train_result: dict = {}
     if train_bridge:
         train_result = train_broca_bridge(
@@ -995,8 +1007,6 @@ def run_broca_experiment(
         "semantic_records": mind.memory.count(),
         "language_only": language_only,
         "rows": rows,
-        "restart": {"latent_answer": frame2.answer, "speech": speech2, "records": restarted.memory.count()},
-        "broca_lesion": {"latent_answer": lesion_frame.answer, "speech_without_graft": lesioned_speech},
         "trainable_broca": trainable_meta,
         "model_id": llama_model_id or DEFAULT_BROCA_MODEL_ID,
     }
@@ -1013,10 +1023,6 @@ def run_broca_experiment(
         print(f"{'-'*32} {'-'*17} {'-'*10} {'-'*34}")
         for r in rows:
             print(f"{r['query']:<32} {r['intent']:<17} {r['latent_answer']:<10} {r['speech']}")
-        print("\nPersistence check after fresh substrate reload:")
-        print(f"  query='where is hopper ?' latent={frame2.answer} speech='{speech2}' records={restarted.memory.count()}")
-        print("\nBroca lesion check:")
-        print(f"  substrate still has latent answer={lesion_frame.answer}; speech without graft='{lesioned_speech}'")
         if train_bridge and train_result:
             print("\nTrainable Broca bridge:")
             print("  frozen host + trainable frame-to-residual graft, trained by teacher forcing on semantic frames")

@@ -1,2 +1,9 @@
 /.pytest_cache
 /.venv
+
+# Local persistence & benchmarks (paths printed by demos / BrocaMind / Makefile).
+runs/*
+!runs/.gitkeep
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal

@@ -18,6 +18,7 @@ from .llama_broca_host import LlamaBrocaHost, load_llama_broca_host
 from .memory import SQLiteActivationMemory
 from .substrate_graph import EpisodeAssociationGraph, merge_epistemic_evidence_dict
 from .tokenizer import SPEECH_BRIDGE_PREFIX, utterance_words
+from .continuous_frame import COGNITIVE_FRAME_DIM, pack_cognitive_frame, stable_sketch
 
 __all__ = [
     "ActiveInferenceAgent",
@@ -52,6 +53,9 @@ __all__ = [
     "pick_torch_device",
     "SPEECH_BRIDGE_PREFIX",
     "utterance_words",
+    "COGNITIVE_FRAME_DIM",
+    "pack_cognitive_frame",
+    "stable_sketch",
 ]
 
 

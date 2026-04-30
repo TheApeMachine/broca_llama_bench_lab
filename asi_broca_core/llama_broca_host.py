@@ -68,6 +68,7 @@ class LlamaBrocaHost(nn.Module):
         self._active_state: dict[str, Any] | None = None
         self._active_cache: Optional[Dict[str, torch.Tensor]] = None
         self._hook_handles: dict[int, Any] = {}
+        self.graft_mixer_tau: float = 1.0
 
     @staticmethod
     def layer_post_slot(layer_idx: int) -> str:
@@ -230,9 +231,21 @@ class LlamaBrocaHost(nn.Module):
         if cache is not None:
             cache[f"{slot}.pre"] = x.detach().clone()
         key = self._slot_key(slot)
+        x0 = x
         if self._grafts_enabled and key in self.grafts:
-            for graft in self.grafts[key]:
-                x = graft(x, state)
+            mods = list(self.grafts[key])
+            if len(mods) == 1:
+                x = mods[0](x0, state)
+            elif len(mods) > 1:
+                deltas: list[torch.Tensor] = []
+                for graft in mods:
+                    deltas.append(graft(x0, state) - x0)
+                stacked = torch.stack(deltas, dim=0)
+                tau = float(state.get("graft_mixer_tau", getattr(self, "graft_mixer_tau", 1.0)))
+                tau = max(tau, 1e-6)
+                scores = -stacked.detach().pow(2).mean(dim=(1, 2, 3))
+                w = torch.softmax(scores / tau, dim=0).view(-1, 1, 1, 1)
+                x = x0 + (w * stacked).sum(dim=0)
         if cache is not None:
             cache[f"{slot}.post"] = x.detach().clone()
         return x

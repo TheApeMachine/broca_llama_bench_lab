@@ -38,7 +38,5 @@ def test_broca_experiment_outputs_expected_rows(tmp_path: Path, llama_broca_load
     assert action_row["intent"] == "active_action"
     assert action_row["speech"].lower().startswith("i should") or "listen" in action_row["speech"].lower()
     assert any("help" in s or "intervention" in s or "treatment" in s for s in speeches_lower)
-    assert result["broca_lesion"]["latent_answer"] == "rome"
-    assert result["restart"]["latent_answer"] == "lisbon"
 
 

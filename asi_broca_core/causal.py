@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import itertools
 import math
+import random
 from dataclasses import dataclass, field
 from typing import Callable, Iterable, Mapping, Sequence
 
@@ -24,6 +25,10 @@ class FiniteSCM:
     deterministic functions of their parents and exogenous noise. Interventions
     replace structural equations with constants; counterfactuals are computed by
     abduction over exogenous worlds, action, then prediction.
+
+    Exact queries iterate over **all** exogenous worlds via ``itertools.product``.
+    That is tractable only for toy cardinalities (see ``exogenous_world_volume``).
+    For larger discrete models use ``probability_monte_carlo`` / sampled counterfactuals.
     """
 
     domains: dict[str, tuple]
@@ -109,6 +114,49 @@ class FiniteSCM:
             return 0.0
         return num / den
 
+    @property
+    def exogenous_world_volume(self) -> int:
+        """Product of exogenous domain sizes — enumeration cost scales with this."""
+
+        vol = 1
+        for name in self.exogenous:
+            vol *= len(self.exogenous[name])
+        return vol
+
+    def probability_monte_carlo(
+        self,
+        event: Mapping[str, object],
+        *,
+        given: Mapping[str, object] | None = None,
+        interventions: Mapping[str, object] | None = None,
+        n_samples: int = 10_000,
+        seed: int = 0,
+    ) -> float:
+        """Monte Carlo estimate of conditional ``P(event | given, do(interventions))``.
+
+        Samples exogenous worlds from the factorized prior; keeps draws that satisfy
+        ``given``. Rare conditioning sets inflate variance — increase ``n_samples``.
+        """
+
+        rng = random.Random(int(seed))
+        given_d = dict(given or {})
+        num = 0
+        den = 0
+        for _ in range(max(1, int(n_samples))):
+            world: dict[str, object] = {}
+            for name in self.exogenous:
+                dom = list(self.exogenous[name].keys())
+                weights = [float(self.exogenous[name][x]) for x in dom]
+                world[name] = rng.choices(dom, weights=weights, k=1)[0]
+            vals = self.evaluate_world(world, interventions)
+            if all(vals.get(k) == v for k, v in given_d.items()):
+                den += 1
+                if all(vals.get(k) == v for k, v in event.items()):
+                    num += 1
+        if den <= 0:
+            return 0.0
+        return num / den
+
     def distribution(self, variables: Sequence[str], *, given: Mapping[str, object] | None = None, interventions: Mapping[str, object] | None = None) -> dict[tuple, float]:
         out: dict[tuple, float] = {}
         den = 0.0
@@ -130,6 +178,8 @@ class FiniteSCM:
         evidence: Mapping[str, object],
         interventions: Mapping[str, object],
     ) -> float:
+        """Exact counterfactual probability — enumerates **all** exogenous worlds."""
+
         num = 0.0
         den = 0.0
         for exo, p in self._exogenous_worlds():
