@@ -118,20 +118,26 @@ def run_broca_architecture_eval(
     output_path: str | Path | None = None,
     cases: Sequence[ArchitectureEvalCase] = DEFAULT_ARCHITECTURE_EVAL_CASES,
 ) -> dict[str, Any]:
-    """Run a direct scored comparison between bare host and Broca architecture."""
+    """Run a direct scored comparison between bare host and Broca architecture.
+
+    Each case uses a new ``BrocaMind`` so ``setup_prompts`` and semantic state
+    do not carry over across cases within this run.
+    """
 
     mid = llama_model_id or os.environ.get("ASI_BROCA_MODEL_ID", "meta-llama/Llama-3.2-1B-Instruct")
-    mind = BrocaMind(
-        seed=seed,
-        db_path=db_path,
-        namespace=f"architecture_eval_{seed}",
-        llama_model_id=mid,
-        device=device,
-        hf_token=hf_token,
-    )
 
     rows: list[dict[str, Any]] = []
+    graft_report = ""
     for case in cases:
+        mind = BrocaMind(
+            seed=seed,
+            db_path=db_path,
+            namespace=f"architecture_eval_{seed}_{case.id}",
+            llama_model_id=mid,
+            device=device,
+            hf_token=hf_token,
+        )
+        graft_report = mind.host.graft_report()
         for setup in case.setup_prompts:
             mind.comprehend(setup)
         max_new_tokens = _encode_len(mind.tokenizer, case.expected_speech)
@@ -186,13 +192,14 @@ def run_broca_architecture_eval(
         "description": (
             "Direct scored comparison: bare frozen language host vs BrocaMind with semantic memory, "
             "active inference, causal substrate, workspace frames, and residual-stream graft verbalization. "
-            "Semantic-memory cases must provide their own setup_prompts; no facts are seeded by default."
+            "Semantic-memory cases must provide their own setup_prompts; no facts are seeded by default. "
+            "Each evaluation case uses a fresh BrocaMind instance, so setup_prompts and memory do not persist across cases."
         ),
         "model_id": mid,
         "device": device,
         "seed": seed,
         "primary_metric": "speech_exact_accuracy",
-        "graft_report": mind.host.graft_report(),
+        "graft_report": graft_report,
         "cases": rows,
         "metrics": {
             "baseline_bare_language_host": {

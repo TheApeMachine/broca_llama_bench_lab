@@ -37,6 +37,11 @@ def test_frozen_subword_projector_preserves_embedding_geometry():
     near_b = f"{near_a}_variant"
     far = _symbol("far")
     tok = RegexTokenizer.fit([f"{near_a} {near_b} {far}"])
+    missing = [sym for sym in (near_a, near_b, far) if sym not in tok.token_to_id]
+    assert not missing, (
+        f"RegexTokenizer.fit must include tokens {near_a!r}, {near_b!r}, {far!r}; missing={missing}; "
+        "check RegexTokenizer.fit and tok.token_to_id"
+    )
     weight = torch.zeros((len(tok), 6), dtype=torch.float32)
     near_a_id = tok.token_to_id[near_a]
     near_b_id = tok.token_to_id[near_b]

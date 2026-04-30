@@ -22,7 +22,7 @@ def speech_seed_ids(tokenizer, prefix: str | None = None) -> list[int]:
 
     if prefix is not None:
         return list(tokenizer.encode(prefix))
-    enc = getattr(tokenizer, "encode")
+    enc = tokenizer.encode
     try:
         ids = list(enc("", add_bos=True))
     except TypeError:

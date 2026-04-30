@@ -12,6 +12,27 @@ from asi_broca_core.memory import SQLiteActivationMemory
 from asi_broca_core.substrate_graph import EpisodeAssociationGraph, merge_epistemic_evidence_dict
 
 
+class FakeHost:
+    cfg = types.SimpleNamespace(d_model=8)
+
+    def __init__(self, track_grafts: bool = False):
+        self.grafts: list | None = [] if track_grafts else None
+
+    def add_graft(self, slot, graft):
+        if self.grafts is not None:
+            self.grafts.append((slot, graft))
+
+
+@pytest.fixture
+def fake_host_loader(monkeypatch: pytest.MonkeyPatch):
+    def _make(track_grafts: bool = False) -> FakeHost:
+        host = FakeHost(track_grafts=track_grafts)
+        monkeypatch.setattr(broca_mod, "load_llama_broca_host", lambda *args, **kwargs: (host, object()))
+        return host
+
+    return _make
+
+
 def _symbol(prefix: str) -> str:
     return f"{prefix}_{uuid.uuid4().hex[:10]}"
 
@@ -34,7 +55,7 @@ def test_workspace_journal_fetch_roundtrip(tmp_path: Path, llama_broca_loaded: N
     mind.answer(f"where is {subject} ?")
     row = mind.journal.fetch(2)
     assert row is not None
-    assert row["intent"] == "memory_location"
+    assert row["intent"] == "memory_lookup"
     replay = mind.retrieve_episode(2)
     assert replay.answer == obj
     assert replay.evidence.get("retrieved_episode_id") == 2
@@ -65,14 +86,8 @@ def test_runtime_mind_creates_sqlite_before_model_load_failure(tmp_path: Path, m
     assert WorkspaceJournal(db).count() == 0
 
 
-def test_runtime_mind_starts_empty_and_learns_observed_location(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
-    class FakeHost:
-        cfg = types.SimpleNamespace(d_model=8)
-
-        def add_graft(self, slot, graft):
-            return None
-
-    monkeypatch.setattr(broca_mod, "load_llama_broca_host", lambda *args, **kwargs: (FakeHost(), object()))
+def test_runtime_mind_starts_empty_and_learns_observed_location(tmp_path: Path, fake_host_loader):
+    fake_host_loader(track_grafts=False)
     db = tmp_path / "learn.sqlite"
     subject = _symbol("subject")
     obj = _symbol("object")
@@ -83,26 +98,18 @@ def test_runtime_mind_starts_empty_and_learns_observed_location(tmp_path: Path, 
 
     learned = mind.comprehend(f"{subject} is in {obj} .")
     assert learned.intent == "memory_write"
+    pred = learned.evidence["predicate"]
     assert mind.memory.count() == 1
     assert mind.comprehend(f"where is {subject} ?").answer == obj
 
     restarted = BrocaMind(seed=0, db_path=db, namespace="runtime")
     assert restarted.memory.count() == 1
     assert restarted.comprehend(f"where is {subject} ?").answer == obj
+    assert pred == learned.evidence["predicate"]
 
 
-def test_runtime_mind_routes_faculties_and_installs_feature_graft(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
-    class FakeHost:
-        cfg = types.SimpleNamespace(d_model=8)
-
-        def __init__(self):
-            self.grafts = []
-
-        def add_graft(self, slot, graft):
-            self.grafts.append((slot, graft))
-
-    host = FakeHost()
-    monkeypatch.setattr(broca_mod, "load_llama_broca_host", lambda *args, **kwargs: (host, object()))
+def test_runtime_mind_routes_faculties_and_installs_feature_graft(tmp_path: Path, fake_host_loader):
+    host = fake_host_loader(track_grafts=True)
     mind = BrocaMind(seed=0, db_path=tmp_path / "router.sqlite", namespace="runtime")
 
     assert any(isinstance(graft, TrainableBrocaGraft) for _, graft in host.grafts)
@@ -110,14 +117,8 @@ def test_runtime_mind_routes_faculties_and_installs_feature_graft(tmp_path: Path
     assert mind.comprehend("does treatment help ?").intent == "causal_effect"
 
 
-def test_observed_contradiction_records_counterfactual_without_overwrite(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
-    class FakeHost:
-        cfg = types.SimpleNamespace(d_model=8)
-
-        def add_graft(self, slot, graft):
-            return None
-
-    monkeypatch.setattr(broca_mod, "load_llama_broca_host", lambda *args, **kwargs: (FakeHost(), object()))
+def test_observed_contradiction_records_counterfactual_without_overwrite(tmp_path: Path, fake_host_loader):
+    fake_host_loader(track_grafts=False)
     mind = BrocaMind(seed=0, db_path=tmp_path / "conflict.sqlite", namespace="runtime")
     subject = _symbol("subject")
     current = _symbol("object")
@@ -131,18 +132,12 @@ def test_observed_contradiction_records_counterfactual_without_overwrite(tmp_pat
     assert conflict.evidence["claimed_answer"] == challenger
     assert conflict.evidence["counterfactual"]["would_change_answer_to"] == challenger
     assert mind.comprehend(f"where is {subject} ?").answer == current
-    statuses = [c["status"] for c in mind.memory.claims(subject, "location")]
+    statuses = [c["status"] for c in mind.memory.claims(subject, conflict.evidence["predicate"])]
     assert statuses == ["accepted", "conflict"]
 
 
-def test_background_consolidation_revises_after_repeated_counterevidence(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
-    class FakeHost:
-        cfg = types.SimpleNamespace(d_model=8)
-
-        def add_graft(self, slot, graft):
-            return None
-
-    monkeypatch.setattr(broca_mod, "load_llama_broca_host", lambda *args, **kwargs: (FakeHost(), object()))
+def test_background_consolidation_revises_after_repeated_counterevidence(tmp_path: Path, fake_host_loader):
+    fake_host_loader(track_grafts=False)
     mind = BrocaMind(seed=0, db_path=tmp_path / "consolidate.sqlite", namespace="runtime")
     subject = _symbol("subject")
     current = _symbol("object")
@@ -162,14 +157,8 @@ def test_background_consolidation_revises_after_repeated_counterevidence(tmp_pat
     assert stored_reflections[-1]["evidence"]["candidate_object"] == challenger
 
 
-def test_background_worker_start_stop(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
-    class FakeHost:
-        cfg = types.SimpleNamespace(d_model=8)
-
-        def add_graft(self, slot, graft):
-            return None
-
-    monkeypatch.setattr(broca_mod, "load_llama_broca_host", lambda *args, **kwargs: (FakeHost(), object()))
+def test_background_worker_start_stop(tmp_path: Path, fake_host_loader):
+    fake_host_loader(track_grafts=False)
     mind = BrocaMind(seed=0, db_path=tmp_path / "worker.sqlite", namespace="runtime")
 
     worker = mind.start_background(interval_s=60.0)

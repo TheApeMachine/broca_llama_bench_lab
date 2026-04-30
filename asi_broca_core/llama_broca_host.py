@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import contextlib
 import os
+import threading
 import types
 from typing import Any, Dict, Iterator, Optional
 
@@ -72,6 +73,8 @@ class LlamaBrocaHost(nn.Module):
         self.graft_mixer_max_delta_rms_ratio: float = 8.0
         self.graft_mixer_max_delta_rms_floor: float = 10.0
         self.last_graft_mix: dict[str, Any] = {}
+        self.enable_last_graft_mix_diagnostics: bool = False
+        self._last_graft_mix_lock = threading.Lock()
 
     @staticmethod
     def layer_post_slot(layer_idx: int) -> str:
@@ -255,15 +258,18 @@ class LlamaBrocaHost(nn.Module):
         base_rms = x0.detach().pow(2).mean().sqrt()
         ratio = float(state.get("graft_mixer_max_delta_rms_ratio", self.graft_mixer_max_delta_rms_ratio))
         floor = float(state.get("graft_mixer_max_delta_rms_floor", self.graft_mixer_max_delta_rms_floor))
-        cap = torch.maximum(base_rms * max(ratio, 0.0), torch.tensor(max(floor, 1e-6), device=x0.device, dtype=base_rms.dtype))
+        cap = (base_rms * max(ratio, 0.0)).clamp_min(max(floor, 1e-6))
         scale = torch.clamp(cap / mixed_rms.clamp_min(1e-12), max=1.0).to(dtype=mixed.dtype)
         mixed = mixed * scale
-        self.last_graft_mix[slot] = {
-            "weights": weights.detach().cpu(),
-            "scores": scores.detach().cpu(),
-            "delta_rms": delta_rms.detach().cpu(),
-            "scale": float(scale.detach().cpu()),
-        }
+        if self.enable_last_graft_mix_diagnostics:
+            snapshot = {
+                "weights": weights.detach().cpu(),
+                "scores": scores.detach().cpu(),
+                "delta_rms": delta_rms.detach().cpu(),
+                "scale": float(scale.detach().cpu()),
+            }
+            with self._last_graft_mix_lock:
+                self.last_graft_mix[slot] = snapshot
         return x0 + mixed
 
     def _apply_grafts(self, slot: str, x: torch.Tensor, state: dict, cache: Optional[Dict[str, torch.Tensor]]) -> torch.Tensor:

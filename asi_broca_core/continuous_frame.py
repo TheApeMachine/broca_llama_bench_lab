@@ -127,7 +127,7 @@ class FrozenSubwordProjector:
     ) -> None:
         self.tokenizer = tokenizer
         self.dim = int(dim)
-        weight = embedding_weight.detach()
+        weight = embedding_weight.detach().clone()
         self.embedding_weight = weight
         g = torch.Generator(device="cpu")
         g.manual_seed(int(seed))

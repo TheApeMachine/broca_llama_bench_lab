@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import itertools
+import logging
 import math
 import random
 from dataclasses import dataclass, field
@@ -8,6 +9,8 @@ from typing import Callable, Iterable, Mapping, Sequence
 
 
 _EPS = 1e-12
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -35,6 +38,7 @@ class FiniteSCM:
     exogenous: dict[str, dict[object, float]] = field(default_factory=dict)
     equations: dict[str, EndogenousEquation] = field(default_factory=dict)
     order: list[str] = field(default_factory=list)
+    labels: dict[str, str] = field(default_factory=dict)
 
     def add_exogenous(self, name: str, domain: Sequence, probs: Mapping[object, float] | None = None) -> None:
         dom = tuple(domain)
@@ -248,12 +252,13 @@ class FiniteSCM:
 
         rng = random.Random(int(seed))
         evidence_d = dict(evidence)
+        query_event_d = dict(query_event)
         num = 0
         den = 0
         draws = 0
         draw_budget = max(1, int(n_samples))
         accept_target = int(min_accepted) if min_accepted is not None else max(32, int(math.sqrt(float(draw_budget))))
-        draw_limit = int(max_draws) if max_draws is not None else max(draw_budget, draw_budget * 20)
+        draw_limit = int(max_draws) if max_draws is not None else draw_budget * 20
         while draws < draw_limit and (draws < draw_budget or den < accept_target):
             draws += 1
             exo = self._sample_exogenous_world(rng)
@@ -262,9 +267,15 @@ class FiniteSCM:
                 continue
             den += 1
             cf = self.evaluate_world(exo, interventions=interventions)
-            if all(cf.get(k) == v for k, v in query_event.items()):
+            if all(cf.get(k) == v for k, v in query_event_d.items()):
                 num += 1
         if den <= 0:
+            logger.warning(
+                "counterfactual_probability_monte_carlo: no samples matched evidence after %s draws (limit=%s); "
+                "returning 0.0. Consider increasing max_draws or n_samples if this is unexpected.",
+                draws,
+                draw_limit,
+            )
             return 0.0
         return num / den
 
@@ -447,6 +458,14 @@ class FiniteSCM:
 
 def build_simpson_scm() -> FiniteSCM:
     scm = FiniteSCM(domains={})
+    scm.labels.update(
+        {
+            "T": "treatment",
+            "Y": "outcome",
+            "positive_effect": "helps",
+            "negative_effect": "hurts",
+        }
+    )
     scm.add_exogenous("U_S", [0, 1], {0: 0.5, 1: 0.5})
     scm.add_exogenous("U_T", range(100))
     scm.add_exogenous("U_Y", range(100))

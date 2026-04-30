@@ -199,8 +199,9 @@ def main() -> None:
         if args.no_background:
             print("Background consolidation: off", flush=True)
         else:
-            mind.start_background(interval_s=args.background_interval)
-            print(f"Background consolidation: every {max(0.1, float(args.background_interval)):.1f}s", flush=True)
+            validated_interval = max(0.1, float(args.background_interval))
+            mind.start_background(interval_s=validated_interval)
+            print(f"Background consolidation: every {validated_interval:.1f}s", flush=True)
         if args.system:
             print("(Note: --system applies only to vanilla HF chat mode, not --broca routing.)", flush=True)
         print("Substrate comprehension uses your raw text. Teach facts first, then ask about them.", flush=True)
@@ -226,14 +227,18 @@ def main() -> None:
                 print(f"[substrate intent={frame.intent} latent={frame.answer}]", flush=True)
                 sys.stdout.write("Assistant> ")
                 sys.stdout.flush()
-                stream_broca_plan_tokens(
-                    mind.host,
-                    mind.tokenizer,
-                    plan,
-                    device=dev,
-                    max_new_tokens=args.max_new_tokens,
-                    broca_features=frame.to_features(mind.text_encoder),
-                )
+                try:
+                    stream_broca_plan_tokens(
+                        mind.host,
+                        mind.tokenizer,
+                        plan,
+                        device=dev,
+                        max_new_tokens=args.max_new_tokens,
+                        broca_features=frame.to_features(mind.text_encoder),
+                    )
+                except KeyboardInterrupt:
+                    sys.stdout.write("\n[generation interrupted]\n")
+                    sys.stdout.flush()
         finally:
             mind.stop_background()
 

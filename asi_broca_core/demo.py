@@ -40,8 +40,12 @@ def main() -> None:
             device=args.broca_device,
             output_path=out / "broca_architecture_eval.json",
         )
-        metrics = result["metrics"]
-        enhanced = metrics["enhanced_broca_architecture"]
+        metrics = result.get("metrics")
+        if not isinstance(metrics, dict):
+            raise KeyError("run_broca_architecture_eval result missing 'metrics' mapping")
+        enhanced = metrics.get("enhanced_broca_architecture")
+        if not isinstance(enhanced, dict):
+            raise KeyError("metrics missing 'enhanced_broca_architecture'")
         print("\n=== Broca architecture benchmark ===")
         print(f"results={out / 'broca_architecture_eval.json'}")
         print(f"enhanced speech_exact_accuracy={enhanced['speech_exact_accuracy']:.3f}")

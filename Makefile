@@ -7,7 +7,7 @@
 
 PYTHON ?= python3
 
-# Extra CLI args (e.g. `make chat CHAT_ARGS="--device cpu"`)
+# Extra CLI args for `make chat` (Broca/substrate is already enabled; e.g. CHAT_ARGS="--device cpu")
 CHAT_ARGS ?=
 # Append to the default bench invocation (e.g. `make bench BENCH_EXTRA="--skip-smoke"`)
 BENCH_EXTRA ?=
@@ -17,7 +17,7 @@ BENCH_EXTRA ?=
 help:
 	@echo "Targets:"
 	@echo "  make install-benchmark   pip install editable + benchmark dependencies"
-	@echo "  make chat                streaming terminal chat (HF LM); add CHAT_ARGS='--broca' for full substrate"
+	@echo "  make chat                streaming terminal chat with Broca substrate (--broca is always passed; extend via CHAT_ARGS)"
 	@echo "  make bench               full harness: native HF datasets + lm-eval + Broca probes"
 	@echo ""
 	@echo "SQLite persistence:"
@@ -34,7 +34,7 @@ help:
 	@echo ""
 	@echo "Examples:"
 	@echo "  make chat CHAT_ARGS='--device mps --sample --temperature 0.8'"
-	@echo "  make chat CHAT_ARGS='--broca --broca-db runs/broca_chat.sqlite'"
+	@echo "  make chat CHAT_ARGS='--broca-db runs/broca_chat.sqlite'"
 	@echo "  make bench BENCH_EXTRA='--preset full --limit 100'"
 
 install-benchmark:

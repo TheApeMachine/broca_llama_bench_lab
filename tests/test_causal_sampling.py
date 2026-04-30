@@ -26,6 +26,9 @@ def test_large_counterfactual_uses_sampling_without_exhaustive_worlds():
     scm.add_endogenous("X", [0, 1], ["U_X"], lambda v: 1 if v["U_X"] < 900 else 0)
     scm.add_endogenous("Y", [0, 1], ["X", "U_Y"], lambda v: 1 if (v["X"] == 1 and v["U_Y"] < 800) else 0)
 
+    # FiniteSCM.counterfactual_probability falls back to Monte Carlo for large exogenous Cartesian products.
+    # There is no public hook to force that path, so we patch the private enumerator to ensure this test never
+    # walks 1000×1000 worlds (brittle if _exogenous_worlds is renamed — update this test if so).
     def fail_enumeration():
         raise AssertionError("exact exogenous enumeration should not run")
 

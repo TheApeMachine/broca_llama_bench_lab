@@ -87,3 +87,18 @@ def test_graft_mixer_prefers_stronger_intervention():
 
     diff = cache["layer.0.post.post"] - cache["layer.0.post.pre"]
     assert torch.allclose(diff, torch.full_like(diff, 10.0), atol=1e-3)
+
+
+def test_graft_mixer_high_tau_blends_interventions():
+    lm = FakeLlamaLM()
+    host = LlamaBrocaHost(lm)
+    slot = LlamaBrocaHost.layer_post_slot(0)
+    host.add_graft(slot, DeltaGraft(1.0))
+    host.add_graft(slot, DeltaGraft(10.0))
+
+    idx = torch.tensor([[1, 2, 3]])
+    _, cache = host(idx, extra_state={"graft_mixer_tau": 1.0}, return_cache=True)
+
+    diff = cache["layer.0.post.post"] - cache["layer.0.post.pre"]
+    flat = float(diff.mean())
+    assert 1.0 < flat < 10.0, f"expected blended delta strictly between graft magnitudes, got mean={flat}"

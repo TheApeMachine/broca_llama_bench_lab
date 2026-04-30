@@ -56,6 +56,8 @@ def lexical_plan_cross_entropy_mean(
     row = list(prefix_ids)
     graft_cm = model.grafts_enabled(grafts_on) if hasattr(model, "grafts_enabled") else nullcontext()
     lm_head = getattr(model, "lm_head", None)
+    plan_tensor = torch.tensor([list(plan_ids)], device=device)
+    bf_device = broca_features.to(device) if broca_features is not None else None
 
     with graft_cm:
         for step, tgt in enumerate(target_ids):
@@ -63,11 +65,11 @@ def lexical_plan_cross_entropy_mean(
             batch_ids, mask = _batch_from_ids([row], pad_id, device=device)
             extra: dict = {}
             if grafts_on:
-                extra["broca_plan_token_ids"] = torch.tensor([list(plan_ids)], device=device)
+                extra["broca_plan_token_ids"] = plan_tensor
                 extra["broca_step"] = torch.tensor([min(step, max(0, len(plan_ids) - 1))], device=device)
                 extra["tokenizer"] = tokenizer
-                if broca_features is not None:
-                    extra["broca_features"] = broca_features.to(device)
+                if bf_device is not None:
+                    extra["broca_features"] = bf_device
 
             last_pos = int(mask.long().sum().item()) - 1
 
@@ -117,6 +119,8 @@ def lexical_surprise_gap(
     sum_graft = 0.0
     sum_plain = 0.0
     lm_head = getattr(model, "lm_head", None)
+    plan_tensor = torch.tensor([list(plan_ids)], device=device)
+    prepared_broca = broca_features.to(device) if broca_features is not None else None
 
     graft_cm = model.grafts_enabled(True) if hasattr(model, "grafts_enabled") else nullcontext()
     use_dual = True
@@ -125,12 +129,12 @@ def lexical_surprise_gap(
             tid = int(tgt)
             batch_ids, mask = _batch_from_ids([row], pad_id, device=device)
             extra = {
-                "broca_plan_token_ids": torch.tensor([list(plan_ids)], device=device),
+                "broca_plan_token_ids": plan_tensor,
                 "broca_step": torch.tensor([min(step, max(0, len(plan_ids) - 1))], device=device),
                 "tokenizer": tokenizer,
             }
-            if broca_features is not None:
-                extra["broca_features"] = broca_features.to(device)
+            if prepared_broca is not None:
+                extra["broca_features"] = prepared_broca
             last_pos = int(mask.long().sum().item()) - 1
 
             if lm_head is None:

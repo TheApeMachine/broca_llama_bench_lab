@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import json
+import hashlib
+import logging
 import math
 import os
 import sqlite3
@@ -38,40 +40,12 @@ from .predictive_coding import lexical_surprise_gap
 from .substrate_graph import EpisodeAssociationGraph, merge_epistemic_evidence_dict
 from .tokenizer import speech_seed_ids, utterance_words
 
+logger = logging.getLogger(__name__)
 
 DEFAULT_BROCA_MODEL_ID = os.environ.get("ASI_BROCA_MODEL_ID", "meta-llama/Llama-3.2-1B-Instruct")
 SEMANTIC_CONFIDENCE_FLOOR = 0.5
 BELIEF_REVISION_MARGIN = 0.5
 BELIEF_REVISION_MIN_CLAIMS = 2
-
-
-def _speech_plan_active_action(answer: str) -> list[str]:
-    # Keep action labels verbatim (e.g. ``open_left``) so checks that token-scan action names stay aligned.
-    tok = answer.strip()
-    return ["i", "should", tok, "."]
-
-
-def _speech_plan_causal(answer: str) -> list[str]:
-    lab = answer.strip().replace("_", " ")
-    return ["intervention", "says", "treatment", lab, "."]
-
-
-def _speech_plan_open_vocab(frame: "CognitiveFrame") -> list[str]:
-    """Last resort — still emits content keyed by arbitrary intent / answer strings."""
-
-    if frame.answer and frame.answer != "unknown":
-        ans = frame.answer.replace("_", " ")
-        if frame.subject:
-            sub = frame.subject.replace("_", " ")
-            return [sub, "maps", "to", ans, "."]
-        return ["faculty", "reports", ans, "."]
-    lab = frame.intent.replace("_", " ")
-    return ["working", "memory", "holds", "intent", lab, "."]
-
-
-QUESTION_WORDS = frozenset({"where", "what", "who", "when", "why", "how", "does", "do", "did", "is", "are", "can", "should"})
-MEMORY_COMMAND_WORDS = frozenset({"remember", "note", "learn", "store"})
-LOCATION_RELATORS = frozenset({"in", "at", "inside", "near", "on", "located"})
 
 
 @dataclass(frozen=True)
@@ -95,75 +69,147 @@ def _word_tokens(toks: Sequence[str]) -> list[str]:
     return [t for t in toks if any(ch.isalnum() for ch in t)]
 
 
-def _predicate_from_relator(relator: str) -> str:
-    rel = relator.lower()
-    return "location" if rel in LOCATION_RELATORS else rel
+def _lexical_tokens(value: Any) -> list[str]:
+    text = str(value).replace("_", " ").strip().lower()
+    return _word_tokens(utterance_words(text))
+
+
+def _is_question(toks: Sequence[str]) -> bool:
+    return any(t == "?" for t in toks)
+
+
+def _predicate_from_words(words: Sequence[str]) -> str:
+    return " ".join(str(w).lower() for w in words if str(w).strip())
 
 
 def _location_assertion_from_tokens(toks: Sequence[str]) -> tuple[str, str] | None:
     """Backward-compatible shim over the open vocabulary claim parser."""
 
     claim = _claim_from_tokens(toks)
-    if claim is not None and claim.predicate == "location":
+    if claim is not None:
         return claim.subject, claim.obj
     return None
 
 
 def _claim_from_tokens(toks: Sequence[str]) -> ParsedClaim | None:
-    """Parse an observed relational claim without fixed entity/value slots."""
+    """Parse an observed relational claim without fixed entity/value slots.
 
-    words = _word_tokens(toks)
-    if not words or words[0] in QUESTION_WORDS:
+    A declarative observation is treated as ``subject`` + free-form relation
+    phrase + ``object``. The relation is not canonicalized through a built-in
+    ontology; later queries recover it through the persisted subject/predicate
+    records.
+
+    **Limitation:** This assumes a simple contiguous ``subject + relation +
+    object`` layout over alphanumeric word tokens (after light cleanup). It does
+    not handle nested clauses, coordinated subjects, or non-adjacent arguments;
+    compound or complex sentences will often mis-assign head or tail tokens.
+
+    Leading determiners (``the``, ``a``, ``an``) are skipped when picking the
+    subject head. Trailing copula tokens that would incorrectly sit in the object
+    slot are stripped. If the middle phrase is only a linking verb (e.g. ``cat is
+    fluffy``), the predicate is folded to ``state`` so the copula is not stored
+    as the sole relation string.
+    """
+
+    words = list(_word_tokens(toks))
+    evidence_extra: dict[str, Any] = {}
+    determiners = {"the", "a", "an"}
+    if words and words[0].lower() in determiners:
+        evidence_extra["skipped_leading_determiners"] = True
+        while words and words[0].lower() in determiners:
+            words.pop(0)
+    if len(words) < 3 or _is_question(toks):
         return None
-    source_words = words
-    if words[0] in MEMORY_COMMAND_WORDS:
-        words = words[1:]
-    if len(words) >= 4 and words[1] == "is" and words[2] in LOCATION_RELATORS:
-        return ParsedClaim(
-            subject=words[0],
-            predicate=_predicate_from_relator(words[2]),
-            obj=words[3],
-            confidence=1.0,
-            evidence={"parser": "relational_claim", "source_words": source_words},
-        )
-    if len(words) >= 4 and words[1] in {"lives", "live"} and words[2] == "in":
-        return ParsedClaim(
-            subject=words[0],
-            predicate="location",
-            obj=words[3],
-            confidence=1.0,
-            evidence={"parser": "verb_relation_claim", "source_words": source_words, "verb": words[1]},
-        )
-    if len(words) >= 3 and words[1] in {"is", "are"}:
-        return ParsedClaim(
-            subject=words[0],
-            predicate="attribute",
-            obj=words[2],
-            confidence=0.8,
-            evidence={"parser": "attribute_claim", "source_words": source_words, "verb": words[1]},
-        )
-    return None
+    copulas = {"is", "are", "was", "were", "be"}
+    core = list(words)
+    trimmed_copula_tail = 0
+    while len(core) >= 3 and core[-1].lower() in copulas:
+        core.pop()
+        trimmed_copula_tail += 1
+    if trimmed_copula_tail:
+        evidence_extra["stripped_trailing_copula_tokens"] = trimmed_copula_tail
+    if len(core) < 3:
+        return None
+    predicate = _predicate_from_words(core[1:-1])
+    if not predicate:
+        return None
+    pred_norm = predicate.strip().lower()
+    if pred_norm in copulas and len(core) == 3:
+        predicate = "state"
+        evidence_extra["linking_verb_folded"] = pred_norm
+    return ParsedClaim(
+        subject=core[0],
+        predicate=predicate,
+        obj=core[-1],
+        confidence=1.0,
+        evidence={
+            "parser": "open_relation_claim",
+            "source_words": words,
+            "predicate_surface": predicate,
+            **evidence_extra,
+        },
+    )
 
 
-def _query_from_tokens(toks: Sequence[str]) -> ParsedQuery | None:
-    """Parse a memory query into an open subject/predicate lookup."""
+def _choose_subject(words: Sequence[str], known_subjects: Sequence[str]) -> str | None:
+    if not words:
+        return None
+    known = {s.lower(): s.lower() for s in known_subjects}
+    for word in words:
+        got = known.get(word.lower())
+        if got is not None:
+            return got
+    if known:
+        return None
+    return words[-1].lower()
 
+
+def _choose_predicate(
+    utterance: str,
+    records: Sequence[tuple[str, str, float, dict]],
+    text_encoder: TextEncoder | None,
+) -> str:
+    if not records:
+        return ""
+    if len(records) == 1:
+        return records[0][0]
+    query_vec = _text_vector(utterance, text_encoder)
+    scored: list[tuple[float, str]] = []
+    for pred, obj, conf, ev in records:
+        evidence_text = " ".join(str(x) for x in (pred, obj, ev.get("predicate_surface", ""), ev.get("parser", "")))
+        score = _cosine(query_vec, _text_vector(evidence_text, text_encoder)) + 0.05 * float(conf)
+        scored.append((score, pred))
+    return max(scored, key=lambda item: item[0])[1]
+
+
+def _query_from_tokens(
+    toks: Sequence[str],
+    *,
+    utterance: str,
+    known_subjects: Sequence[str],
+    records_for_subject: Callable[[str], Sequence[tuple[str, str, float, dict]]],
+    text_encoder: TextEncoder | None,
+) -> ParsedQuery | None:
+    """Resolve a question into an existing subject/predicate memory lookup."""
+
+    if not _is_question(toks):
+        return None
     words = _word_tokens(toks)
-    if len(words) >= 3 and words[0] == "where" and words[1] in {"is", "are"}:
-        return ParsedQuery(
-            subject=words[2],
-            predicate="location",
-            confidence=1.0,
-            evidence={"parser": "where_query", "source_words": words},
-        )
-    if len(words) >= 3 and words[0] == "what" and words[1] in {"is", "are"}:
-        return ParsedQuery(
-            subject=words[2],
-            predicate="attribute",
-            confidence=0.8,
-            evidence={"parser": "what_query", "source_words": words},
-        )
-    return None
+    if not words:
+        return None
+    subject = _choose_subject(words, known_subjects)
+    if subject is None or not str(subject).strip():
+        return None
+    records = list(records_for_subject(subject))
+    predicate = _choose_predicate(utterance, records, text_encoder)
+    if not predicate:
+        return None
+    return ParsedQuery(
+        subject=subject,
+        predicate=predicate,
+        confidence=1.0,
+        evidence={"parser": "open_memory_query", "source_words": words, "predicate_candidates": [r[0] for r in records]},
+    )
 
 
 def _cosine(a: torch.Tensor, b: torch.Tensor) -> float:
@@ -176,7 +222,8 @@ def _text_vector(text: str, text_encoder: TextEncoder | None) -> torch.Tensor:
         return stable_sketch(text)
     try:
         v = text_encoder(text)
-    except Exception:
+    except (RuntimeError, ValueError):
+        logger.error("text_encoder failed in _text_vector; falling back to stable_sketch", exc_info=True)
         v = stable_sketch(text)
     return v.detach().float().cpu().view(-1)
 
@@ -188,20 +235,62 @@ def _route_relevance(utterance: str, toks: Sequence[str], descriptors: Sequence[
     sem = max(0.0, _cosine(_text_vector(utterance, text_encoder), _text_vector(descriptor_text, text_encoder)))
     words = set(_word_tokens(toks))
     desc_words = set(_word_tokens(utterance_words(descriptor_text)))
-    overlap = len(words & desc_words) / math.sqrt(max(1, len(words)) * max(1, len(desc_words)))
-    return max(0.0, min(1.0, 0.65 * sem + 0.55 * overlap))
+    hits = words & desc_words
+    overlap = len(hits) / max(1, min(len(words), len(desc_words)))
+    hit_gate = 1.0 if hits else 0.0
+    # Coefficients (0.50 + 0.35 + 0.25) sum above 1.0; normalize before clamping so the score stays in [0, 1].
+    combined = 0.50 * sem + 0.35 * overlap + 0.25 * hit_gate
+    return max(0.0, min(1.0, combined / 1.10))
+
+
+def _frame_descriptor_tokens(frame: "CognitiveFrame") -> list[str]:
+    parts: list[str] = []
+    for value in (frame.intent, frame.subject, frame.answer):
+        parts.extend(_lexical_tokens(value))
+    for key, value in sorted((frame.evidence or {}).items()):
+        parts.extend(_lexical_tokens(key))
+        if isinstance(value, (str, int, float, bool)):
+            parts.extend(_lexical_tokens(value))
+        elif isinstance(value, dict):
+            for sub_key, sub_value in value.items():
+                parts.extend(_lexical_tokens(sub_key))
+                if isinstance(sub_value, (str, int, float, bool)):
+                    parts.extend(_lexical_tokens(sub_value))
+    return parts
+
+
+def _frame_relevance(utterance: str, toks: Sequence[str], frame: "CognitiveFrame", text_encoder: TextEncoder | None) -> float:
+    return _route_relevance(utterance, toks, _frame_descriptor_tokens(frame), text_encoder)
+
+
+def _frame_speech_plan(frame: "CognitiveFrame") -> list[str]:
+    tokens: list[str] = []
+    tokens.extend(_lexical_tokens(frame.intent))
+    if frame.subject:
+        tokens.extend(_lexical_tokens(frame.subject))
+    predicate = (frame.evidence or {}).get("predicate") or (frame.evidence or {}).get("predicate_surface")
+    if predicate:
+        tokens.extend(_lexical_tokens(predicate))
+    if frame.answer and frame.answer != "unknown":
+        tokens.extend(_lexical_tokens(frame.answer))
+    claimed = (frame.evidence or {}).get("claimed_answer")
+    if claimed:
+        tokens.extend(_lexical_tokens(claimed))
+    if not tokens:
+        tokens.extend(_lexical_tokens(frame.answer))
+    return tokens + ["."]
 
 
 @dataclass
 class CognitiveFrame:
     """A non-linguistic content packet for the Broca interface to express.
 
-    ``intent`` is an open vocabulary routing label (built-ins like ``memory_location``
-    name bundled demos; substrates may emit ``spatial_navigation``, ``einstein_bio``, …).
+    ``intent`` is an open vocabulary routing label; substrates may emit labels
+    such as ``spatial_navigation`` or ``einstein_bio`` without changing feature shape.
 
     ``to_features()`` maps arbitrary intent/subject/answer strings through frozen subword sketches;
-    ``speech_plan()`` accepts ``evidence[\"speech_plan_words\"]`` overrides and falls back to
-    templates that work for strings outside the toy demos.
+    ``speech_plan()`` accepts ``evidence[\"speech_plan_words\"]`` overrides and otherwise
+    lexicalizes the frame's own intent/subject/predicate/answer fields.
     """
 
     intent: str
@@ -215,26 +304,7 @@ class CognitiveFrame:
         if isinstance(raw_override, list) and raw_override and all(isinstance(x, str) for x in raw_override):
             return list(raw_override)
 
-        if self.intent == "memory_conflict" and self.subject:
-            claimed = str(self.evidence.get("claimed_answer", "unknown")).replace("_", " ")
-            current = self.answer.replace("_", " ")
-            return ["conflict", self.subject, "was", current, "but", "you", "said", claimed, "."]
-        if self.intent == "memory_write" and self.subject and self.answer != "unknown":
-            return ["noted", self.subject, "is", "in", self.answer, "."]
-        if self.intent == "memory_location" and self.subject and self.answer != "unknown":
-            mu_thr = float(self.evidence.get("semantic_mean_confidence", 1.0))
-            if self.confidence < mu_thr:
-                return ["i", "should", "verify", "where", self.subject, "is", "."]
-            return [self.subject, "is", "in", self.answer, "."]
-        if self.intent == "prediction_error":
-            return ["semantic", "prediction", "clashes", "with", "input", "."]
-        if self.intent == "active_action":
-            return _speech_plan_active_action(self.answer)
-        if self.intent == "causal_effect":
-            return _speech_plan_causal(self.answer)
-        if self.intent == "synthesis_bundle" and self.answer != "unknown":
-            return ["situated", "memory", "matches", "causal", "readout", "for", self.answer, "."]
-        return _speech_plan_open_vocab(self)
+        return _frame_speech_plan(self)
 
     def to_features(self, text_encoder: TextEncoder | None = None) -> torch.Tensor:
         """Semantic subword bottleneck over intent/subject/answer + numeric faculty scalars."""
@@ -313,9 +383,28 @@ class PersistentSemanticMemory:
             )
             con.execute("CREATE INDEX IF NOT EXISTS idx_reflection_lookup ON memory_reflections(namespace, kind, subject, predicate)")
 
-    def upsert(self, subject: str, predicate: str, obj: str, *, confidence: float = 1.0, evidence: dict | None = None) -> None:
+    def upsert(
+        self,
+        subject: str,
+        predicate: str,
+        obj: str,
+        *,
+        confidence: float = 1.0,
+        evidence: dict | None = None,
+        con: sqlite3.Connection | None = None,
+    ) -> None:
         now = time.time()
-        with self._connect() as con:
+        row = (
+            self.namespace,
+            subject.lower(),
+            predicate.lower(),
+            obj.lower(),
+            float(confidence),
+            json.dumps(evidence or {}, sort_keys=True),
+            now,
+            now,
+        )
+        if con is not None:
             con.execute(
                 """
                 INSERT INTO semantic_memory(namespace, subject, predicate, object, confidence, evidence_json, created_at, updated_at)
@@ -324,7 +413,19 @@ class PersistentSemanticMemory:
                 DO UPDATE SET object=excluded.object, confidence=excluded.confidence,
                               evidence_json=excluded.evidence_json, updated_at=excluded.updated_at
                 """,
-                (self.namespace, subject.lower(), predicate.lower(), obj.lower(), float(confidence), json.dumps(evidence or {}, sort_keys=True), now, now),
+                row,
+            )
+            return
+        with self._connect() as c:
+            c.execute(
+                """
+                INSERT INTO semantic_memory(namespace, subject, predicate, object, confidence, evidence_json, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(namespace, subject, predicate)
+                DO UPDATE SET object=excluded.object, confidence=excluded.confidence,
+                              evidence_json=excluded.evidence_json, updated_at=excluded.updated_at
+                """,
+                row,
             )
 
     def record_claim(
@@ -398,24 +499,37 @@ class PersistentSemanticMemory:
         evidence: dict,
         *,
         dedupe_key: str,
+        con: sqlite3.Connection | None = None,
     ) -> int | None:
         now = time.time()
-        with self._connect() as con:
+        params = (
+            self.namespace,
+            dedupe_key,
+            kind,
+            subject.lower(),
+            predicate.lower(),
+            summary,
+            json.dumps(evidence, sort_keys=True),
+            now,
+        )
+        if con is not None:
             cur = con.execute(
                 """
                 INSERT OR IGNORE INTO memory_reflections(namespace, dedupe_key, kind, subject, predicate, summary, evidence_json, created_at)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 """,
-                (
-                    self.namespace,
-                    dedupe_key,
-                    kind,
-                    subject.lower(),
-                    predicate.lower(),
-                    summary,
-                    json.dumps(evidence, sort_keys=True),
-                    now,
-                ),
+                params,
+            )
+            if cur.rowcount == 0:
+                return None
+            return int(cur.lastrowid)
+        with self._connect() as c:
+            cur = c.execute(
+                """
+                INSERT OR IGNORE INTO memory_reflections(namespace, dedupe_key, kind, subject, predicate, summary, evidence_json, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                params,
             )
             if cur.rowcount == 0:
                 return None
@@ -485,24 +599,36 @@ class PersistentSemanticMemory:
             }
 
             if current_obj and best_obj != current_obj and best_count >= int(min_claims) and best_score >= current_score + float(revision_margin):
-                dedupe = f"belief_revision:{subject}:{predicate}:{current_obj}->{best_obj}:{','.join(map(str, best['claim_ids']))}"
-                reflection_id = self.record_reflection(
-                    "belief_revision",
-                    subject,
-                    predicate,
-                    f"revised {subject}.{predicate} from {current_obj} to {best_obj}",
-                    evidence,
-                    dedupe_key=dedupe,
-                )
-                if reflection_id is not None:
-                    self.upsert(
-                        subject,
-                        predicate,
-                        best_obj,
-                        confidence=min(1.0, best_score / max(1.0, sum(float(v["score"]) for v in support.values()))),
-                        evidence={**evidence, "reflection_id": reflection_id},
-                    )
-                    reflections.append({"id": reflection_id, "kind": "belief_revision", **evidence})
+                claim_ids_digest = hashlib.sha256(
+                    json.dumps(sorted(int(i) for i in best["claim_ids"]), separators=(",", ":")).encode()
+                ).hexdigest()
+                dedupe = f"belief_revision:{subject}:{predicate}:{current_obj}->{best_obj}:{claim_ids_digest}"
+                with self._connect() as con:
+                    con.execute("BEGIN")
+                    try:
+                        reflection_id = self.record_reflection(
+                            "belief_revision",
+                            subject,
+                            predicate,
+                            f"revised {subject}.{predicate} from {current_obj} to {best_obj}",
+                            evidence,
+                            dedupe_key=dedupe,
+                            con=con,
+                        )
+                        if reflection_id is not None:
+                            self.upsert(
+                                subject,
+                                predicate,
+                                best_obj,
+                                confidence=min(1.0, best_score / max(1.0, sum(float(v["score"]) for v in support.values()))),
+                                evidence={**evidence, "reflection_id": reflection_id},
+                                con=con,
+                            )
+                            reflections.append({"id": reflection_id, "kind": "belief_revision", **evidence})
+                        con.commit()
+                    except Exception:
+                        con.rollback()
+                        raise
             else:
                 dedupe = f"belief_conflict:{subject}:{predicate}:{','.join(str(r['id']) for r in rows)}"
                 reflection_id = self.record_reflection(
@@ -587,8 +713,29 @@ class PersistentSemanticMemory:
             ).fetchall()
         return [str(r[0]) for r in rows]
 
+    def subjects(self) -> list[str]:
+        with self._connect() as con:
+            rows = con.execute(
+                "SELECT DISTINCT subject FROM semantic_memory WHERE namespace=? ORDER BY subject",
+                (self.namespace,),
+            ).fetchall()
+        return [str(r[0]) for r in rows]
+
+    def records_for_subject(self, subject: str) -> list[tuple[str, str, float, dict]]:
+        with self._connect() as con:
+            rows = con.execute(
+                """
+                SELECT predicate, object, confidence, evidence_json
+                FROM semantic_memory
+                WHERE namespace=? AND subject=?
+                ORDER BY updated_at DESC, id DESC
+                """,
+                (self.namespace, subject.lower()),
+            ).fetchall()
+        return [(str(r[0]), str(r[1]), float(r[2]), json.loads(r[3])) for r in rows]
+
     def distinct_objects_for_predicate(self, predicate: str) -> frozenset[str]:
-        """Known objects (e.g. city names) already stored — used for conflict detection without CITIES."""
+        """Known objects already stored for a predicate; used for conflict detection."""
 
         pred = predicate.lower()
         with self._connect() as con:
@@ -744,39 +891,40 @@ def cognitive_frame_from_episode_row(row: dict) -> CognitiveFrame:
 
 
 def working_memory_synthesize(working: list[CognitiveFrame]) -> CognitiveFrame | None:
-    """When working memory simultaneously carries locality and causal readouts, bind provenance."""
+    """When working memory simultaneously carries memory and causal readouts, bind provenance."""
 
     if len(working) < 2:
         return None
     if any(f.intent == "synthesis_bundle" for f in working[-6:]):
         return None
-    loc = None
+    mem = None
     ce = None
     for f in reversed(working):
-        if loc is None and f.intent == "memory_location":
-            loc = f
+        if mem is None and f.intent.startswith("memory_") and f.intent not in {"memory_write", "memory_conflict"}:
+            mem = f
         if ce is None and f.intent == "causal_effect":
             ce = f
-        if loc is not None and ce is not None:
+        if mem is not None and ce is not None:
             break
-    if loc is None or ce is None:
+    if mem is None or ce is None:
         return None
     jids: list[int] = []
-    for f in (loc, ce):
+    for f in (mem, ce):
         jid = (f.evidence or {}).get("journal_id")
         if jid is not None:
             jids.append(int(jid))
-    geo = math.sqrt(max(1e-12, float(loc.confidence)) * max(1e-12, float(ce.confidence)))
+    geo = math.sqrt(max(1e-12, float(mem.confidence)) * max(1e-12, float(ce.confidence)))
     return CognitiveFrame(
         "synthesis_bundle",
-        subject=loc.subject,
-        answer=loc.answer,
+        subject=mem.subject,
+        answer=mem.answer,
         confidence=min(1.0, geo),
         evidence={
             "episode_ids": jids,
-            "instruments": ["working_memory_synthesis", "semantic_location", "scm_do_readout"],
+            "instruments": ["working_memory_synthesis", "semantic_memory", "scm_do_readout"],
+            "predicate": (mem.evidence or {}).get("predicate", ""),
             "causal_ate": ce.evidence.get("ate"),
-            "source_intents": [loc.intent, ce.intent],
+            "source_intents": [mem.intent, ce.intent],
         },
     )
 
@@ -789,7 +937,7 @@ class IntrinsicCue:
 
 
 class GlobalWorkspace:
-    """A tiny blackboard where non-language faculties publish latent frames."""
+    """A tiny blackboard for non-language faculty frames."""
 
     def __init__(self):
         self.frames: list[CognitiveFrame] = []
@@ -855,6 +1003,7 @@ class CognitiveBackgroundWorker:
             try:
                 self.run_once()
             except Exception as exc:  # pragma: no cover - background safety net
+                logger.exception("Broca background consolidation loop failed")
                 self.last_error = repr(exc)
 
 
@@ -862,7 +1011,7 @@ class LexicalPlanGraft(BaseGraft):
     """Writes a planned next word into the frozen host's residual stream.
 
     This is the cleanest Broca analogy in the lab: the cognitive substrate
-    decides what is to be said; this graft turns the intended lexical sequence
+    decides the lexical content; this graft turns the intended lexical sequence
     into hidden-state directions that the frozen language host can emit.
     """
 
@@ -1042,47 +1191,32 @@ class CognitiveRouter:
     candidate traces attached.
     """
 
-    action_descriptors = (
-        "action",
-        "take",
-        "choose",
-        "decide",
-        "should",
-        "policy",
-        "listen",
-        "open",
-        "expected free energy",
-    )
-    causal_descriptors = (
-        "causal",
-        "effect",
-        "intervention",
-        "treatment",
-        "help",
-        "helps",
-        "hurt",
-        "do calculus",
-        "ate",
-    )
-
     def __init__(self, *, relevance_floor: float = 0.28):
         self.relevance_floor = float(relevance_floor)
 
     def route(self, mind: "BrocaMind", utterance: str, toks: Sequence[str]) -> CognitiveFrame:
         candidates: list[FacultyCandidate] = []
         claim = _claim_from_tokens(toks)
-        query = _query_from_tokens(toks)
+        query = _query_from_tokens(
+            toks,
+            utterance=utterance,
+            known_subjects=mind.memory.subjects(),
+            records_for_subject=mind.memory.records_for_subject,
+            text_encoder=mind.text_encoder,
+        )
 
         if claim is not None:
             candidates.append(FacultyCandidate("semantic_claim", 1.45, lambda claim=claim: self._memory_write(mind, utterance, claim)))
         if query is not None:
             candidates.append(FacultyCandidate("semantic_query", 1.35, lambda query=query: self._memory_query(mind, utterance, toks, query)))
 
-        active_score = 0.1 + _route_relevance(utterance, toks, self.action_descriptors, mind.text_encoder)
-        candidates.append(FacultyCandidate("active_inference", active_score, lambda: self._active_action(mind)))
+        active_frame = self._active_action(mind)
+        active_score = 0.1 + _frame_relevance(utterance, toks, active_frame, mind.text_encoder)
+        candidates.append(FacultyCandidate("active_inference", active_score, lambda active_frame=active_frame: active_frame))
 
-        causal_score = 0.1 + _route_relevance(utterance, toks, self.causal_descriptors, mind.text_encoder)
-        candidates.append(FacultyCandidate("causal_effect", causal_score, lambda: self._causal_effect(mind)))
+        causal_frame = self._causal_effect(mind)
+        causal_score = 0.1 + _frame_relevance(utterance, toks, causal_frame, mind.text_encoder)
+        candidates.append(FacultyCandidate("causal_effect", causal_score, lambda causal_frame=causal_frame: causal_frame))
 
         ranked = sorted(candidates, key=lambda c: c.score, reverse=True)
         selected = ranked[0] if ranked and ranked[0].score >= self.relevance_floor else None
@@ -1144,7 +1278,15 @@ class CognitiveRouter:
         )
 
     def _memory_query(self, mind: "BrocaMind", utterance: str, toks: Sequence[str], query: ParsedQuery) -> CognitiveFrame:
-        rec = mind.memory.get(query.subject, query.predicate) if query.subject else None
+        if not query.subject or not str(query.subject).strip():
+            return CognitiveFrame(
+                "unknown",
+                subject="",
+                answer="unknown",
+                confidence=0.0,
+                evidence={"missing": "semantic_subject", "predicate": query.predicate, **dict(query.evidence)},
+            )
+        rec = mind.memory.get(query.subject, query.predicate)
         if rec is None:
             return CognitiveFrame(
                 "unknown",
@@ -1155,7 +1297,7 @@ class CognitiveRouter:
             )
 
         obj, conf, ev = rec
-        frame = CognitiveFrame("memory_location" if query.predicate == "location" else "memory_lookup", subject=query.subject, answer=obj, confidence=conf, evidence=dict(ev))
+        frame = CognitiveFrame("memory_lookup", subject=query.subject, answer=obj, confidence=conf, evidence=dict(ev))
         mu_pop = mind.memory.mean_confidence()
         frame.evidence["semantic_mean_confidence"] = max(SEMANTIC_CONFIDENCE_FLOOR, float(mu_pop or 0.0))
         frame.evidence["predicate"] = query.predicate
@@ -1232,12 +1374,15 @@ class CognitiveRouter:
         p1 = mind.scm.probability({"Y": 1}, interventions={"T": 1})
         p0 = mind.scm.probability({"Y": 1}, interventions={"T": 0})
         ate = p1 - p0
+        intervention_var = next((name for name in mind.scm.endogenous_names if name in mind.scm.domains and len(mind.scm.domains[name]) == 2), "intervention")
+        labels = getattr(mind.scm, "labels", {}) or {}
+        answer_key = "positive_effect" if ate >= 0 else "negative_effect"
         return CognitiveFrame(
             "causal_effect",
-            subject="treatment",
-            answer="helps" if ate >= 0 else "hurts",
+            subject=str(labels.get(intervention_var, intervention_var)),
+            answer=str(labels.get(answer_key, answer_key)),
             confidence=float(min(1.0, abs(ate))),
-            evidence={"p_do_positive": p1, "p_do_negative": p0, "ate": ate},
+            evidence={"p_do_positive": p1, "p_do_negative": p0, "ate": ate, "labels": labels},
         )
 
 
@@ -1315,15 +1460,21 @@ class BrocaMind:
         mu_pop = self.memory.mean_confidence()
         confidence_floor = SEMANTIC_CONFIDENCE_FLOOR if mu_pop is None else max(SEMANTIC_CONFIDENCE_FLOOR, float(mu_pop))
         toks_set = set(toks)
-        for ent in self.memory.subjects_for_predicate("location"):
+        for ent in self.memory.subjects():
             if ent not in toks_set:
                 continue
-            rec = self.memory.get(ent, "location")
-            if rec is None:
+            records = self.memory.records_for_subject(ent)
+            if not records:
                 self.workspace.intrinsic_cues.append(IntrinsicCue(1.0, "memory_gap", {"subject": ent}))
-            elif rec[1] < confidence_floor:
+                continue
+            best_pred, _obj, best_conf, _ev = max(records, key=lambda row: row[2])
+            if best_conf < confidence_floor:
                 self.workspace.intrinsic_cues.append(
-                    IntrinsicCue(float(confidence_floor - rec[1]), "memory_low_confidence", {"subject": ent, "confidence": rec[1]})
+                    IntrinsicCue(
+                        float(confidence_floor - best_conf),
+                        "memory_low_confidence",
+                        {"subject": ent, "predicate": best_pred, "confidence": best_conf},
+                    )
                 )
         cq = self.causal_agent.qs
         if cq is not None and len(cq) >= 2:
@@ -1345,10 +1496,13 @@ class BrocaMind:
             self.episode_graph.bump(self._last_journal_id, jid)
         self._last_journal_id = jid
         if frame.intent == "prediction_error":
-            pred = str(frame.evidence.get("predicate", "location"))
+            pred = str(frame.evidence.get("predicate", ""))
+            if not pred and frame.subject:
+                records = self.memory.records_for_subject(frame.subject)
+                pred = records[0][0] if records else ""
             known_objects = self.memory.distinct_objects_for_predicate(pred)
             observed_objects = [t for t in toks if t in known_objects]
-            if observed_objects and frame.subject:
+            if observed_objects and frame.subject and pred:
                 self.memory.upsert(
                     frame.subject,
                     pred,
@@ -1358,8 +1512,9 @@ class BrocaMind:
                 )
         out = self.workspace.publish(frame)
         for tail in self.workspace.frames:
-            if tail.intent == "synthesis_bundle" and tail.subject:
-                self.memory.merge_epistemic_evidence(tail.subject, "location", tail.evidence)
+            pred = str((tail.evidence or {}).get("predicate", ""))
+            if tail.intent == "synthesis_bundle" and tail.subject and pred:
+                self.memory.merge_epistemic_evidence(tail.subject, pred, tail.evidence)
         return out
 
     def retrieve_episode(self, episode_id: int) -> CognitiveFrame:
