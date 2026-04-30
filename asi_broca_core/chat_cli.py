@@ -22,7 +22,7 @@ import torch
 from .broca import BrocaMind, decode_generation
 from .device_utils import pick_torch_device
 from .llama_broca_host import load_llama_broca_host, quiet_transformers_benchmark_log_warnings, resolve_hf_hub_token
-from .tokenizer import SPEECH_BRIDGE_PREFIX
+from .tokenizer import speech_seed_ids
 
 
 def _stream_reply(
@@ -98,11 +98,12 @@ def stream_broca_plan_tokens(
     *,
     device: torch.device,
     max_new_tokens: int,
+    broca_features: torch.Tensor | None = None,
 ) -> str:
     """Greedy token emission under LexicalPlanGraft (streams decoded pieces)."""
 
     plan_ids = list(tokenizer.encode_plan_words(list(plan_words)))
-    ids = list(tokenizer.encode(SPEECH_BRIDGE_PREFIX))
+    ids = speech_seed_ids(tokenizer)
     generated: list[int] = []
     pad_id = int(tokenizer.pad_id)
     steps = range(min(max_new_tokens, len(plan_ids)))
@@ -116,6 +117,7 @@ def stream_broca_plan_tokens(
                 "broca_plan_token_ids": torch.tensor([plan_ids], device=device),
                 "broca_step": torch.tensor([step], device=device),
                 "tokenizer": tokenizer,
+                **({"broca_features": broca_features.to(device)} if broca_features is not None else {}),
             },
         )
         last = int(mask.long().sum().item()) - 1
@@ -160,6 +162,8 @@ def _build_parser() -> argparse.ArgumentParser:
         help="SQLite path for BrocaMind (--broca). Default: runs/broca_chat.sqlite",
     )
     p.add_argument("--broca-namespace", default="chat", help="Semantic memory namespace for --broca.")
+    p.add_argument("--no-background", action="store_true", help="Disable background memory consolidation in --broca mode.")
+    p.add_argument("--background-interval", type=float, default=5.0, help="Seconds between background consolidation passes in --broca mode.")
     return p
 
 
@@ -191,37 +195,47 @@ def main() -> None:
         )
         dev = resolved_device if isinstance(resolved_device, torch.device) else torch.device(str(resolved_device))
         print(f"Model: {args.model}  device: {dev}", flush=True)
+        print(f"Persistent memory: records={mind.memory.count()}  journal_rows={mind.journal.count()}", flush=True)
+        if args.no_background:
+            print("Background consolidation: off", flush=True)
+        else:
+            mind.start_background(interval_s=args.background_interval)
+            print(f"Background consolidation: every {max(0.1, float(args.background_interval)):.1f}s", flush=True)
         if args.system:
             print("(Note: --system applies only to vanilla HF chat mode, not --broca routing.)", flush=True)
-        print("Substrate comprehension uses your raw text (e.g. 'where is ada ?'). Speech streams via lexical graft.", flush=True)
+        print("Substrate comprehension uses your raw text. Teach facts first, then ask about them.", flush=True)
         print("Commands: /quit /exit — leave.", flush=True)
         print(flush=True)
 
-        while True:
-            try:
-                line = input("You> ").strip()
-            except (EOFError, KeyboardInterrupt):
-                print("\nBye.", flush=True)
-                break
-            if not line:
-                continue
-            low = line.lower()
-            if low in {"/quit", "/exit", ":q"}:
-                print("Bye.", flush=True)
-                break
+        try:
+            while True:
+                try:
+                    line = input("You> ").strip()
+                except (EOFError, KeyboardInterrupt):
+                    print("\nBye.", flush=True)
+                    break
+                if not line:
+                    continue
+                low = line.lower()
+                if low in {"/quit", "/exit", ":q"}:
+                    print("Bye.", flush=True)
+                    break
 
-            frame, _speech_ref = mind.answer(line)
-            plan = frame.speech_plan()
-            print(f"[substrate intent={frame.intent} latent={frame.answer}]", flush=True)
-            sys.stdout.write("Assistant> ")
-            sys.stdout.flush()
-            stream_broca_plan_tokens(
-                mind.host,
-                mind.tokenizer,
-                plan,
-                device=dev,
-                max_new_tokens=args.max_new_tokens,
-            )
+                frame = mind.comprehend(line)
+                plan = frame.speech_plan()
+                print(f"[substrate intent={frame.intent} latent={frame.answer}]", flush=True)
+                sys.stdout.write("Assistant> ")
+                sys.stdout.flush()
+                stream_broca_plan_tokens(
+                    mind.host,
+                    mind.tokenizer,
+                    plan,
+                    device=dev,
+                    max_new_tokens=args.max_new_tokens,
+                    broca_features=frame.to_features(mind.text_encoder),
+                )
+        finally:
+            mind.stop_background()
 
         return
 
@@ -243,6 +257,7 @@ def main() -> None:
         messages.append({"role": "system", "content": args.system.strip()})
 
     print(f"Model: {args.model}  device: {resolved_device}", flush=True)
+    print("Vanilla HF chat mode: no SQLite/Broca persistent memory. Start with --broca to use the substrate.", flush=True)
     print("Commands: /quit /exit — leave; blank lines ignored. Ctrl+C interrupts the current reply.", flush=True)
     print(flush=True)
 

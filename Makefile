@@ -41,7 +41,7 @@ install-benchmark:
 	$(PYTHON) -m pip install -e ".[benchmark]"
 
 chat:
-	$(PYTHON) -m asi_broca_core.chat_cli $(CHAT_ARGS)
+	$(PYTHON) -m asi_broca_core.chat_cli --broca $(CHAT_ARGS)
 
 # Native (standard task preset) + Eleuther lm-eval (standard preset limits) + architecture eval.
 bench:

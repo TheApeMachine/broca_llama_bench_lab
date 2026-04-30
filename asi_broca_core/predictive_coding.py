@@ -18,7 +18,7 @@ from contextlib import nullcontext
 import torch
 import torch.nn.functional as F
 
-from .tokenizer import SPEECH_BRIDGE_PREFIX
+from .tokenizer import speech_seed_ids
 
 
 def _batch_from_ids(rows: Sequence[Sequence[int]], pad_id: int, *, device: torch.device | str):
@@ -44,6 +44,7 @@ def lexical_plan_cross_entropy_mean(
     target_ids: Sequence[int],
     plan_ids: Sequence[int],
     grafts_on: bool,
+    broca_features: torch.Tensor | None = None,
 ) -> float:
     """Mean negative log-likelihood of ``target_ids`` under teacher-forced prefixes."""
 
@@ -65,6 +66,8 @@ def lexical_plan_cross_entropy_mean(
                 extra["broca_plan_token_ids"] = torch.tensor([list(plan_ids)], device=device)
                 extra["broca_step"] = torch.tensor([min(step, max(0, len(plan_ids) - 1))], device=device)
                 extra["tokenizer"] = tokenizer
+                if broca_features is not None:
+                    extra["broca_features"] = broca_features.to(device)
 
             last_pos = int(mask.long().sum().item()) - 1
 
@@ -97,10 +100,11 @@ def lexical_surprise_gap(
     utterance: str,
     plan_words: Sequence[str],
     prefix: str | None = None,
+    broca_features: torch.Tensor | None = None,
 ) -> tuple[float, float, float]:
     """``(mean_nll_graft, mean_nll_plain, gap)`` with ``gap = graft - plain``."""
 
-    prefix_ids = tokenizer.encode(prefix if prefix is not None else SPEECH_BRIDGE_PREFIX)
+    prefix_ids = speech_seed_ids(tokenizer, prefix)
     target_ids = tokenizer.encode(utterance)
     plan_ids = tokenizer.encode_plan_words(list(plan_words))
 
@@ -125,6 +129,8 @@ def lexical_surprise_gap(
                 "broca_step": torch.tensor([min(step, max(0, len(plan_ids) - 1))], device=device),
                 "tokenizer": tokenizer,
             }
+            if broca_features is not None:
+                extra["broca_features"] = broca_features.to(device)
             last_pos = int(mask.long().sum().item()) - 1
 
             if lm_head is None:
@@ -162,6 +168,7 @@ def lexical_surprise_gap(
         target_ids=target_ids,
         plan_ids=plan_ids,
         grafts_on=True,
+        broca_features=broca_features,
     )
     ce_p = lexical_plan_cross_entropy_mean(
         model,

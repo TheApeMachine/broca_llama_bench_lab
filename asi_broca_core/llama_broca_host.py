@@ -69,6 +69,9 @@ class LlamaBrocaHost(nn.Module):
         self._active_cache: Optional[Dict[str, torch.Tensor]] = None
         self._hook_handles: dict[int, Any] = {}
         self.graft_mixer_tau: float = 1.0
+        self.graft_mixer_max_delta_rms_ratio: float = 8.0
+        self.graft_mixer_max_delta_rms_floor: float = 10.0
+        self.last_graft_mix: dict[str, Any] = {}
 
     @staticmethod
     def layer_post_slot(layer_idx: int) -> str:
@@ -227,6 +230,42 @@ class LlamaBrocaHost(nn.Module):
                 lines.append(f"{slot}[{i}]: {module.__class__.__name__} params={total} trainable={trainable}")
         return "\n".join(lines) if lines else "<no grafts>"
 
+    def _graft_priority(self, graft: nn.Module, state: dict) -> float:
+        priority = getattr(graft, "mixer_priority", 1.0)
+        if callable(priority):
+            priority = priority(state)
+        try:
+            return max(float(priority), 1e-6)
+        except Exception:
+            return 1.0
+
+    def _mix_graft_deltas(self, slot: str, x0: torch.Tensor, deltas: list[torch.Tensor], mods: list[nn.Module], state: dict) -> torch.Tensor:
+        stacked = torch.stack(deltas, dim=0)
+        reduce_dims = tuple(range(1, stacked.ndim))
+        delta_rms = stacked.detach().pow(2).mean(dim=reduce_dims).sqrt()
+        priorities = torch.tensor([self._graft_priority(g, state) for g in mods], device=stacked.device, dtype=stacked.dtype)
+        tau = float(state.get("graft_mixer_tau", getattr(self, "graft_mixer_tau", 1.0)))
+        tau = max(tau, 1e-6)
+        scores = torch.log1p(delta_rms.to(stacked.dtype)) + torch.log(priorities)
+        weights = torch.softmax(scores / tau, dim=0)
+        view_shape = (weights.shape[0],) + (1,) * (stacked.ndim - 1)
+        mixed = (weights.view(view_shape) * stacked).sum(dim=0)
+
+        mixed_rms = mixed.detach().pow(2).mean().sqrt()
+        base_rms = x0.detach().pow(2).mean().sqrt()
+        ratio = float(state.get("graft_mixer_max_delta_rms_ratio", self.graft_mixer_max_delta_rms_ratio))
+        floor = float(state.get("graft_mixer_max_delta_rms_floor", self.graft_mixer_max_delta_rms_floor))
+        cap = torch.maximum(base_rms * max(ratio, 0.0), torch.tensor(max(floor, 1e-6), device=x0.device, dtype=base_rms.dtype))
+        scale = torch.clamp(cap / mixed_rms.clamp_min(1e-12), max=1.0).to(dtype=mixed.dtype)
+        mixed = mixed * scale
+        self.last_graft_mix[slot] = {
+            "weights": weights.detach().cpu(),
+            "scores": scores.detach().cpu(),
+            "delta_rms": delta_rms.detach().cpu(),
+            "scale": float(scale.detach().cpu()),
+        }
+        return x0 + mixed
+
     def _apply_grafts(self, slot: str, x: torch.Tensor, state: dict, cache: Optional[Dict[str, torch.Tensor]]) -> torch.Tensor:
         if cache is not None:
             cache[f"{slot}.pre"] = x.detach().clone()
@@ -240,12 +279,7 @@ class LlamaBrocaHost(nn.Module):
                 deltas: list[torch.Tensor] = []
                 for graft in mods:
                     deltas.append(graft(x0, state) - x0)
-                stacked = torch.stack(deltas, dim=0)
-                tau = float(state.get("graft_mixer_tau", getattr(self, "graft_mixer_tau", 1.0)))
-                tau = max(tau, 1e-6)
-                scores = -stacked.detach().pow(2).mean(dim=(1, 2, 3))
-                w = torch.softmax(scores / tau, dim=0).view(-1, 1, 1, 1)
-                x = x0 + (w * stacked).sum(dim=0)
+                x = self._mix_graft_deltas(slot, x0, deltas, mods, state)
         if cache is not None:
             cache[f"{slot}.post"] = x.detach().clone()
         return x

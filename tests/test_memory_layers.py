@@ -1,10 +1,19 @@
 from pathlib import Path
+import types
+import uuid
 
 import torch
 
-from asi_broca_core.broca import BrocaMind, CognitiveFrame, GlobalWorkspace, working_memory_synthesize
+import pytest
+
+from asi_broca_core.broca import BrocaMind, CognitiveFrame, GlobalWorkspace, TrainableBrocaGraft, WorkspaceJournal, working_memory_synthesize
+import asi_broca_core.broca as broca_mod
 from asi_broca_core.memory import SQLiteActivationMemory
 from asi_broca_core.substrate_graph import EpisodeAssociationGraph, merge_epistemic_evidence_dict
+
+
+def _symbol(prefix: str) -> str:
+    return f"{prefix}_{uuid.uuid4().hex[:10]}"
 
 
 def test_episode_association_graph_persistent(tmp_path: Path):
@@ -18,25 +27,169 @@ def test_episode_association_graph_persistent(tmp_path: Path):
 
 
 def test_workspace_journal_fetch_roundtrip(tmp_path: Path, llama_broca_loaded: None):
+    subject = _symbol("subject")
+    obj = _symbol("object")
     mind = BrocaMind(seed=0, db_path=tmp_path / "b.sqlite", namespace="x")
-    mind.answer("where is ada ?")
-    row = mind.journal.fetch(1)
+    mind.answer(f"{subject} is in {obj} .")
+    mind.answer(f"where is {subject} ?")
+    row = mind.journal.fetch(2)
     assert row is not None
     assert row["intent"] == "memory_location"
-    replay = mind.retrieve_episode(1)
-    assert replay.answer == "rome"
-    assert replay.evidence.get("retrieved_episode_id") == 1
+    replay = mind.retrieve_episode(2)
+    assert replay.answer == obj
+    assert replay.evidence.get("retrieved_episode_id") == 2
+
+
+def test_workspace_journal_count(tmp_path: Path):
+    subject = _symbol("subject")
+    obj = _symbol("object")
+    journal = WorkspaceJournal(tmp_path / "j.sqlite")
+    frame = CognitiveFrame("memory_location", subject=subject, answer=obj, confidence=1.0)
+
+    assert journal.count() == 0
+    journal.append(f"where is {subject} ?", frame)
+    assert journal.count() == 1
+
+
+def test_runtime_mind_creates_sqlite_before_model_load_failure(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    def fail_load(*args, **kwargs):
+        raise RuntimeError("model unavailable")
+
+    db = tmp_path / "early.sqlite"
+    monkeypatch.setattr(broca_mod, "load_llama_broca_host", fail_load)
+
+    with pytest.raises(RuntimeError, match="model unavailable"):
+        BrocaMind(seed=0, db_path=db, namespace="early")
+
+    assert db.exists()
+    assert WorkspaceJournal(db).count() == 0
+
+
+def test_runtime_mind_starts_empty_and_learns_observed_location(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    class FakeHost:
+        cfg = types.SimpleNamespace(d_model=8)
+
+        def add_graft(self, slot, graft):
+            return None
+
+    monkeypatch.setattr(broca_mod, "load_llama_broca_host", lambda *args, **kwargs: (FakeHost(), object()))
+    db = tmp_path / "learn.sqlite"
+    subject = _symbol("subject")
+    obj = _symbol("object")
+
+    mind = BrocaMind(seed=0, db_path=db, namespace="runtime")
+    assert mind.memory.count() == 0
+    assert mind.comprehend(f"where is {subject} ?").intent == "unknown"
+
+    learned = mind.comprehend(f"{subject} is in {obj} .")
+    assert learned.intent == "memory_write"
+    assert mind.memory.count() == 1
+    assert mind.comprehend(f"where is {subject} ?").answer == obj
+
+    restarted = BrocaMind(seed=0, db_path=db, namespace="runtime")
+    assert restarted.memory.count() == 1
+    assert restarted.comprehend(f"where is {subject} ?").answer == obj
+
+
+def test_runtime_mind_routes_faculties_and_installs_feature_graft(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    class FakeHost:
+        cfg = types.SimpleNamespace(d_model=8)
+
+        def __init__(self):
+            self.grafts = []
+
+        def add_graft(self, slot, graft):
+            self.grafts.append((slot, graft))
+
+    host = FakeHost()
+    monkeypatch.setattr(broca_mod, "load_llama_broca_host", lambda *args, **kwargs: (host, object()))
+    mind = BrocaMind(seed=0, db_path=tmp_path / "router.sqlite", namespace="runtime")
+
+    assert any(isinstance(graft, TrainableBrocaGraft) for _, graft in host.grafts)
+    assert mind.comprehend("what action should i take ?").intent == "active_action"
+    assert mind.comprehend("does treatment help ?").intent == "causal_effect"
+
+
+def test_observed_contradiction_records_counterfactual_without_overwrite(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    class FakeHost:
+        cfg = types.SimpleNamespace(d_model=8)
+
+        def add_graft(self, slot, graft):
+            return None
+
+    monkeypatch.setattr(broca_mod, "load_llama_broca_host", lambda *args, **kwargs: (FakeHost(), object()))
+    mind = BrocaMind(seed=0, db_path=tmp_path / "conflict.sqlite", namespace="runtime")
+    subject = _symbol("subject")
+    current = _symbol("object")
+    challenger = _symbol("object")
+
+    mind.comprehend(f"{subject} is in {current} .")
+    conflict = mind.comprehend(f"{subject} is in {challenger} .")
+
+    assert conflict.intent == "memory_conflict"
+    assert conflict.answer == current
+    assert conflict.evidence["claimed_answer"] == challenger
+    assert conflict.evidence["counterfactual"]["would_change_answer_to"] == challenger
+    assert mind.comprehend(f"where is {subject} ?").answer == current
+    statuses = [c["status"] for c in mind.memory.claims(subject, "location")]
+    assert statuses == ["accepted", "conflict"]
+
+
+def test_background_consolidation_revises_after_repeated_counterevidence(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    class FakeHost:
+        cfg = types.SimpleNamespace(d_model=8)
+
+        def add_graft(self, slot, graft):
+            return None
+
+    monkeypatch.setattr(broca_mod, "load_llama_broca_host", lambda *args, **kwargs: (FakeHost(), object()))
+    mind = BrocaMind(seed=0, db_path=tmp_path / "consolidate.sqlite", namespace="runtime")
+    subject = _symbol("subject")
+    current = _symbol("object")
+    challenger = _symbol("object")
+
+    mind.comprehend(f"{subject} is in {current} .")
+    mind.comprehend(f"{subject} is in {challenger} .")
+    assert mind.consolidate_once()[0]["kind"] == "belief_conflict"
+    assert mind.comprehend(f"where is {subject} ?").answer == current
+
+    mind.comprehend(f"{subject} is in {challenger} .")
+    reflections = mind.consolidate_once()
+
+    assert any(r["kind"] == "belief_revision" for r in reflections)
+    assert mind.comprehend(f"where is {subject} ?").answer == challenger
+    stored_reflections = mind.memory.reflections(kind="belief_revision")
+    assert stored_reflections[-1]["evidence"]["candidate_object"] == challenger
+
+
+def test_background_worker_start_stop(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    class FakeHost:
+        cfg = types.SimpleNamespace(d_model=8)
+
+        def add_graft(self, slot, graft):
+            return None
+
+    monkeypatch.setattr(broca_mod, "load_llama_broca_host", lambda *args, **kwargs: (FakeHost(), object()))
+    mind = BrocaMind(seed=0, db_path=tmp_path / "worker.sqlite", namespace="runtime")
+
+    worker = mind.start_background(interval_s=60.0)
+
+    assert worker.running
+    mind.stop_background()
+    assert not worker.running
 
 
 def test_working_memory_synthesis_binds_episodes():
     ws = GlobalWorkspace()
-    a = CognitiveFrame("memory_location", subject="ada", answer="rome", confidence=0.9, evidence={"journal_id": 10})
+    subject = _symbol("subject")
+    obj = _symbol("object")
+    a = CognitiveFrame("memory_location", subject=subject, answer=obj, confidence=0.9, evidence={"journal_id": 10})
     b = CognitiveFrame("causal_effect", subject="treatment", answer="helps", confidence=0.8, evidence={"journal_id": 11, "ate": 0.05})
     ws.publish(a)
     ws.publish(b)
     syn = [f for f in ws.frames if f.intent == "synthesis_bundle"]
     assert syn
-    assert syn[-1].subject == "ada"
+    assert syn[-1].subject == subject
     assert 10 in syn[-1].evidence["episode_ids"]
     assert 11 in syn[-1].evidence["episode_ids"]
 
@@ -63,8 +216,10 @@ def test_activation_association_spread_matrix(tmp_path: Path):
 
 
 def test_working_memory_synthesize_standalone():
+    subject = _symbol("subject")
+    obj = _symbol("object")
     frames = [
-        CognitiveFrame("memory_location", subject="ada", answer="rome", confidence=1.0, evidence={"journal_id": 3}),
+        CognitiveFrame("memory_location", subject=subject, answer=obj, confidence=1.0, evidence={"journal_id": 3}),
         CognitiveFrame("causal_effect", subject="treatment", answer="helps", confidence=1.0, evidence={"journal_id": 4}),
     ]
     syn = working_memory_synthesize(frames)

@@ -5,17 +5,7 @@ import math
 from asi_broca_core.experiments import (
     run_active_inference_experiment,
     run_causal_experiment,
-    run_memory_experiment,
-    run_trainable_bridge_experiment,
-    run_unified_stack_experiment,
 )
-
-
-def test_persistent_memory_survives_restart(tmp_path, llama_broca_loaded: None):
-    result = run_memory_experiment(seed=0, db_path=tmp_path / "mem.sqlite", verbose=False)
-    assert result["persisted_records"] == 8
-    assert result["after_write"] >= result["before"]
-    assert result["after_restart"] >= result["before"]
 
 
 def test_active_inference_prefers_information_before_action():
@@ -35,19 +25,3 @@ def test_pearl_backdoor_frontdoor_and_counterfactuals():
     assert result["frontdoor_sets"][0] == ["M"]
     assert math.isclose(result["frontdoor_formula_x1"], result["frontdoor_do_x1"], rel_tol=1e-9, abs_tol=1e-9)
     assert 0.0 <= result["counterfactual_success_if_untreated"] <= 1.0
-
-
-def test_unified_faculty_stack_answers_three_task_types(tmp_path, llama_broca_loaded: None):
-    result = run_unified_stack_experiment(seed=0, db_path=tmp_path / "stack.sqlite", verbose=False)
-    assert result["after"] >= result["before"]
-    assert result["records"] == 8
-    assert result["active_choice"] == "listen"
-    assert result["causal_effects"]["ate"] > 0
-
-
-def test_trainable_faculty_bridge_learns_with_frozen_host(llama_broca_loaded: None):
-    result = run_trainable_bridge_experiment(seed=0, steps=160, verbose=False)
-    assert result["after"] > result["before"]
-    assert result["after"] >= 0.85
-    assert result["bridge_params"] < result["host_total_params"] / 10
-

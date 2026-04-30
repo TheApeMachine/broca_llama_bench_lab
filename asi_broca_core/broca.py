@@ -4,12 +4,12 @@ from __future__ import annotations
 import json
 import math
 import os
-import random
 import sqlite3
+import threading
 import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any, Callable, Sequence
 
 import torch
 import torch.nn as nn
@@ -23,30 +23,26 @@ from .active_inference import (
     entropy as belief_entropy,
 )
 from .causal import build_simpson_scm
-from .continuous_frame import COGNITIVE_FRAME_DIM, pack_cognitive_frame
+from .continuous_frame import (
+    COGNITIVE_FRAME_DIM,
+    TextEncoder,
+    frozen_subword_projector_from_model,
+    pack_cognitive_frame,
+    stable_sketch,
+)
 from .device_utils import pick_torch_device
 from .grafts import BaseGraft
 from .hf_tokenizer_compat import HuggingFaceBrocaTokenizer
-from .host import count_parameters
 from .llama_broca_host import LlamaBrocaHost, load_llama_broca_host
 from .predictive_coding import lexical_surprise_gap
 from .substrate_graph import EpisodeAssociationGraph, merge_epistemic_evidence_dict
-from .tokenizer import SPEECH_BRIDGE_PREFIX, utterance_words
+from .tokenizer import speech_seed_ids, utterance_words
 
 
 DEFAULT_BROCA_MODEL_ID = os.environ.get("ASI_BROCA_MODEL_ID", "meta-llama/Llama-3.2-1B-Instruct")
-
-# Teacher-forcing / smoke demos only — pass explicit ``facts`` to ``seed_locations`` for anything real.
-_DEMO_LOCATION_PAIRS: tuple[tuple[str, str], ...] = (
-    ("ada", "rome"),
-    ("byron", "paris"),
-    ("curie", "tokyo"),
-    ("darwin", "lima"),
-    ("euclid", "oslo"),
-    ("faraday", "cairo"),
-    ("gauss", "vienna"),
-    ("hopper", "lisbon"),
-)
+SEMANTIC_CONFIDENCE_FLOOR = 0.5
+BELIEF_REVISION_MARGIN = 0.5
+BELIEF_REVISION_MIN_CLAIMS = 2
 
 
 def _speech_plan_active_action(answer: str) -> list[str]:
@@ -73,7 +69,127 @@ def _speech_plan_open_vocab(frame: "CognitiveFrame") -> list[str]:
     return ["working", "memory", "holds", "intent", lab, "."]
 
 
-FEATURE_DIM = COGNITIVE_FRAME_DIM
+QUESTION_WORDS = frozenset({"where", "what", "who", "when", "why", "how", "does", "do", "did", "is", "are", "can", "should"})
+MEMORY_COMMAND_WORDS = frozenset({"remember", "note", "learn", "store"})
+LOCATION_RELATORS = frozenset({"in", "at", "inside", "near", "on", "located"})
+
+
+@dataclass(frozen=True)
+class ParsedClaim:
+    subject: str
+    predicate: str
+    obj: str
+    confidence: float
+    evidence: dict[str, Any]
+
+
+@dataclass(frozen=True)
+class ParsedQuery:
+    subject: str
+    predicate: str
+    confidence: float
+    evidence: dict[str, Any]
+
+
+def _word_tokens(toks: Sequence[str]) -> list[str]:
+    return [t for t in toks if any(ch.isalnum() for ch in t)]
+
+
+def _predicate_from_relator(relator: str) -> str:
+    rel = relator.lower()
+    return "location" if rel in LOCATION_RELATORS else rel
+
+
+def _location_assertion_from_tokens(toks: Sequence[str]) -> tuple[str, str] | None:
+    """Backward-compatible shim over the open vocabulary claim parser."""
+
+    claim = _claim_from_tokens(toks)
+    if claim is not None and claim.predicate == "location":
+        return claim.subject, claim.obj
+    return None
+
+
+def _claim_from_tokens(toks: Sequence[str]) -> ParsedClaim | None:
+    """Parse an observed relational claim without fixed entity/value slots."""
+
+    words = _word_tokens(toks)
+    if not words or words[0] in QUESTION_WORDS:
+        return None
+    source_words = words
+    if words[0] in MEMORY_COMMAND_WORDS:
+        words = words[1:]
+    if len(words) >= 4 and words[1] == "is" and words[2] in LOCATION_RELATORS:
+        return ParsedClaim(
+            subject=words[0],
+            predicate=_predicate_from_relator(words[2]),
+            obj=words[3],
+            confidence=1.0,
+            evidence={"parser": "relational_claim", "source_words": source_words},
+        )
+    if len(words) >= 4 and words[1] in {"lives", "live"} and words[2] == "in":
+        return ParsedClaim(
+            subject=words[0],
+            predicate="location",
+            obj=words[3],
+            confidence=1.0,
+            evidence={"parser": "verb_relation_claim", "source_words": source_words, "verb": words[1]},
+        )
+    if len(words) >= 3 and words[1] in {"is", "are"}:
+        return ParsedClaim(
+            subject=words[0],
+            predicate="attribute",
+            obj=words[2],
+            confidence=0.8,
+            evidence={"parser": "attribute_claim", "source_words": source_words, "verb": words[1]},
+        )
+    return None
+
+
+def _query_from_tokens(toks: Sequence[str]) -> ParsedQuery | None:
+    """Parse a memory query into an open subject/predicate lookup."""
+
+    words = _word_tokens(toks)
+    if len(words) >= 3 and words[0] == "where" and words[1] in {"is", "are"}:
+        return ParsedQuery(
+            subject=words[2],
+            predicate="location",
+            confidence=1.0,
+            evidence={"parser": "where_query", "source_words": words},
+        )
+    if len(words) >= 3 and words[0] == "what" and words[1] in {"is", "are"}:
+        return ParsedQuery(
+            subject=words[2],
+            predicate="attribute",
+            confidence=0.8,
+            evidence={"parser": "what_query", "source_words": words},
+        )
+    return None
+
+
+def _cosine(a: torch.Tensor, b: torch.Tensor) -> float:
+    den = (a.norm() * b.norm()).clamp_min(1e-12)
+    return float(torch.dot(a.view(-1), b.view(-1)) / den)
+
+
+def _text_vector(text: str, text_encoder: TextEncoder | None) -> torch.Tensor:
+    if text_encoder is None:
+        return stable_sketch(text)
+    try:
+        v = text_encoder(text)
+    except Exception:
+        v = stable_sketch(text)
+    return v.detach().float().cpu().view(-1)
+
+
+def _route_relevance(utterance: str, toks: Sequence[str], descriptors: Sequence[str], text_encoder: TextEncoder | None) -> float:
+    """Continuous intent relevance plus lexical coverage from a route manifest."""
+
+    descriptor_text = " ".join(descriptors)
+    sem = max(0.0, _cosine(_text_vector(utterance, text_encoder), _text_vector(descriptor_text, text_encoder)))
+    words = set(_word_tokens(toks))
+    desc_words = set(_word_tokens(utterance_words(descriptor_text)))
+    overlap = len(words & desc_words) / math.sqrt(max(1, len(words)) * max(1, len(desc_words)))
+    return max(0.0, min(1.0, 0.65 * sem + 0.55 * overlap))
 
 
 @dataclass
@@ -83,7 +199,7 @@ class CognitiveFrame:
     ``intent`` is an open vocabulary routing label (built-ins like ``memory_location``
     name bundled demos; substrates may emit ``spatial_navigation``, ``einstein_bio``, …).
 
-    ``to_features()`` maps arbitrary intent/subject/answer strings through hashed sketches;
+    ``to_features()`` maps arbitrary intent/subject/answer strings through frozen subword sketches;
     ``speech_plan()`` accepts ``evidence[\"speech_plan_words\"]`` overrides and falls back to
     templates that work for strings outside the toy demos.
     """
@@ -99,6 +215,12 @@ class CognitiveFrame:
         if isinstance(raw_override, list) and raw_override and all(isinstance(x, str) for x in raw_override):
             return list(raw_override)
 
+        if self.intent == "memory_conflict" and self.subject:
+            claimed = str(self.evidence.get("claimed_answer", "unknown")).replace("_", " ")
+            current = self.answer.replace("_", " ")
+            return ["conflict", self.subject, "was", current, "but", "you", "said", claimed, "."]
+        if self.intent == "memory_write" and self.subject and self.answer != "unknown":
+            return ["noted", self.subject, "is", "in", self.answer, "."]
         if self.intent == "memory_location" and self.subject and self.answer != "unknown":
             mu_thr = float(self.evidence.get("semantic_mean_confidence", 1.0))
             if self.confidence < mu_thr:
@@ -114,10 +236,10 @@ class CognitiveFrame:
             return ["situated", "memory", "matches", "causal", "readout", "for", self.answer, "."]
         return _speech_plan_open_vocab(self)
 
-    def to_features(self) -> torch.Tensor:
-        """Sketch-hash bottleneck over intent/subject/answer + numeric faculty scalars."""
+    def to_features(self, text_encoder: TextEncoder | None = None) -> torch.Tensor:
+        """Semantic subword bottleneck over intent/subject/answer + numeric faculty scalars."""
 
-        return pack_cognitive_frame(self.intent, self.subject, self.answer, float(self.confidence), self.evidence)
+        return pack_cognitive_frame(self.intent, self.subject, self.answer, float(self.confidence), self.evidence, text_encoder=text_encoder)
 
 
 class PersistentSemanticMemory:
@@ -157,6 +279,39 @@ class PersistentSemanticMemory:
                 """
             )
             con.execute("CREATE INDEX IF NOT EXISTS idx_semantic_lookup ON semantic_memory(namespace, subject, predicate)")
+            con.execute(
+                """
+                CREATE TABLE IF NOT EXISTS semantic_claims (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    namespace TEXT NOT NULL,
+                    subject TEXT NOT NULL,
+                    predicate TEXT NOT NULL,
+                    object TEXT NOT NULL,
+                    confidence REAL NOT NULL,
+                    status TEXT NOT NULL,
+                    evidence_json TEXT NOT NULL,
+                    created_at REAL NOT NULL
+                )
+                """
+            )
+            con.execute("CREATE INDEX IF NOT EXISTS idx_claim_lookup ON semantic_claims(namespace, subject, predicate, status)")
+            con.execute(
+                """
+                CREATE TABLE IF NOT EXISTS memory_reflections (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    namespace TEXT NOT NULL,
+                    dedupe_key TEXT NOT NULL,
+                    kind TEXT NOT NULL,
+                    subject TEXT NOT NULL,
+                    predicate TEXT NOT NULL,
+                    summary TEXT NOT NULL,
+                    evidence_json TEXT NOT NULL,
+                    created_at REAL NOT NULL,
+                    UNIQUE(namespace, dedupe_key)
+                )
+                """
+            )
+            con.execute("CREATE INDEX IF NOT EXISTS idx_reflection_lookup ON memory_reflections(namespace, kind, subject, predicate)")
 
     def upsert(self, subject: str, predicate: str, obj: str, *, confidence: float = 1.0, evidence: dict | None = None) -> None:
         now = time.time()
@@ -171,6 +326,245 @@ class PersistentSemanticMemory:
                 """,
                 (self.namespace, subject.lower(), predicate.lower(), obj.lower(), float(confidence), json.dumps(evidence or {}, sort_keys=True), now, now),
             )
+
+    def record_claim(
+        self,
+        subject: str,
+        predicate: str,
+        obj: str,
+        *,
+        confidence: float = 1.0,
+        status: str = "observed",
+        evidence: dict | None = None,
+    ) -> int:
+        now = time.time()
+        with self._connect() as con:
+            cur = con.execute(
+                """
+                INSERT INTO semantic_claims(namespace, subject, predicate, object, confidence, status, evidence_json, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    self.namespace,
+                    subject.lower(),
+                    predicate.lower(),
+                    obj.lower(),
+                    float(confidence),
+                    str(status),
+                    json.dumps(evidence or {}, sort_keys=True),
+                    now,
+                ),
+            )
+            return int(cur.lastrowid)
+
+    def claims(self, subject: str | None = None, predicate: str | None = None, *, status: str | None = None) -> list[dict]:
+        clauses = ["namespace=?"]
+        args: list[Any] = [self.namespace]
+        if subject is not None:
+            clauses.append("subject=?")
+            args.append(subject.lower())
+        if predicate is not None:
+            clauses.append("predicate=?")
+            args.append(predicate.lower())
+        if status is not None:
+            clauses.append("status=?")
+            args.append(status)
+        sql = (
+            "SELECT id, subject, predicate, object, confidence, status, evidence_json, created_at "
+            f"FROM semantic_claims WHERE {' AND '.join(clauses)} ORDER BY id"
+        )
+        with self._connect() as con:
+            rows = con.execute(sql, args).fetchall()
+        return [
+            {
+                "id": int(r[0]),
+                "subject": str(r[1]),
+                "predicate": str(r[2]),
+                "object": str(r[3]),
+                "confidence": float(r[4]),
+                "status": str(r[5]),
+                "evidence": json.loads(r[6]),
+                "created_at": float(r[7]),
+            }
+            for r in rows
+        ]
+
+    def record_reflection(
+        self,
+        kind: str,
+        subject: str,
+        predicate: str,
+        summary: str,
+        evidence: dict,
+        *,
+        dedupe_key: str,
+    ) -> int | None:
+        now = time.time()
+        with self._connect() as con:
+            cur = con.execute(
+                """
+                INSERT OR IGNORE INTO memory_reflections(namespace, dedupe_key, kind, subject, predicate, summary, evidence_json, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    self.namespace,
+                    dedupe_key,
+                    kind,
+                    subject.lower(),
+                    predicate.lower(),
+                    summary,
+                    json.dumps(evidence, sort_keys=True),
+                    now,
+                ),
+            )
+            if cur.rowcount == 0:
+                return None
+            return int(cur.lastrowid)
+
+    def reflections(self, *, kind: str | None = None) -> list[dict]:
+        clauses = ["namespace=?"]
+        args: list[Any] = [self.namespace]
+        if kind is not None:
+            clauses.append("kind=?")
+            args.append(kind)
+        sql = (
+            "SELECT id, dedupe_key, kind, subject, predicate, summary, evidence_json, created_at "
+            f"FROM memory_reflections WHERE {' AND '.join(clauses)} ORDER BY id"
+        )
+        with self._connect() as con:
+            rows = con.execute(sql, args).fetchall()
+        return [
+            {
+                "id": int(r[0]),
+                "dedupe_key": str(r[1]),
+                "kind": str(r[2]),
+                "subject": str(r[3]),
+                "predicate": str(r[4]),
+                "summary": str(r[5]),
+                "evidence": json.loads(r[6]),
+                "created_at": float(r[7]),
+            }
+            for r in rows
+        ]
+
+    def consolidate_claims_once(
+        self,
+        *,
+        revision_margin: float = BELIEF_REVISION_MARGIN,
+        min_claims: int = BELIEF_REVISION_MIN_CLAIMS,
+    ) -> list[dict]:
+        claims = self.claims()
+        grouped: dict[tuple[str, str], list[dict]] = {}
+        for claim in claims:
+            grouped.setdefault((claim["subject"], claim["predicate"]), []).append(claim)
+
+        reflections: list[dict] = []
+        for (subject, predicate), rows in grouped.items():
+            if len({r["object"] for r in rows}) < 2:
+                continue
+            support: dict[str, dict[str, Any]] = {}
+            for row in rows:
+                entry = support.setdefault(row["object"], {"score": 0.0, "count": 0, "claim_ids": []})
+                entry["score"] += float(row["confidence"])
+                entry["count"] += 1
+                entry["claim_ids"].append(int(row["id"]))
+
+            current = self.get(subject, predicate)
+            current_obj = current[0] if current is not None else ""
+            current_score = float(support.get(current_obj, {}).get("score", 0.0))
+            best_obj, best = max(support.items(), key=lambda item: (float(item[1]["score"]), int(item[1]["count"])))
+            best_score = float(best["score"])
+            best_count = int(best["count"])
+            evidence = {
+                "support": support,
+                "current_object": current_obj,
+                "candidate_object": best_obj,
+                "revision_margin": float(revision_margin),
+                "min_claims": int(min_claims),
+                "instrument": "background_claim_consolidation",
+            }
+
+            if current_obj and best_obj != current_obj and best_count >= int(min_claims) and best_score >= current_score + float(revision_margin):
+                dedupe = f"belief_revision:{subject}:{predicate}:{current_obj}->{best_obj}:{','.join(map(str, best['claim_ids']))}"
+                reflection_id = self.record_reflection(
+                    "belief_revision",
+                    subject,
+                    predicate,
+                    f"revised {subject}.{predicate} from {current_obj} to {best_obj}",
+                    evidence,
+                    dedupe_key=dedupe,
+                )
+                if reflection_id is not None:
+                    self.upsert(
+                        subject,
+                        predicate,
+                        best_obj,
+                        confidence=min(1.0, best_score / max(1.0, sum(float(v["score"]) for v in support.values()))),
+                        evidence={**evidence, "reflection_id": reflection_id},
+                    )
+                    reflections.append({"id": reflection_id, "kind": "belief_revision", **evidence})
+            else:
+                dedupe = f"belief_conflict:{subject}:{predicate}:{','.join(str(r['id']) for r in rows)}"
+                reflection_id = self.record_reflection(
+                    "belief_conflict",
+                    subject,
+                    predicate,
+                    f"unresolved conflict over {subject}.{predicate}",
+                    evidence,
+                    dedupe_key=dedupe,
+                )
+                if reflection_id is not None:
+                    reflections.append({"id": reflection_id, "kind": "belief_conflict", **evidence})
+        return reflections
+
+    def observe_claim(self, subject: str, predicate: str, obj: str, *, confidence: float = 1.0, evidence: dict | None = None) -> dict:
+        subj = subject.lower()
+        pred = predicate.lower()
+        observed_obj = obj.lower()
+        ev = dict(evidence or {})
+        current = self.get(subj, pred)
+        if current is None:
+            claim_id = self.record_claim(subj, pred, observed_obj, confidence=confidence, status="accepted", evidence=ev)
+            self.upsert(
+                subj,
+                pred,
+                observed_obj,
+                confidence=confidence,
+                evidence={**ev, "claim_id": claim_id, "claim_status": "accepted"},
+            )
+            return {"status": "accepted", "claim_id": claim_id, "current_object": observed_obj, "observed_object": observed_obj}
+
+        current_obj, current_conf, current_ev = current
+        if current_obj == observed_obj:
+            claim_id = self.record_claim(subj, pred, observed_obj, confidence=confidence, status="corroborated", evidence=ev)
+            merged_ev = merge_epistemic_evidence_dict(dict(current_ev), {**ev, "claim_id": claim_id, "claim_status": "corroborated"})
+            self.upsert(subj, pred, observed_obj, confidence=max(float(current_conf), float(confidence)), evidence=merged_ev)
+            return {"status": "corroborated", "claim_id": claim_id, "current_object": current_obj, "observed_object": observed_obj}
+
+        conflict_ev = {
+            **ev,
+            "conflicts_with": {
+                "subject": subj,
+                "predicate": pred,
+                "object": current_obj,
+                "confidence": current_conf,
+                "evidence": current_ev,
+            },
+            "counterfactual": {
+                "if_accepted": {"subject": subj, "predicate": pred, "object": observed_obj},
+                "would_change_answer_from": current_obj,
+                "would_change_answer_to": observed_obj,
+            },
+        }
+        claim_id = self.record_claim(subj, pred, observed_obj, confidence=confidence, status="conflict", evidence=conflict_ev)
+        return {
+            "status": "conflict",
+            "claim_id": claim_id,
+            "current_object": current_obj,
+            "current_confidence": current_conf,
+            "observed_object": observed_obj,
+            "counterfactual": conflict_ev["counterfactual"],
+        }
 
     def get(self, subject: str, predicate: str) -> tuple[str, float, dict] | None:
         with self._connect() as con:
@@ -218,12 +612,6 @@ class PersistentSemanticMemory:
         if row is None or int(row[1]) == 0:
             return None
         return float(row[0])
-
-    def seed_locations(self, facts: Sequence[tuple[str, str]] | None = None) -> None:
-        if facts is None:
-            facts = _DEMO_LOCATION_PAIRS
-        for name, city in facts:
-            self.upsert(name, "location", city, confidence=1.0, evidence={"source": "seed_fact", "instruments": ["seed_schema"]})
 
     def merge_epistemic_evidence(self, subject: str, predicate: str, incoming: dict) -> None:
         got = self.get(subject, predicate)
@@ -332,6 +720,11 @@ class WorkspaceJournal:
             )
         return out
 
+    def count(self) -> int:
+        with self._connect() as con:
+            row = con.execute("SELECT COUNT(*) FROM workspace_journal").fetchone()
+        return int(row[0])
+
 
 def cognitive_frame_from_episode_row(row: dict) -> CognitiveFrame:
     ev = dict(row["evidence"])
@@ -424,6 +817,47 @@ class GlobalWorkspace:
         return [asdict(f) for f in self.frames]
 
 
+class CognitiveBackgroundWorker:
+    """In-process consolidation loop for persisted cognitive substrate state."""
+
+    def __init__(self, mind: "BrocaMind", *, interval_s: float = 5.0):
+        self.mind = mind
+        self.interval_s = max(0.1, float(interval_s))
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+        self.iterations = 0
+        self.last_error: str | None = None
+
+    @property
+    def running(self) -> bool:
+        return self._thread is not None and self._thread.is_alive()
+
+    def start(self) -> None:
+        if self.running:
+            return
+        self._stop.clear()
+        self._thread = threading.Thread(target=self._loop, name="broca-consolidator", daemon=True)
+        self._thread.start()
+
+    def stop(self, timeout: float = 2.0) -> None:
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=max(0.0, float(timeout)))
+
+    def run_once(self) -> list[dict]:
+        out = self.mind.consolidate_once()
+        self.iterations += 1
+        self.last_error = None
+        return out
+
+    def _loop(self) -> None:
+        while not self._stop.wait(self.interval_s):
+            try:
+                self.run_once()
+            except Exception as exc:  # pragma: no cover - background safety net
+                self.last_error = repr(exc)
+
+
 class LexicalPlanGraft(BaseGraft):
     """Writes a planned next word into the frozen host's residual stream.
 
@@ -435,6 +869,7 @@ class LexicalPlanGraft(BaseGraft):
     def __init__(self, *, strength: float = 28.0):
         super().__init__()
         self.strength = float(strength)
+        self.mixer_priority = 2.0
         self.last_token_id: int | None = None
         self.last_token: str | None = None
 
@@ -476,6 +911,7 @@ class TrainableBrocaGraft(BaseGraft):
         self.d_features = int(d_features)
         self.max_steps = int(max_steps)
         self.strength = float(strength)
+        self.mixer_priority = 0.35
         self.norm = nn.LayerNorm(d_features)
         self.step_emb = nn.Embedding(max_steps, step_dim)
         self.net = nn.Sequential(
@@ -494,7 +930,8 @@ class TrainableBrocaGraft(BaseGraft):
         feats = state["broca_features"]
         if not isinstance(feats, torch.Tensor):
             feats = torch.tensor(feats, device=x.device, dtype=x.dtype)
-        feats = feats.to(x.device, x.dtype)
+        param_dtype = self.norm.weight.dtype
+        feats = feats.to(x.device, param_dtype)
         if feats.ndim == 1:
             feats = feats.view(1, -1).expand(x.shape[0], -1)
         if feats.shape[-1] != self.d_features:
@@ -503,19 +940,13 @@ class TrainableBrocaGraft(BaseGraft):
         if not isinstance(step, torch.Tensor):
             step = torch.full((x.shape[0],), int(step), device=x.device, dtype=torch.long)
         step = step.to(x.device).long().view(-1).clamp(0, self.max_steps - 1)
-        z = torch.cat([self.norm(feats), self.step_emb(step).to(x.dtype)], dim=-1)
-        delta = (self.net(z) * self.strength).to(dtype=x.dtype)
+        z = torch.cat([self.norm(feats), self.step_emb(step).to(device=x.device, dtype=param_dtype)], dim=-1)
+        delta = (self.net(z) * self.strength).to(device=x.device, dtype=x.dtype)
         out = x.clone()
         last = state["last_indices"].to(x.device)
         rows = torch.arange(x.shape[0], device=x.device)
         out[rows, last] += delta
         return out
-
-
-def seed_everything(seed: int) -> None:
-    random.seed(seed)
-    torch.manual_seed(seed)
-    torch.set_num_threads(1)
 
 
 def _batch_from_ids(rows: Sequence[Sequence[int]], pad_id: int, *, device: torch.device | str | None = None):
@@ -555,10 +986,11 @@ def generate_from_plan(
     *,
     prefix: str | None = None,
     max_new_tokens: int | None = None,
+    broca_features: torch.Tensor | None = None,
 ) -> str:
     plan_ids = list(tokenizer.encode_plan_words(plan_tokens))
     max_new_tokens = max_new_tokens or len(plan_ids)
-    ids = tokenizer.encode(prefix if prefix is not None else SPEECH_BRIDGE_PREFIX)
+    ids = speech_seed_ids(tokenizer, prefix)
     generated: list[int] = []
     device = next(model.parameters()).device
     steps = range(min(max_new_tokens, len(plan_ids)))
@@ -572,6 +1004,7 @@ def generate_from_plan(
                 "broca_plan_token_ids": torch.tensor([plan_ids], device=device),
                 "broca_step": torch.tensor([step], device=device),
                 "tokenizer": tokenizer,
+                **({"broca_features": broca_features.to(device)} if broca_features is not None else {}),
             },
         )
         pred = int(logits[0, mask.long().sum().item() - 1].argmax().item())
@@ -579,24 +1012,8 @@ def generate_from_plan(
     return decode_generation(tokenizer, generated)
 
 
-def generate_from_features(model: nn.Module, tokenizer: Any, features: torch.Tensor, *, prefix: str | None = None, max_new_tokens: int = 32) -> str:
-    ids = tokenizer.encode(prefix if prefix is not None else SPEECH_BRIDGE_PREFIX)
-    generated: list[int] = []
-    device = next(model.parameters()).device
-    feats = features.to(device).float().view(1, -1)
-    for step in range(max_new_tokens):
-        row = ids + generated
-        batch_ids, mask, _ = _batch_from_ids([row], tokenizer.pad_id, device=device)
-        logits = model(batch_ids, mask, extra_state={"broca_features": feats, "broca_step": torch.tensor([step], device=device)})
-        pred = int(logits[0, mask.long().sum().item() - 1].argmax().item())
-        generated.append(pred)
-        if decode_generation(tokenizer, generated).rstrip().endswith("."):
-            break
-    return decode_generation(tokenizer, generated)
-
-
 def generate_without_broca(model: nn.Module, tokenizer: Any, *, prefix: str | None = None, max_new_tokens: int = 5) -> str:
-    ids = tokenizer.encode(prefix if prefix is not None else SPEECH_BRIDGE_PREFIX)
+    ids = speech_seed_ids(tokenizer, prefix)
     generated: list[int] = []
     device = next(model.parameters()).device
     for _ in range(max_new_tokens):
@@ -606,6 +1023,222 @@ def generate_without_broca(model: nn.Module, tokenizer: Any, *, prefix: str | No
         pred = int(logits[0, mask.long().sum().item() - 1].argmax().item())
         generated.append(pred)
     return decode_generation(tokenizer, generated)
+
+
+@dataclass
+class FacultyCandidate:
+    name: str
+    score: float
+    build: Callable[[], CognitiveFrame]
+    evidence: dict[str, Any] = field(default_factory=dict)
+
+
+class CognitiveRouter:
+    """Always-on faculty router over memory, action, and causal candidates.
+
+    Each faculty receives every utterance and emits a scored latent frame. The
+    selected frame is the highest precision candidate above a low relevance
+    floor; otherwise the workspace still receives an ``unknown`` frame with the
+    candidate traces attached.
+    """
+
+    action_descriptors = (
+        "action",
+        "take",
+        "choose",
+        "decide",
+        "should",
+        "policy",
+        "listen",
+        "open",
+        "expected free energy",
+    )
+    causal_descriptors = (
+        "causal",
+        "effect",
+        "intervention",
+        "treatment",
+        "help",
+        "helps",
+        "hurt",
+        "do calculus",
+        "ate",
+    )
+
+    def __init__(self, *, relevance_floor: float = 0.28):
+        self.relevance_floor = float(relevance_floor)
+
+    def route(self, mind: "BrocaMind", utterance: str, toks: Sequence[str]) -> CognitiveFrame:
+        candidates: list[FacultyCandidate] = []
+        claim = _claim_from_tokens(toks)
+        query = _query_from_tokens(toks)
+
+        if claim is not None:
+            candidates.append(FacultyCandidate("semantic_claim", 1.45, lambda claim=claim: self._memory_write(mind, utterance, claim)))
+        if query is not None:
+            candidates.append(FacultyCandidate("semantic_query", 1.35, lambda query=query: self._memory_query(mind, utterance, toks, query)))
+
+        active_score = 0.1 + _route_relevance(utterance, toks, self.action_descriptors, mind.text_encoder)
+        candidates.append(FacultyCandidate("active_inference", active_score, lambda: self._active_action(mind)))
+
+        causal_score = 0.1 + _route_relevance(utterance, toks, self.causal_descriptors, mind.text_encoder)
+        candidates.append(FacultyCandidate("causal_effect", causal_score, lambda: self._causal_effect(mind)))
+
+        ranked = sorted(candidates, key=lambda c: c.score, reverse=True)
+        selected = ranked[0] if ranked and ranked[0].score >= self.relevance_floor else None
+        frame = selected.build() if selected is not None else CognitiveFrame("unknown", answer="unknown", confidence=0.0, evidence={"route": "none"})
+        frame.evidence = {
+            **dict(frame.evidence),
+            "router_selected": selected.name if selected is not None else "unknown",
+            "router_candidates": [
+                {"name": c.name, "score": round(float(c.score), 6)}
+                for c in ranked
+            ],
+            "intrinsic_cues": [asdict(cue) for cue in mind.workspace.intrinsic_cues],
+        }
+        return frame
+
+    def _memory_write(self, mind: "BrocaMind", utterance: str, claim: ParsedClaim) -> CognitiveFrame:
+        ev = {
+            "source": "observed_utterance",
+            "utterance": utterance,
+            "predicate": claim.predicate,
+            "instruments": ["runtime_observation"],
+            **dict(claim.evidence),
+        }
+        observed = mind.memory.observe_claim(
+            claim.subject,
+            claim.predicate,
+            claim.obj,
+            confidence=float(claim.confidence),
+            evidence=ev,
+        )
+        if observed["status"] == "conflict":
+            return CognitiveFrame(
+                "memory_conflict",
+                subject=claim.subject,
+                answer=str(observed["current_object"]),
+                confidence=float(observed.get("current_confidence", 0.0)),
+                evidence={
+                    "predicate": claim.predicate,
+                    "claimed_answer": claim.obj,
+                    "claim_id": observed["claim_id"],
+                    "claim_status": observed["status"],
+                    "counterfactual": observed["counterfactual"],
+                    "source": "observed_utterance",
+                    "instruments": ["runtime_observation", "counterfactual_belief_update"],
+                },
+            )
+        return CognitiveFrame(
+            "memory_write",
+            subject=claim.subject,
+            answer=claim.obj,
+            confidence=float(claim.confidence),
+            evidence={
+                "predicate": claim.predicate,
+                "claim_id": observed["claim_id"],
+                "claim_status": observed["status"],
+                "source": "observed_utterance",
+                "instruments": ["runtime_observation"],
+            },
+        )
+
+    def _memory_query(self, mind: "BrocaMind", utterance: str, toks: Sequence[str], query: ParsedQuery) -> CognitiveFrame:
+        rec = mind.memory.get(query.subject, query.predicate) if query.subject else None
+        if rec is None:
+            return CognitiveFrame(
+                "unknown",
+                subject=query.subject,
+                answer="unknown",
+                confidence=0.0,
+                evidence={"missing": "semantic_memory", "predicate": query.predicate, **dict(query.evidence)},
+            )
+
+        obj, conf, ev = rec
+        frame = CognitiveFrame("memory_location" if query.predicate == "location" else "memory_lookup", subject=query.subject, answer=obj, confidence=conf, evidence=dict(ev))
+        mu_pop = mind.memory.mean_confidence()
+        frame.evidence["semantic_mean_confidence"] = max(SEMANTIC_CONFIDENCE_FLOOR, float(mu_pop or 0.0))
+        frame.evidence["predicate"] = query.predicate
+
+        known_objects = mind.memory.distinct_objects_for_predicate(query.predicate)
+        mentioned_objects = [t for t in toks if t in known_objects]
+        conflicting = bool(mentioned_objects and mentioned_objects[-1] != obj.lower())
+        if not conflicting:
+            return frame
+
+        plan_words = frame.speech_plan()
+        broca_features = frame.to_features(mind.text_encoder)
+        ce_g, ce_p, gap = lexical_surprise_gap(
+            mind.host,
+            mind.tokenizer,
+            utterance=utterance,
+            plan_words=plan_words,
+            broca_features=broca_features,
+        )
+        frame.evidence["prediction_ce_graft"] = ce_g
+        frame.evidence["prediction_ce_plain"] = ce_p
+        frame.evidence["prediction_gap"] = gap
+        if gap <= 0.0:
+            return frame
+
+        coupled = mind.unified_agent.decide()
+        return CognitiveFrame(
+            "prediction_error",
+            subject=query.subject,
+            answer=obj,
+            confidence=conf,
+            evidence={
+                **dict(frame.evidence),
+                "delta_ce": gap,
+                "coupled_faculty": coupled.faculty,
+                "wake_action": coupled.action_name,
+                "spatial_min_G": coupled.spatial_min_G,
+                "causal_min_G": coupled.causal_min_G,
+            },
+        )
+
+    def _active_action(self, mind: "BrocaMind") -> CognitiveFrame:
+        coupled = mind.unified_agent.decide()
+        posterior_spatial = {
+            mind.pomdp.action_names[i]: float(p)
+            for i, p in enumerate(coupled.spatial_decision.posterior_over_policies[: len(mind.pomdp.action_names)])
+        }
+        causal_names = mind.causal_pomdp.action_names
+        posterior_causal = {
+            causal_names[i]: float(p)
+            for i, p in enumerate(coupled.causal_decision.posterior_over_policies[: len(causal_names)])
+        }
+        conf = (
+            max(coupled.spatial_decision.posterior_over_policies)
+            if coupled.faculty == "spatial"
+            else max(coupled.causal_decision.posterior_over_policies)
+        )
+        return CognitiveFrame(
+            "active_action",
+            answer=coupled.action_name,
+            confidence=float(conf),
+            evidence={
+                "coupled_faculty": coupled.faculty,
+                "spatial_min_G": coupled.spatial_min_G,
+                "causal_min_G": coupled.causal_min_G,
+                "expected_free_energy_spatial": min(ev.expected_free_energy for ev in coupled.spatial_decision.policies),
+                "expected_free_energy_causal": min(ev.expected_free_energy for ev in coupled.causal_decision.policies),
+                "policy_posterior": posterior_spatial,
+                "causal_policy_posterior": posterior_causal,
+            },
+        )
+
+    def _causal_effect(self, mind: "BrocaMind") -> CognitiveFrame:
+        p1 = mind.scm.probability({"Y": 1}, interventions={"T": 1})
+        p0 = mind.scm.probability({"Y": 1}, interventions={"T": 0})
+        ate = p1 - p0
+        return CognitiveFrame(
+            "causal_effect",
+            subject="treatment",
+            answer="helps" if ate >= 0 else "hurts",
+            confidence=float(min(1.0, abs(ate))),
+            evidence={"p_do_positive": p1, "p_do_negative": p0, "ate": ate},
+        )
 
 
 class BrocaMind:
@@ -628,27 +1261,59 @@ class BrocaMind:
         self.seed = seed
         resolved_device = device if isinstance(device, torch.device) else pick_torch_device(device)
         mid = llama_model_id or DEFAULT_BROCA_MODEL_ID
-        self.host, self.tokenizer = load_llama_broca_host(mid, device=resolved_device, token=hf_token)
-        graft_strength = lexical_strength if lexical_strength is not None else default_lexical_strength(self.host)
-        self.lexical_graft = LexicalPlanGraft(strength=graft_strength)
-        self.host.add_graft("final_hidden", self.lexical_graft)
         self.memory = PersistentSemanticMemory(db_path, namespace=namespace)
-        if self.memory.count() == 0:
-            self.memory.seed_locations()
         self.journal = WorkspaceJournal(Path(db_path))
         self.episode_graph = EpisodeAssociationGraph(Path(db_path))
         self._last_journal_id: int | None = None
+        self.host, self.tokenizer = load_llama_broca_host(mid, device=resolved_device, token=hf_token)
+        self.text_encoder = frozen_subword_projector_from_model(self.host, self.tokenizer)
+        graft_strength = lexical_strength if lexical_strength is not None else default_lexical_strength(self.host)
+        self.lexical_graft = LexicalPlanGraft(strength=graft_strength)
+        self.host.add_graft("final_hidden", self.lexical_graft)
+        self.feature_graft = TrainableBrocaGraft(
+            COGNITIVE_FRAME_DIM,
+            int(getattr(self.host.cfg, "d_model", 96)),
+            strength=0.1,
+        )
+        params = getattr(self.host, "parameters", None)
+        if callable(params):
+            host_param = next(params(), None)
+            if host_param is not None:
+                self.feature_graft.to(host_param.device)
+        self.host.add_graft("final_hidden", self.feature_graft)
         self.workspace = GlobalWorkspace()
+        self.router = CognitiveRouter()
         self.pomdp = build_tiger_pomdp()
         self.active_agent = ActiveInferenceAgent(self.pomdp, horizon=1, learn=False)
         self.scm = build_simpson_scm()
         self.causal_pomdp = build_causal_epistemic_pomdp(self.scm)
         self.causal_agent = ActiveInferenceAgent(self.causal_pomdp, horizon=1, learn=False)
         self.unified_agent = CoupledEFEAgent(self.active_agent, self.causal_agent)
+        self._background_worker: CognitiveBackgroundWorker | None = None
+
+    @property
+    def background_worker(self) -> CognitiveBackgroundWorker | None:
+        return self._background_worker
+
+    def consolidate_once(self) -> list[dict]:
+        return self.memory.consolidate_claims_once()
+
+    def start_background(self, *, interval_s: float = 5.0) -> CognitiveBackgroundWorker:
+        if self._background_worker is None:
+            self._background_worker = CognitiveBackgroundWorker(self, interval_s=interval_s)
+        else:
+            self._background_worker.interval_s = max(0.1, float(interval_s))
+        self._background_worker.start()
+        return self._background_worker
+
+    def stop_background(self) -> None:
+        if self._background_worker is not None:
+            self._background_worker.stop()
 
     def _intrinsic_scan(self, toks: list[str]) -> None:
         self.workspace.intrinsic_cues.clear()
         mu_pop = self.memory.mean_confidence()
+        confidence_floor = SEMANTIC_CONFIDENCE_FLOOR if mu_pop is None else max(SEMANTIC_CONFIDENCE_FLOOR, float(mu_pop))
         toks_set = set(toks)
         for ent in self.memory.subjects_for_predicate("location"):
             if ent not in toks_set:
@@ -656,9 +1321,9 @@ class BrocaMind:
             rec = self.memory.get(ent, "location")
             if rec is None:
                 self.workspace.intrinsic_cues.append(IntrinsicCue(1.0, "memory_gap", {"subject": ent}))
-            elif mu_pop is not None and rec[1] < mu_pop:
+            elif rec[1] < confidence_floor:
                 self.workspace.intrinsic_cues.append(
-                    IntrinsicCue(float(mu_pop - rec[1]), "memory_low_confidence", {"subject": ent, "confidence": rec[1]})
+                    IntrinsicCue(float(confidence_floor - rec[1]), "memory_low_confidence", {"subject": ent, "confidence": rec[1]})
                 )
         cq = self.causal_agent.qs
         if cq is not None and len(cq) >= 2:
@@ -670,102 +1335,24 @@ class BrocaMind:
     def comprehend(self, utterance: str) -> CognitiveFrame:
         toks = utterance_words(utterance)
         self._intrinsic_scan(toks)
-        frame: CognitiveFrame
-        if "where" in toks and "is" in toks:
-            try:
-                subject = toks[toks.index("is") + 1]
-            except Exception:
-                subject = ""
-            rec = self.memory.get(subject, "location") if subject else None
-            if rec:
-                obj, conf, ev = rec
-                frame = CognitiveFrame("memory_location", subject=subject, answer=obj, confidence=conf, evidence=dict(ev))
-                mu_pop = self.memory.mean_confidence()
-                if mu_pop is not None:
-                    frame.evidence["semantic_mean_confidence"] = mu_pop
-                known_locations = self.memory.distinct_objects_for_predicate("location")
-                mentioned_locations = [t for t in toks if t in known_locations]
-                conflicting = bool(mentioned_locations and mentioned_locations[-1] != obj.lower())
-                if conflicting:
-                    plan_words = frame.speech_plan()
-                    ce_g, ce_p, gap = lexical_surprise_gap(self.host, self.tokenizer, utterance=utterance, plan_words=plan_words)
-                    frame.evidence["prediction_ce_graft"] = ce_g
-                    frame.evidence["prediction_ce_plain"] = ce_p
-                    frame.evidence["prediction_gap"] = gap
-                    if gap > 0.0:
-                        coupled = self.unified_agent.decide()
-                        frame = CognitiveFrame(
-                            "prediction_error",
-                            subject=subject,
-                            answer=obj,
-                            confidence=conf,
-                            evidence={
-                                **dict(frame.evidence),
-                                "delta_ce": gap,
-                                "coupled_faculty": coupled.faculty,
-                                "wake_action": coupled.action_name,
-                                "spatial_min_G": coupled.spatial_min_G,
-                                "causal_min_G": coupled.causal_min_G,
-                            },
-                        )
-            else:
-                frame = CognitiveFrame("unknown", subject=subject, answer="unknown", confidence=0.0, evidence={"missing": "semantic_memory"})
-        elif "action" in toks or "take" in toks:
-            coupled = self.unified_agent.decide()
-            posterior_spatial = {
-                self.pomdp.action_names[i]: float(p)
-                for i, p in enumerate(coupled.spatial_decision.posterior_over_policies[: len(self.pomdp.action_names)])
-            }
-            causal_names = self.causal_pomdp.action_names
-            posterior_causal = {
-                causal_names[i]: float(p)
-                for i, p in enumerate(coupled.causal_decision.posterior_over_policies[: len(causal_names)])
-            }
-            conf = (
-                max(coupled.spatial_decision.posterior_over_policies)
-                if coupled.faculty == "spatial"
-                else max(coupled.causal_decision.posterior_over_policies)
-            )
-            frame = CognitiveFrame(
-                "active_action",
-                answer=coupled.action_name,
-                confidence=float(conf),
-                evidence={
-                    "coupled_faculty": coupled.faculty,
-                    "spatial_min_G": coupled.spatial_min_G,
-                    "causal_min_G": coupled.causal_min_G,
-                    "expected_free_energy_spatial": min(ev.expected_free_energy for ev in coupled.spatial_decision.policies),
-                    "expected_free_energy_causal": min(ev.expected_free_energy for ev in coupled.causal_decision.policies),
-                    "policy_posterior": posterior_spatial,
-                    "causal_policy_posterior": posterior_causal,
-                },
-            )
-        elif "treatment" in toks or "help" in toks or "helps" in toks:
-            p1 = self.scm.probability({"Y": 1}, interventions={"T": 1})
-            p0 = self.scm.probability({"Y": 1}, interventions={"T": 0})
-            ate = p1 - p0
-            frame = CognitiveFrame(
-                "causal_effect",
-                subject="treatment",
-                answer="helps" if ate >= 0 else "hurts",
-                confidence=float(min(1.0, abs(ate))),
-                evidence={"p_do_positive": p1, "p_do_negative": p0, "ate": ate},
-            )
-        else:
-            frame = CognitiveFrame("unknown", answer="unknown", confidence=0.0, evidence={"route": "none"})
+        frame = self.router.route(self, utterance, toks)
+        return self._commit_frame(utterance, toks, frame)
+
+    def _commit_frame(self, utterance: str, toks: Sequence[str], frame: CognitiveFrame) -> CognitiveFrame:
         jid = self.journal.append(utterance, frame)
         frame.evidence = {**frame.evidence, "journal_id": jid}
         if self._last_journal_id is not None:
             self.episode_graph.bump(self._last_journal_id, jid)
         self._last_journal_id = jid
         if frame.intent == "prediction_error":
-            known_locations = self.memory.distinct_objects_for_predicate("location")
-            cities_in = [t for t in toks if t in known_locations]
-            if cities_in and frame.subject:
+            pred = str(frame.evidence.get("predicate", "location"))
+            known_objects = self.memory.distinct_objects_for_predicate(pred)
+            observed_objects = [t for t in toks if t in known_objects]
+            if observed_objects and frame.subject:
                 self.memory.upsert(
                     frame.subject,
-                    "location",
-                    cities_in[-1],
+                    pred,
+                    observed_objects[-1],
                     confidence=1.0,
                     evidence={"journal_id": jid, "resolver": "prediction_error"},
                 )
@@ -791,249 +1378,13 @@ class BrocaMind:
         return replay
 
     def speak(self, frame: CognitiveFrame) -> str:
-        return generate_from_plan(self.host, self.tokenizer, frame.speech_plan())
+        return generate_from_plan(
+            self.host,
+            self.tokenizer,
+            frame.speech_plan(),
+            broca_features=frame.to_features(self.text_encoder),
+        )
 
     def answer(self, utterance: str) -> tuple[CognitiveFrame, str]:
         frame = self.comprehend(utterance)
         return frame, self.speak(frame)
-
-
-def build_training_frames() -> list[CognitiveFrame]:
-    frames: list[CognitiveFrame] = [
-        CognitiveFrame("memory_location", subject=name, answer=city, confidence=1.0) for name, city in _DEMO_LOCATION_PAIRS
-    ]
-    frames.extend(
-        [
-            CognitiveFrame("active_action", answer="listen", confidence=0.72, evidence={"policy_posterior": {"listen": 0.72, "open_left": 0.14, "open_right": 0.14}}),
-            CognitiveFrame("active_action", answer="open_left", confidence=0.92, evidence={"policy_posterior": {"listen": 0.04, "open_left": 0.92, "open_right": 0.04}}),
-            CognitiveFrame("active_action", answer="open_right", confidence=0.91, evidence={"policy_posterior": {"listen": 0.05, "open_left": 0.04, "open_right": 0.91}}),
-            CognitiveFrame("causal_effect", subject="treatment", answer="helps", confidence=0.9, evidence={"p_do_positive": 0.55, "p_do_negative": 0.45, "ate": 0.10}),
-            CognitiveFrame("causal_effect", subject="treatment", answer="hurts", confidence=0.9, evidence={"p_do_positive": 0.35, "p_do_negative": 0.55, "ate": -0.20}),
-            CognitiveFrame(
-                "synthesis_bundle",
-                subject="ada",
-                answer="rome",
-                confidence=0.85,
-                evidence={
-                    "episode_ids": [1, 2],
-                    "instruments": ["working_memory_synthesis", "semantic_location", "scm_do_readout"],
-                    "causal_ate": 0.1,
-                },
-            ),
-            CognitiveFrame("prediction_error", subject="ada", answer="rome", confidence=0.55, evidence={"delta_ce": 0.4}),
-            CognitiveFrame("unknown", answer="unknown", confidence=0.0),
-        ]
-    )
-    return frames
-
-
-def broca_canonical_eval_queries() -> list[str]:
-    """Smoke queries for bundled comprehension demos (_DEMO_LOCATION_PAIRS + routing tuples)."""
-
-    return [
-        f"where is {_DEMO_LOCATION_PAIRS[0][0]} ?",
-        " ".join(("what", "action", "should", "i", "take", "?")),
-        " ".join(("does", "treatment", "help", "?")),
-    ]
-
-
-def _broca_teacher_forcing_dataset(tokenizer: Any, frames: Sequence[CognitiveFrame]) -> tuple[
-    torch.Tensor,
-    torch.Tensor,
-    torch.Tensor,
-    torch.Tensor,
-    torch.Tensor,
-    torch.Tensor,
-    list[tuple[str, str]],
-    int,
-]:
-    rows: list[list[int]] = []
-    feats: list[torch.Tensor] = []
-    steps_list: list[int] = []
-    targets: list[int] = []
-    examples: list[tuple[str, str]] = []
-    prefix = tokenizer.encode(SPEECH_BRIDGE_PREFIX)
-    max_step_seen = 0
-    for frame in frames:
-        plan = [str(tok).lower() for tok in frame.speech_plan()]
-        plan_ids = list(tokenizer.encode_plan_words(plan))
-        for j, target_id in enumerate(plan_ids):
-            rows.append(prefix + plan_ids[:j])
-            feats.append(frame.to_features())
-            steps_list.append(j)
-            targets.append(target_id)
-            max_step_seen = max(max_step_seen, j)
-        examples.append((" ".join(plan), frame.intent))
-    bridge_max_steps = max(8, max_step_seen + 1)
-    ids, mask, lengths = _batch_from_ids(rows, tokenizer.pad_id)
-    return (
-        ids,
-        mask,
-        lengths,
-        torch.stack(feats),
-        torch.tensor(steps_list, dtype=torch.long),
-        torch.tensor(targets, dtype=torch.long),
-        examples,
-        bridge_max_steps,
-    )
-
-
-def train_broca_bridge(
-    seed: int = 0,
-    steps: int = 80,
-    *,
-    llama_model_id: str | None = None,
-    device: torch.device | str | None = None,
-    hf_token: str | bool | None = None,
-) -> dict:
-    seed_everything(seed)
-    resolved_device = device if isinstance(device, torch.device) else pick_torch_device(device)
-    mid = llama_model_id or DEFAULT_BROCA_MODEL_ID
-    model, tokenizer = load_llama_broca_host(mid, device=resolved_device, token=hf_token)
-    frames = build_training_frames()
-    ids, mask, lengths, feats, step_ids, targets, _examples, bridge_max_steps = _broca_teacher_forcing_dataset(tokenizer, frames)
-
-    bridge = TrainableBrocaGraft(FEATURE_DIM, model.cfg.d_model, max_steps=bridge_max_steps, strength=1.0)
-    model.add_graft("final_hidden", bridge)
-    for par in bridge.parameters():
-        par.requires_grad = True
-
-    dev = next(model.parameters()).device
-    ids = ids.to(dev)
-    mask = mask.to(dev)
-    lengths = lengths.to(dev)
-    feats = feats.to(dev, dtype=torch.float32)
-    step_ids = step_ids.to(dev)
-    targets = targets.to(dev)
-
-    bridge.to(device=dev)
-    last = lengths - 1
-
-    def eval_teacher() -> tuple[float, list[str]]:
-        with torch.no_grad():
-            logits = model(ids, mask, extra_state={"broca_features": feats, "broca_step": step_ids})
-            pred_ids = logits[torch.arange(ids.shape[0], device=dev), last].argmax(dim=-1)
-            acc = float((pred_ids == targets).float().mean().item())
-            return acc, [tokenizer.decode_id(int(x)) for x in pred_ids[:12]]
-
-    before, before_sample = eval_teacher()
-    opt = torch.optim.AdamW(bridge.parameters(), lr=0.045, weight_decay=0.0)
-    final_loss = 0.0
-    for _ in range(steps):
-        opt.zero_grad(set_to_none=True)
-        logits = model(ids, mask, extra_state={"broca_features": feats, "broca_step": step_ids})
-        loss = F.cross_entropy(logits[torch.arange(ids.shape[0], device=dev), last], targets)
-        loss.backward()
-        opt.step()
-        final_loss = float(loss.detach().item())
-    after, after_sample = eval_teacher()
-
-    targets_text = [" ".join(f.speech_plan()) for f in frames[:5]]
-    max_lens = [
-        len(tokenizer.encode_plan_words([str(t).lower() for t in f.speech_plan()])) + 4 for f in frames[:5]
-    ]
-    generated = [
-        generate_from_features(model, tokenizer, f.to_features(), max_new_tokens=min(32, int(max_lens[i])))
-        for i, f in enumerate(frames[:5])
-    ]
-
-    total, trainable = count_parameters(model)
-    return {
-        "model": model,
-        "tokenizer": tokenizer,
-        "before_accuracy": before,
-        "after_accuracy": after,
-        "before_sample": before_sample,
-        "after_sample": after_sample,
-        "generated": generated,
-        "targets": targets_text,
-        "final_loss": final_loss,
-        "total_params": total,
-        "trainable_params": trainable,
-        "bridge_params": sum(p.numel() for p in bridge.parameters()),
-    }
-
-
-def run_broca_experiment(
-    seed: int = 0,
-    db_path: str | Path = "runs/broca_semantic_memory.sqlite",
-    verbose: bool = True,
-    *,
-    llama_model_id: str | None = None,
-    device: torch.device | str | None = None,
-    hf_token: str | bool | None = None,
-    train_bridge: bool = True,
-    train_bridge_steps: int = 80,
-) -> dict:
-    path = Path(db_path)
-    if path.exists():
-        path.unlink()
-    for suffix in ("-wal", "-shm"):
-        sp = Path(str(path) + suffix)
-        if sp.exists():
-            sp.unlink()
-
-    mind = BrocaMind(
-        seed=seed,
-        db_path=path,
-        namespace=f"broca_{seed}",
-        llama_model_id=llama_model_id,
-        device=device,
-        hf_token=hf_token,
-    )
-    total, trainable = count_parameters(mind.host)
-    language_only = generate_without_broca(mind.host, mind.tokenizer, prefix=None, max_new_tokens=5)
-    queries = broca_canonical_eval_queries()
-    rows: list[dict] = []
-    for q in queries:
-        frame, utterance = mind.answer(q)
-        rows.append({"query": q, "intent": frame.intent, "latent_answer": frame.answer, "speech": utterance, "evidence": frame.evidence})
-
-    train_result: dict = {}
-    if train_bridge:
-        train_result = train_broca_bridge(
-            seed=seed,
-            steps=train_bridge_steps,
-            llama_model_id=llama_model_id,
-            device=device,
-            hf_token=hf_token,
-        )
-
-    trainable_meta = {k: v for k, v in train_result.items() if k not in {"model", "tokenizer"}} if train_result else {}
-
-    result = {
-        "host_params": total,
-        "host_trainable_params": trainable,
-        "semantic_records": mind.memory.count(),
-        "language_only": language_only,
-        "rows": rows,
-        "trainable_broca": trainable_meta,
-        "model_id": llama_model_id or DEFAULT_BROCA_MODEL_ID,
-    }
-
-    if verbose:
-        print("\n=== 6) LLM-as-Broca architecture ===")
-        print("The language host is treated as a speech/planning interface. Memory, action selection, and causality live outside it and publish latent frames.")
-        print(f"frozen Broca host params={total:,}; trainable host params before trainable bridge={trainable:,}")
-        print(f"persistent semantic memory records={mind.memory.count()}; db={path}")
-        print("\nLanguage host with no Broca/faculty state:")
-        print(f"  {SPEECH_BRIDGE_PREFIX} -> {language_only}")
-        print("\nCognitive substrate -> Broca verbalization:")
-        print(f"{'query':<32} {'intent':<17} {'latent':<10} speech")
-        print(f"{'-'*32} {'-'*17} {'-'*10} {'-'*34}")
-        for r in rows:
-            print(f"{r['query']:<32} {r['intent']:<17} {r['latent_answer']:<10} {r['speech']}")
-        if train_bridge and train_result:
-            print("\nTrainable Broca bridge:")
-            print("  frozen host + trainable frame-to-residual graft, trained by teacher forcing on semantic frames")
-            print(f"  bridge params={train_result['bridge_params']:,}; trainable total={train_result['trainable_params']:,}; final_loss={train_result['final_loss']:.4f}")
-            print(f"  teacher-forced token accuracy before={train_result['before_accuracy']:.3f}; after={train_result['after_accuracy']:.3f}")
-            for target, gen in zip(train_result["targets"], train_result["generated"]):
-                ok = "✓" if target == gen else "·"
-                print(f"  {ok} target='{target}' generated='{gen}'")
-        elif not train_bridge:
-            print("\nTrainable Broca bridge: skipped (--no-train-bridge)")
-
-    return result
-
-

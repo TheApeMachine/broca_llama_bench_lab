@@ -14,6 +14,15 @@ class AddGraft(nn.Module):
         return x + 10.0
 
 
+class DeltaGraft(nn.Module):
+    def __init__(self, delta: float):
+        super().__init__()
+        self.delta = float(delta)
+
+    def forward(self, x, state):
+        return x + self.delta
+
+
 class FakeLayer(nn.Module):
     def forward(self, x, *args, **kwargs):
         return (x + 1.0,)
@@ -64,3 +73,17 @@ def test_llama_clear_slot_grafts_removes_layer_hook():
     assert 0 in host._hook_handles
     host.clear_slot_grafts(slot)
     assert 0 not in host._hook_handles
+
+
+def test_graft_mixer_prefers_stronger_intervention():
+    lm = FakeLlamaLM()
+    host = LlamaBrocaHost(lm)
+    slot = LlamaBrocaHost.layer_post_slot(0)
+    host.add_graft(slot, DeltaGraft(1.0))
+    host.add_graft(slot, DeltaGraft(10.0))
+
+    idx = torch.tensor([[1, 2, 3]])
+    _, cache = host(idx, extra_state={"graft_mixer_tau": 0.01}, return_cache=True)
+
+    diff = cache["layer.0.post.post"] - cache["layer.0.post.pre"]
+    assert torch.allclose(diff, torch.full_like(diff, 10.0), atol=1e-3)

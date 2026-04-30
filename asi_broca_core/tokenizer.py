@@ -13,6 +13,26 @@ _TOKEN_RE = re.compile(r"[A-Za-z0-9_]+|[^\sA-Za-z0-9_]")
 SPEECH_BRIDGE_PREFIX = "speak :"
 
 
+def speech_seed_ids(tokenizer, prefix: str | None = None) -> list[int]:
+    """Token IDs used to seed Broca speech generation.
+
+    The default is a neutral BOS/pad context rather than a semantic magic string.
+    Passing ``prefix`` preserves the older explicit cue behavior.
+    """
+
+    if prefix is not None:
+        return list(tokenizer.encode(prefix))
+    enc = getattr(tokenizer, "encode")
+    try:
+        ids = list(enc("", add_bos=True))
+    except TypeError:
+        ids = list(enc(""))
+    if ids:
+        return ids
+    pad = getattr(tokenizer, "pad_id", None)
+    return [int(pad)] if pad is not None else []
+
+
 def utterance_words(text: str) -> list[str]:
     """Lowercase word/punct tokens for routing (same rules as ``RegexTokenizer.tokenize``)."""
 
@@ -85,7 +105,7 @@ class RegexTokenizer:
     def encode_plan_words(self, words: Iterable[str]) -> list[int]:
         """Token IDs for a planned utterance (one ID per regex token, used by Broca grafts)."""
 
-        return [self.token_to_id[str(w).lower()] for w in words]
+        return [self.token_to_id.get(str(w).lower(), self.unk_id) for w in words]
 
     def batch_encode(self, texts: Sequence[str], *, device: torch.device | str | None = None) -> Batch:
         encoded = [self.encode(t) for t in texts]
@@ -113,5 +133,3 @@ class RegexTokenizer:
     @classmethod
     def load(cls, path: str | Path) -> "RegexTokenizer":
         return cls(json.loads(Path(path).read_text(encoding="utf-8")))
-
-

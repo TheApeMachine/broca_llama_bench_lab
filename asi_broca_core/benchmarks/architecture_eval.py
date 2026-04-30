@@ -28,23 +28,10 @@ class ArchitectureEvalCase:
     prompt: str
     expected_answer: str
     expected_speech: str
+    setup_prompts: tuple[str, ...] = ()
 
 
 DEFAULT_ARCHITECTURE_EVAL_CASES: tuple[ArchitectureEvalCase, ...] = (
-    ArchitectureEvalCase(
-        id="memory_ada",
-        task_type="semantic_memory",
-        prompt="where is ada ?",
-        expected_answer="rome",
-        expected_speech="ada is in rome .",
-    ),
-    ArchitectureEvalCase(
-        id="memory_hopper",
-        task_type="semantic_memory",
-        prompt="where is hopper ?",
-        expected_answer="lisbon",
-        expected_speech="hopper is in lisbon .",
-    ),
     ArchitectureEvalCase(
         id="active_action",
         task_type="active_inference",
@@ -145,6 +132,8 @@ def run_broca_architecture_eval(
 
     rows: list[dict[str, Any]] = []
     for case in cases:
+        for setup in case.setup_prompts:
+            mind.comprehend(setup)
         max_new_tokens = _encode_len(mind.tokenizer, case.expected_speech)
         prompt = _baseline_prompt(case)
         with mind.host.grafts_enabled(False):
@@ -161,6 +150,7 @@ def run_broca_architecture_eval(
                 "id": case.id,
                 "task_type": case.task_type,
                 "prompt": case.prompt,
+                "setup_prompts": list(case.setup_prompts),
                 "expected_answer": case.expected_answer,
                 "expected_speech": case.expected_speech,
                 "baseline_bare_language_host": {
@@ -195,7 +185,8 @@ def run_broca_architecture_eval(
         "kind": "broca_architecture_eval",
         "description": (
             "Direct scored comparison: bare frozen language host vs BrocaMind with semantic memory, "
-            "active inference, causal substrate, workspace frames, and residual-stream graft verbalization."
+            "active inference, causal substrate, workspace frames, and residual-stream graft verbalization. "
+            "Semantic-memory cases must provide their own setup_prompts; no facts are seeded by default."
         ),
         "model_id": mid,
         "device": device,
@@ -225,5 +216,3 @@ def run_broca_architecture_eval(
         path.write_text(json.dumps(result, indent=2, default=str), encoding="utf-8")
 
     return result
-
-

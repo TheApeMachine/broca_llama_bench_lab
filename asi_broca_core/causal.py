@@ -82,6 +82,14 @@ class FiniteSCM:
                 world[n] = v
             yield world, p
 
+    def _sample_exogenous_world(self, rng: random.Random) -> dict[str, object]:
+        world: dict[str, object] = {}
+        for name in self.exogenous:
+            dom = list(self.exogenous[name].keys())
+            weights = [float(self.exogenous[name][x]) for x in dom]
+            world[name] = rng.choices(dom, weights=weights, k=1)[0]
+        return world
+
     def evaluate_world(self, exo: Mapping[str, object], interventions: Mapping[str, object] | None = None) -> dict:
         interventions = dict(interventions or {})
         values = dict(exo)
@@ -143,11 +151,7 @@ class FiniteSCM:
         num = 0
         den = 0
         for _ in range(max(1, int(n_samples))):
-            world: dict[str, object] = {}
-            for name in self.exogenous:
-                dom = list(self.exogenous[name].keys())
-                weights = [float(self.exogenous[name][x]) for x in dom]
-                world[name] = rng.choices(dom, weights=weights, k=1)[0]
+            world = self._sample_exogenous_world(rng)
             vals = self.evaluate_world(world, interventions)
             if all(vals.get(k) == v for k, v in given_d.items()):
                 den += 1
@@ -177,8 +181,37 @@ class FiniteSCM:
         *,
         evidence: Mapping[str, object],
         interventions: Mapping[str, object],
+        n_samples: int = 10_000,
+        seed: int = 0,
+        min_accepted: int | None = None,
+        max_draws: int | None = None,
     ) -> float:
-        """Exact counterfactual probability — enumerates **all** exogenous worlds."""
+        """Sampled abduction-action-prediction counterfactual probability.
+
+        Runtime Rung-3 queries deliberately use sampled abduction, regardless of
+        graph size, so the default path never depends on Cartesian enumeration
+        over exogenous worlds. Use ``counterfactual_probability_exact`` only for
+        tests or hand-checking tiny SCMs.
+        """
+
+        return self.counterfactual_probability_monte_carlo(
+            query_event,
+            evidence=evidence,
+            interventions=interventions,
+            n_samples=int(n_samples),
+            seed=seed,
+            min_accepted=min_accepted,
+            max_draws=max_draws,
+        )
+
+    def counterfactual_probability_exact(
+        self,
+        query_event: Mapping[str, object],
+        *,
+        evidence: Mapping[str, object],
+        interventions: Mapping[str, object],
+    ) -> float:
+        """Exact counterfactual probability; enumerates all exogenous worlds."""
 
         num = 0.0
         den = 0.0
@@ -190,6 +223,48 @@ class FiniteSCM:
                 if all(cf.get(k) == v for k, v in query_event.items()):
                     num += p
         if den <= _EPS:
+            return 0.0
+        return num / den
+
+    def counterfactual_probability_monte_carlo(
+        self,
+        query_event: Mapping[str, object],
+        *,
+        evidence: Mapping[str, object],
+        interventions: Mapping[str, object],
+        n_samples: int = 10_000,
+        seed: int = 0,
+        min_accepted: int | None = None,
+        max_draws: int | None = None,
+    ) -> float:
+        """Sampled abduction-action-prediction estimate for counterfactuals.
+
+        This draws exogenous worlds from the factorized prior, rejects worlds
+        whose factual evaluation does not match ``evidence``, then evaluates the
+        counterfactual intervention on accepted worlds. ``n_samples`` is the
+        initial draw budget; if evidence is rare, drawing continues until
+        ``min_accepted`` accepted worlds are collected or ``max_draws`` is hit.
+        """
+
+        rng = random.Random(int(seed))
+        evidence_d = dict(evidence)
+        num = 0
+        den = 0
+        draws = 0
+        draw_budget = max(1, int(n_samples))
+        accept_target = int(min_accepted) if min_accepted is not None else max(32, int(math.sqrt(float(draw_budget))))
+        draw_limit = int(max_draws) if max_draws is not None else max(draw_budget, draw_budget * 20)
+        while draws < draw_limit and (draws < draw_budget or den < accept_target):
+            draws += 1
+            exo = self._sample_exogenous_world(rng)
+            actual = self.evaluate_world(exo, interventions=None)
+            if not all(actual.get(k) == v for k, v in evidence_d.items()):
+                continue
+            den += 1
+            cf = self.evaluate_world(exo, interventions=interventions)
+            if all(cf.get(k) == v for k, v in query_event.items()):
+                num += 1
+        if den <= 0:
             return 0.0
         return num / den
 
@@ -427,5 +502,3 @@ def build_frontdoor_scm() -> FiniteSCM:
     scm.add_endogenous("M", [0, 1], ["X", "U_M"], m_fn)
     scm.add_endogenous("Y", [0, 1], ["M", "U", "U_Y"], y_fn)
     return scm
-
-
