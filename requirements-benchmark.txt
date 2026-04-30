@@ -1,0 +1,7 @@
+-r requirements.txt
+transformers>=4.45.0
+datasets>=2.19.0
+accelerate>=0.33.0
+sentencepiece>=0.2.0
+protobuf>=4.25.0
+lm-eval>=0.4.4
