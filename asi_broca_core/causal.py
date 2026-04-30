@@ -189,6 +189,8 @@ class FiniteSCM:
         seed: int = 0,
         min_accepted: int | None = None,
         max_draws: int | None = None,
+        pilot_fraction: float = 0.1,
+        proposal_smoothing: float = 0.3,
     ) -> float:
         """Sampled abduction-action-prediction counterfactual probability.
 
@@ -206,6 +208,8 @@ class FiniteSCM:
             seed=seed,
             min_accepted=min_accepted,
             max_draws=max_draws,
+            pilot_fraction=pilot_fraction,
+            proposal_smoothing=proposal_smoothing,
         )
 
     def counterfactual_probability_exact(
@@ -240,36 +244,88 @@ class FiniteSCM:
         seed: int = 0,
         min_accepted: int | None = None,
         max_draws: int | None = None,
+        pilot_fraction: float = 0.1,
+        proposal_smoothing: float = 0.3,
     ) -> float:
-        """Sampled abduction-action-prediction estimate for counterfactuals.
+        """Adaptive importance-sampling counterfactual probability.
 
-        This draws exogenous worlds from the factorized prior, rejects worlds
-        whose factual evaluation does not match ``evidence``, then evaluates the
-        counterfactual intervention on accepted worlds. ``n_samples`` is the
-        initial draw budget; if evidence is rare, drawing continues until
-        ``min_accepted`` accepted worlds are collected or ``max_draws`` is hit.
+        Stage 1 (pilot): draws exogenous worlds from the factorized prior and
+        keeps the worlds whose factual evaluation matches ``evidence``. These
+        accepted worlds *also* contribute to the estimate (with importance
+        weight ``1`` since they came from the prior).
+
+        Stage 2 (proposal): builds a per-variable empirical posterior
+        ``Q(U_i | E)`` from the pilot's accepted worlds, smoothed with the
+        prior so no exogenous value gets zero proposal mass.
+
+        Stage 3 (importance sampling): samples remaining worlds from ``Q`` and
+        weights each accepted world by ``P(world) / Q(world)``. The final
+        estimate is the self-normalized weighted ratio.
+
+        For evidence with prior probability in roughly ``[1e-3, 0.5]`` this is
+        substantially more sample-efficient than pure rejection because most
+        post-pilot draws fall on the evidence support. For evidence rarer than
+        the pilot can resolve (zero pilot acceptances) the routine degrades to
+        plain rejection sampling — the same behavior as the previous
+        implementation.
         """
 
         rng = random.Random(int(seed))
         evidence_d = dict(evidence)
         query_event_d = dict(query_event)
-        num = 0
-        den = 0
-        draws = 0
         draw_budget = max(1, int(n_samples))
         accept_target = int(min_accepted) if min_accepted is not None else max(32, int(math.sqrt(float(draw_budget))))
         draw_limit = int(max_draws) if max_draws is not None else draw_budget * 20
-        while draws < draw_limit and (draws < draw_budget or den < accept_target):
+
+        pilot_cap = max(64, int(draw_budget * float(pilot_fraction)))
+        pilot_cap = min(pilot_cap, max(1, draw_limit // 2))
+        pilot_target = max(32, accept_target // 2)
+
+        weighted_num = 0.0
+        weighted_den = 0.0
+        accepted = 0
+        draws = 0
+        pilot_accepted: list[dict[str, object]] = []
+
+        while draws < pilot_cap and len(pilot_accepted) < pilot_target:
             draws += 1
             exo = self._sample_exogenous_world(rng)
             actual = self.evaluate_world(exo, interventions=None)
             if not all(actual.get(k) == v for k, v in evidence_d.items()):
                 continue
-            den += 1
+            pilot_accepted.append(exo)
+            accepted += 1
+            weighted_den += 1.0
             cf = self.evaluate_world(exo, interventions=interventions)
             if all(cf.get(k) == v for k, v in query_event_d.items()):
-                num += 1
-        if den <= 0:
+                weighted_num += 1.0
+
+        proposal = (
+            self._evidence_proposal_from_pilot(pilot_accepted, smoothing=float(proposal_smoothing))
+            if pilot_accepted
+            else None
+        )
+
+        while draws < draw_limit and (draws < draw_budget or accepted < accept_target):
+            draws += 1
+            if proposal is not None:
+                exo = self._sample_from_proposal(rng, proposal)
+                w = self._importance_weight(exo, proposal)
+            else:
+                exo = self._sample_exogenous_world(rng)
+                w = 1.0
+            if w <= 0.0:
+                continue
+            actual = self.evaluate_world(exo, interventions=None)
+            if not all(actual.get(k) == v for k, v in evidence_d.items()):
+                continue
+            accepted += 1
+            weighted_den += w
+            cf = self.evaluate_world(exo, interventions=interventions)
+            if all(cf.get(k) == v for k, v in query_event_d.items()):
+                weighted_num += w
+
+        if weighted_den <= 0.0:
             logger.warning(
                 "counterfactual_probability_monte_carlo: no samples matched evidence after %s draws (limit=%s); "
                 "returning 0.0. Consider increasing max_draws or n_samples if this is unexpected.",
@@ -277,7 +333,60 @@ class FiniteSCM:
                 draw_limit,
             )
             return 0.0
-        return num / den
+        return weighted_num / weighted_den
+
+    def _evidence_proposal_from_pilot(
+        self,
+        pilot_accepted: Sequence[Mapping[str, object]],
+        *,
+        smoothing: float = 0.3,
+    ) -> dict[str, dict[object, float]]:
+        """Per-variable empirical posterior over exogenous values, smoothed with the prior."""
+
+        smoothing = max(0.0, min(1.0, float(smoothing)))
+        n = float(len(pilot_accepted))
+        proposal: dict[str, dict[object, float]] = {}
+        for name, prior in self.exogenous.items():
+            counts: dict[object, float] = {x: 0.0 for x in prior}
+            for world in pilot_accepted:
+                value = world.get(name)
+                if value in counts:
+                    counts[value] += 1.0
+            mixed: dict[object, float] = {}
+            for x, prior_p in prior.items():
+                empirical = counts[x] / n if n > 0 else float(prior_p)
+                mixed[x] = (1.0 - smoothing) * empirical + smoothing * float(prior_p)
+            z = float(sum(mixed.values())) or 1.0
+            proposal[name] = {x: mixed[x] / z for x in prior}
+        return proposal
+
+    def _sample_from_proposal(
+        self,
+        rng: random.Random,
+        proposal: Mapping[str, Mapping[object, float]],
+    ) -> dict[str, object]:
+        world: dict[str, object] = {}
+        for name in self.exogenous:
+            q = proposal[name]
+            dom = list(q.keys())
+            weights = [float(q[x]) for x in dom]
+            world[name] = rng.choices(dom, weights=weights, k=1)[0]
+        return world
+
+    def _importance_weight(
+        self,
+        world: Mapping[str, object],
+        proposal: Mapping[str, Mapping[object, float]],
+    ) -> float:
+        log_w = 0.0
+        for name, prior in self.exogenous.items():
+            value = world[name]
+            p = float(prior.get(value, 0.0))
+            q = float(proposal[name].get(value, 0.0))
+            if p <= 0.0 or q <= 0.0:
+                return 0.0
+            log_w += math.log(p) - math.log(q)
+        return math.exp(log_w)
 
     def descendants(self, node: str, *, parents: Mapping[str, Sequence[str]] | None = None) -> set[str]:
         parents = {k: list(v) for k, v in (parents or self.graph_parents(include_exogenous=True)).items()}

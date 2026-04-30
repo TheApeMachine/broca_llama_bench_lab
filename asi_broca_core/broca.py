@@ -46,6 +46,30 @@ DEFAULT_BROCA_MODEL_ID = os.environ.get("ASI_BROCA_MODEL_ID", "meta-llama/Llama-
 SEMANTIC_CONFIDENCE_FLOOR = 0.5
 BELIEF_REVISION_MARGIN = 0.5
 BELIEF_REVISION_MIN_CLAIMS = 2
+SURPRISE_TRUST_SCALE = 1.0
+
+
+def _claim_trust_weight(claim: dict) -> float:
+    """Trust attenuator for prediction-error-weighted consolidation.
+
+    A claim that the LLM finds surprising (large positive ``prediction_gap``)
+    earns a smaller per-claim weight, so a Sybil-style poisoning attack that
+    repeats an unlikely statement no longer flips a belief on raw count alone.
+    Claims without a recorded gap (e.g. corroborating observations) get full
+    weight.
+    """
+
+    ev = claim.get("evidence")
+    if not isinstance(ev, dict):
+        return 1.0
+    raw = ev.get("prediction_gap")
+    try:
+        gap = float(raw)
+    except (TypeError, ValueError):
+        return 1.0
+    if not math.isfinite(gap) or gap <= 0.0:
+        return 1.0
+    return 1.0 / (1.0 + SURPRISE_TRUST_SCALE * gap)
 
 
 @dataclass(frozen=True)
@@ -91,6 +115,164 @@ def _location_assertion_from_tokens(toks: Sequence[str]) -> tuple[str, str] | No
     return None
 
 
+class RelationExtractor:
+    """Pluggable subject/predicate/object extractor for declarative utterances.
+
+    Implementations should return ``None`` for non-declarative input (questions,
+    fragments) and a ``ParsedClaim`` otherwise. Extractors are called per
+    routing decision, so they are expected to be cheap or short-circuit on
+    obviously inapplicable input.
+    """
+
+    def extract_claim(self, utterance: str, toks: Sequence[str]) -> "ParsedClaim | None":  # pragma: no cover - protocol
+        raise NotImplementedError
+
+
+class HeuristicRelationExtractor(RelationExtractor):
+    """Whitespace/regex SVO heuristic. Brittle on subordinate clauses and passive voice."""
+
+    def extract_claim(self, utterance: str, toks: Sequence[str]) -> "ParsedClaim | None":
+        return _claim_from_tokens(toks)
+
+
+class LLMRelationExtractor(RelationExtractor):
+    """Few-shot SVO extraction via the host LLM, with heuristic fallback.
+
+    Uses ``host.llm.generate`` with a JSON few-shot prompt so subordinate
+    clauses, passive voice, and stripped determiners are handled by the
+    language model instead of a regex. If the host does not expose ``.llm``
+    (test fakes), or the LLM emits unparseable output, this delegates to
+    ``HeuristicRelationExtractor`` so behavior degrades gracefully.
+
+    Why: the open-vocabulary regex extractor mis-routes claims whose surface
+    form is anything more interesting than ``<subject> <verb> <object>``;
+    re-using the frozen LLM as a parser fixes a whole class of mis-assigned
+    triples without an extra model.
+    """
+
+    PROMPT_TEMPLATE = (
+        "Extract the subject, relation, and object of each sentence as JSON. "
+        "Use lowercase. Strip articles. The relation is the verb phrase.\n"
+        "Sentence: ada is in rome .\n"
+        'JSON: {"subject":"ada","relation":"is in","object":"rome"}\n'
+        "Sentence: the apple, which was incredibly red, fell from the tree .\n"
+        'JSON: {"subject":"apple","relation":"fell from","object":"tree"}\n'
+        "Sentence: the dog chased the ball .\n"
+        'JSON: {"subject":"dog","relation":"chased","object":"ball"}\n'
+        "Sentence: <SENTENCE>\n"
+        "JSON: "
+    )
+
+    def __init__(self, host: Any, tokenizer: Any, *, max_new_tokens: int = 64, cache_size: int = 256):
+        self.host = host
+        self.tokenizer = tokenizer
+        self.max_new_tokens = int(max_new_tokens)
+        self._fallback = HeuristicRelationExtractor()
+        self._cache: dict[str, tuple[str, str, str] | None] = {}
+        self._cache_size = max(0, int(cache_size))
+
+    def extract_claim(self, utterance: str, toks: Sequence[str]) -> "ParsedClaim | None":
+        if _is_question(toks):
+            return None
+        words = list(_word_tokens(toks))
+        if len(words) < 3:
+            return None
+        triple = self._llm_extract(utterance)
+        if triple is None:
+            return self._fallback.extract_claim(utterance, toks)
+        subject, predicate, obj = triple
+        if not subject or not predicate or not obj:
+            return self._fallback.extract_claim(utterance, toks)
+        return ParsedClaim(
+            subject=subject.lower(),
+            predicate=predicate.lower(),
+            obj=obj.lower(),
+            confidence=1.0,
+            evidence={
+                "parser": "llm_relation_extractor",
+                "predicate_surface": predicate,
+                "source_words": words,
+                "utterance": utterance,
+            },
+        )
+
+    def _llm_extract(self, utterance: str) -> tuple[str, str, str] | None:
+        key = utterance.strip()
+        if key in self._cache:
+            return self._cache[key]
+        result = self._llm_extract_uncached(key)
+        if self._cache_size > 0:
+            if len(self._cache) >= self._cache_size:
+                self._cache.pop(next(iter(self._cache)))
+            self._cache[key] = result
+        return result
+
+    def _llm_extract_uncached(self, utterance: str) -> tuple[str, str, str] | None:
+        llm = getattr(self.host, "llm", None)
+        if llm is None or not callable(getattr(llm, "generate", None)):
+            return None
+        hf_tok = getattr(self.tokenizer, "inner", None)
+        if hf_tok is None or not callable(getattr(hf_tok, "decode", None)):
+            return None
+        prompt = self.PROMPT_TEMPLATE.replace("<SENTENCE>", utterance)
+        try:
+            params = getattr(llm, "parameters", None)
+            device = next(params()).device if callable(params) else torch.device("cpu")
+            encoded = hf_tok(prompt, return_tensors="pt")
+            input_ids = encoded["input_ids"].to(device)
+            attention_mask = encoded.get("attention_mask")
+            if attention_mask is not None:
+                attention_mask = attention_mask.to(device)
+            pad_id = getattr(hf_tok, "pad_token_id", None) or getattr(hf_tok, "eos_token_id", None)
+            with torch.no_grad():
+                output = llm.generate(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    max_new_tokens=self.max_new_tokens,
+                    do_sample=False,
+                    pad_token_id=pad_id,
+                )
+            generated = output[0, input_ids.shape[1]:]
+            new_text = hf_tok.decode(generated, skip_special_tokens=True)
+        except (RuntimeError, ValueError, AttributeError, TypeError, IndexError, KeyError, StopIteration):
+            return None
+        return self._parse_json_triple(new_text)
+
+    @staticmethod
+    def _parse_json_triple(text: str) -> tuple[str, str, str] | None:
+        start = text.find("{")
+        if start < 0:
+            return None
+        depth = 0
+        end = -1
+        for i in range(start, len(text)):
+            ch = text[i]
+            if ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0:
+                    end = i + 1
+                    break
+        if end < 0:
+            return None
+        try:
+            obj = json.loads(text[start:end])
+        except (json.JSONDecodeError, ValueError):
+            return None
+        if not isinstance(obj, dict):
+            return None
+        s = obj.get("subject")
+        p = obj.get("relation")
+        o = obj.get("object")
+        if not isinstance(s, str) or not isinstance(p, str) or not isinstance(o, str):
+            return None
+        s, p, o = s.strip(), p.strip(), o.strip()
+        if not s or not p or not o:
+            return None
+        return s, p, o
+
+
 def _claim_from_tokens(toks: Sequence[str]) -> ParsedClaim | None:
     """Parse an observed relational claim without fixed entity/value slots.
 
@@ -103,6 +285,8 @@ def _claim_from_tokens(toks: Sequence[str]) -> ParsedClaim | None:
     object`` layout over alphanumeric word tokens (after light cleanup). It does
     not handle nested clauses, coordinated subjects, or non-adjacent arguments;
     compound or complex sentences will often mis-assign head or tail tokens.
+    Production callers should prefer :class:`LLMRelationExtractor`, which falls
+    back to this only when the host LLM is unavailable.
 
     Leading determiners (``the``, ``a``, ``an``) are skipped when picking the
     subject head. Trailing copula tokens that would incorrectly sit in the object
@@ -226,6 +410,34 @@ def _text_vector(text: str, text_encoder: TextEncoder | None) -> torch.Tensor:
         logger.error("text_encoder failed in _text_vector; falling back to stable_sketch", exc_info=True)
         v = stable_sketch(text)
     return v.detach().float().cpu().view(-1)
+
+
+def _claim_prediction_gap(mind: "BrocaMind", utterance: str, claim: ParsedClaim) -> float | None:
+    """Mean per-token surprise (graft - plain CE) of the host on a contradicting claim.
+
+    Returns ``None`` when the host cannot run a graft-aware forward pass (e.g.
+    test fakes). A larger positive gap means the LLM finds the claim less
+    plausible; consolidation uses this as a trust attenuator so a low-prior
+    statement repeated by an attacker requires more corroboration to flip a
+    belief than a low-surprise statement.
+    """
+
+    try:
+        plan_words = [claim.subject, claim.predicate, claim.obj, "."]
+        broca_features = pack_cognitive_frame(
+            "memory_write", claim.subject, claim.obj, float(claim.confidence), claim.evidence,
+            text_encoder=mind.text_encoder,
+        )
+        _ce_g, _ce_p, gap = lexical_surprise_gap(
+            mind.host,
+            mind.tokenizer,
+            utterance=utterance,
+            plan_words=plan_words,
+            broca_features=broca_features,
+        )
+        return float(gap)
+    except (AttributeError, RuntimeError, TypeError, ValueError, StopIteration, IndexError):
+        return None
 
 
 def _route_relevance(utterance: str, toks: Sequence[str], descriptors: Sequence[str], text_encoder: TextEncoder | None) -> float:
@@ -578,10 +790,12 @@ class PersistentSemanticMemory:
                 continue
             support: dict[str, dict[str, Any]] = {}
             for row in rows:
-                entry = support.setdefault(row["object"], {"score": 0.0, "count": 0, "claim_ids": []})
-                entry["score"] += float(row["confidence"])
+                entry = support.setdefault(row["object"], {"score": 0.0, "count": 0, "claim_ids": [], "trust_weights": []})
+                trust = _claim_trust_weight(row)
+                entry["score"] += float(row["confidence"]) * trust
                 entry["count"] += 1
                 entry["claim_ids"].append(int(row["id"]))
+                entry["trust_weights"].append(float(trust))
 
             current = self.get(subject, predicate)
             current_obj = current[0] if current is not None else ""
@@ -1191,12 +1405,13 @@ class CognitiveRouter:
     candidate traces attached.
     """
 
-    def __init__(self, *, relevance_floor: float = 0.28):
+    def __init__(self, *, relevance_floor: float = 0.28, extractor: RelationExtractor | None = None):
         self.relevance_floor = float(relevance_floor)
+        self.extractor: RelationExtractor = extractor or HeuristicRelationExtractor()
 
     def route(self, mind: "BrocaMind", utterance: str, toks: Sequence[str]) -> CognitiveFrame:
         candidates: list[FacultyCandidate] = []
-        claim = _claim_from_tokens(toks)
+        claim = self.extractor.extract_claim(utterance, toks)
         query = _query_from_tokens(
             toks,
             utterance=utterance,
@@ -1240,6 +1455,11 @@ class CognitiveRouter:
             "instruments": ["runtime_observation"],
             **dict(claim.evidence),
         }
+        existing = mind.memory.get(claim.subject, claim.predicate)
+        if existing is not None and existing[0] != claim.obj:
+            gap = _claim_prediction_gap(mind, utterance, claim)
+            if gap is not None:
+                ev["prediction_gap"] = float(gap)
         observed = mind.memory.observe_claim(
             claim.subject,
             claim.predicate,
@@ -1427,7 +1647,7 @@ class BrocaMind:
                 self.feature_graft.to(host_param.device)
         self.host.add_graft("final_hidden", self.feature_graft)
         self.workspace = GlobalWorkspace()
-        self.router = CognitiveRouter()
+        self.router = CognitiveRouter(extractor=LLMRelationExtractor(self.host, self.tokenizer))
         self.pomdp = build_tiger_pomdp()
         self.active_agent = ActiveInferenceAgent(self.pomdp, horizon=1, learn=False)
         self.scm = build_simpson_scm()

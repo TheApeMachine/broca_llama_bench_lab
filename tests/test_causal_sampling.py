@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+import random
 
 from asi_broca_core.causal import FiniteSCM, build_simpson_scm
 
@@ -41,3 +42,50 @@ def test_large_counterfactual_uses_sampling_without_exhaustive_worlds():
     )
 
     assert 0.75 <= got <= 0.85
+
+
+def test_importance_sampling_reaches_estimate_on_rare_evidence_with_small_budget():
+    """A pure rejection sampler at this budget would frequently miss evidence; the
+    pilot+importance scheme should adapt the proposal toward the rare support and
+    return a finite, reasonable estimate."""
+
+    scm = FiniteSCM(domains={})
+    scm.add_exogenous("U_X", range(100))
+    scm.add_exogenous("U_Y", range(100))
+    scm.add_endogenous("X", [0, 1], ["U_X"], lambda v: 1 if v["U_X"] < 5 else 0)
+    scm.add_endogenous(
+        "Y",
+        [0, 1],
+        ["X", "U_Y"],
+        lambda v: 1 if (v["X"] == 1 and v["U_Y"] < 80) else 0,
+    )
+
+    got = scm.counterfactual_probability(
+        {"Y": 1},
+        evidence={"X": 1, "Y": 1},
+        interventions={"X": 1},
+        n_samples=400,
+        seed=11,
+    )
+
+    # do(X=1) is consistent with the factual world here, so Y must remain 1.
+    assert got >= 0.98
+
+
+def test_importance_sampling_uses_proposal_to_focus_draws_on_evidence():
+    """With a learned proposal, the per-variable empirical posterior should put
+    most mass on the exogenous values that produced evidence — verify by
+    inspecting the proposal directly via the helper."""
+
+    scm = FiniteSCM(domains={})
+    scm.add_exogenous("U", range(100))
+    scm.add_endogenous("E", [0, 1], ["U"], lambda v: 1 if v["U"] < 10 else 0)
+
+    pilot = [scm._sample_exogenous_world(random.Random(s)) for s in range(50)]
+    pilot_e1 = [w for w in pilot if scm.evaluate_world(w)["E"] == 1] or [{"U": 3}, {"U": 7}]
+    proposal = scm._evidence_proposal_from_pilot(pilot_e1, smoothing=0.1)
+
+    rare_mass = sum(proposal["U"][x] for x in range(10))
+    assert rare_mass > 0.5, (
+        f"proposal should concentrate on the U<10 support that produces E=1; got rare_mass={rare_mass}"
+    )
