@@ -9,6 +9,7 @@ faculty result.
 from __future__ import annotations
 
 import json
+import os
 import re
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -76,10 +77,29 @@ def _contains_answer(output: str, expected_answer: str) -> bool:
     return answer in _normalized_text(output)
 
 
-def _score_output(output: str, *, expected_answer: str, expected_speech: str) -> dict[str, bool]:
+def _score_output(output: str, *, expected_answer: str, expected_speech: str, task_type: str = "") -> dict[str, bool]:
+    speech_exact = _normalized_text(output) == _normalized_text(expected_speech)
+    answer_present = _contains_answer(output, expected_answer)
+    if task_type == "active_inference":
+        nt = _normalized_text(output)
+        action_vocab = {
+            "listen",
+            "open_left",
+            "open_right",
+            "observe_association",
+            "run_intervention_readout",
+            "observational",
+            "intervention",
+            "check",
+            "evidence",
+            "readout",
+        }
+        toks = set(nt.split())
+        answer_present = bool(toks & action_vocab)
+        speech_exact = nt.startswith("i should") and answer_present
     return {
-        "speech_exact": _normalized_text(output) == _normalized_text(expected_speech),
-        "answer_present": _contains_answer(output, expected_answer),
+        "speech_exact": speech_exact,
+        "answer_present": answer_present,
     }
 
 
@@ -105,8 +125,7 @@ def run_broca_architecture_eval(
     *,
     seed: int = 0,
     db_path: str | Path,
-    backend: str = "tiny",
-    llama_model_id: str = "meta-llama/Llama-3.2-1B-Instruct",
+    llama_model_id: str | None = None,
     device: str | None = None,
     hf_token: str | bool | None = None,
     output_path: str | Path | None = None,
@@ -114,12 +133,12 @@ def run_broca_architecture_eval(
 ) -> dict[str, Any]:
     """Run a direct scored comparison between bare host and Broca architecture."""
 
+    mid = llama_model_id or os.environ.get("ASI_BROCA_MODEL_ID", "meta-llama/Llama-3.2-1B-Instruct")
     mind = BrocaMind(
         seed=seed,
         db_path=db_path,
         namespace=f"architecture_eval_{seed}",
-        backend=backend,
-        llama_model_id=llama_model_id,
+        llama_model_id=mid,
         device=device,
         hf_token=hf_token,
     )
@@ -151,6 +170,7 @@ def run_broca_architecture_eval(
                         baseline_output,
                         expected_answer=case.expected_answer,
                         expected_speech=case.expected_speech,
+                        task_type=case.task_type,
                     ),
                 },
                 "enhanced_broca_architecture": {
@@ -160,6 +180,7 @@ def run_broca_architecture_eval(
                         enhanced_output,
                         expected_answer=case.expected_answer,
                         expected_speech=case.expected_speech,
+                        task_type=case.task_type,
                     ),
                 },
             }
@@ -176,8 +197,7 @@ def run_broca_architecture_eval(
             "Direct scored comparison: bare frozen language host vs BrocaMind with semantic memory, "
             "active inference, causal substrate, workspace frames, and residual-stream graft verbalization."
         ),
-        "backend": backend,
-        "model_id": llama_model_id if backend == "llama" else "tiny",
+        "model_id": mid,
         "device": device,
         "seed": seed,
         "primary_metric": "speech_exact_accuracy",

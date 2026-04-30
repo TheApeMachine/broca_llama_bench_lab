@@ -198,7 +198,6 @@ def run_broca_architecture_benchmark(
             result = run_broca_architecture_eval(
                 seed=0,
                 db_path=db_path,
-                backend="llama",
                 llama_model_id=llama_model_id,
                 device=dev,
                 hf_token=hf_token,

@@ -169,14 +169,64 @@ class CategoricalPOMDP:
             for sp, val in enumerate(col):
                 self.B[action][sp][s] = val
 
+    def expand_state(self, new_state_name: str, *, qs: Sequence[float], predictive_mass_obs: float) -> list[float]:
+        """Append state; belief steal mass scales with surprise vs discrete-uniform observer baseline."""
+        u = 1.0 / float(max(1, self.n_observations))
+        mass_raw = (u - float(predictive_mass_obs)) / max(u, _EPS)
+        mass = float(min(0.45, max(_EPS * 1000.0, mass_raw)))
+        return self.expand_state_with_mass(new_state_name, qs=qs, mass=mass)
+
+    def expand_state_with_mass(self, new_state_name: str, *, qs: Sequence[float], mass: float = 0.08) -> list[float]:
+        """Low-level grow operator used internally once ``mass`` is already derived."""
+        n = self.n_states
+        na = self.n_actions
+        no = self.n_observations
+        mass = float(max(_EPS * 100, min(0.45, mass)))
+        new_qs = normalize([float(q) * (1.0 - mass) for q in qs] + [mass])
+
+        self.state_names.append(new_state_name)
+
+        for a in range(na):
+            for o in range(no):
+                avg = sum(self.A[a][o]) / max(n, 1)
+                dup = self.A[a][o][n - 1]
+                self.A[a][o].append(0.6 * dup + 0.4 * avg)
+                nv = normalize([self.A[a][o][s] for s in range(n + 1)])
+                for s in range(n + 1):
+                    self.A[a][o][s] = nv[s]
+
+        for a in range(na):
+            for sp in range(n):
+                row = list(self.B[a][sp])
+                row.append(0.5 * row[-1] + 0.5 / (n + 1))
+                self.B[a][sp] = normalize(row)
+            new_row = normalize([1.0 / (n + 1)] * (n + 1))
+            self.B[a].append(list(new_row))
+            for s in range(n + 1):
+                col = [self.B[a][sp][s] for sp in range(n + 1)]
+                nv = normalize(col)
+                for sp in range(n + 1):
+                    self.B[a][sp][s] = nv[sp]
+
+        self.D = normalize([d * (1.0 - mass) for d in self.D] + [mass])
+
+        for a in range(na):
+            for o in range(no):
+                self.a_counts[a][o].append(20.0 * self.A[a][o][n] + 1e-3)
+            for sp in range(n):
+                self.b_counts[a][sp].append(20.0 * self.B[a][sp][n] + 1e-3)
+            self.b_counts[a].append([20.0 * self.B[a][n][s] + 1e-3 for s in range(n + 1)])
+
+        return new_qs
+
 
 @dataclass
 class ActiveInferenceAgent:
     pomdp: CategoricalPOMDP
     horizon: int = 1
-    precision: float = 8.0
     learn: bool = True
     qs: list[float] | None = None
+    _expand_serial: int = field(default=0, repr=False)
 
     def __post_init__(self) -> None:
         if self.qs is None:
@@ -188,7 +238,10 @@ class ActiveInferenceAgent:
     def decide(self) -> Decision:
         assert self.qs is not None
         evals = [self.pomdp.evaluate_policy(pol, self.qs) for pol in self.pomdp.enumerate_policies(self.horizon)]
-        posterior = softmax_neg([e.expected_free_energy for e in evals], self.precision)
+        g_vals = [e.expected_free_energy for e in evals]
+        spread = float(max(g_vals) - min(g_vals))
+        precision = (1.0 / max(spread, _EPS)) if spread > _EPS else float(len(evals))
+        posterior = softmax_neg(g_vals, precision)
         best_index = max(range(len(evals)), key=lambda i: posterior[i])
         action = evals[best_index].policy[0]
         return Decision(action, self.pomdp.action_names[action], list(self.qs), evals, posterior)
@@ -197,12 +250,113 @@ class ActiveInferenceAgent:
         assert self.qs is not None
         before = list(self.qs)
         pred = self.pomdp.predict_state(before, action)
+        po = self.pomdp.observation_distribution(pred, action)
+        expanded = False
+        uniform_floor = 1.0 / float(max(1, self.pomdp.n_observations))
+        if po[obs] < uniform_floor:
+            label = f"hyp_{self.pomdp.n_states}_{self._expand_serial}"
+            self._expand_serial += 1
+            self.qs = self.pomdp.expand_state(label, qs=before, predictive_mass_obs=float(po[obs]))
+            pred = self.pomdp.predict_state(self.qs, action)
+            expanded = True
+        else:
+            self.qs = before
         post = self.pomdp.posterior_after_observation(pred, action, obs)
         if self.learn:
             self.pomdp.learn_A(action, obs, post, lr=lr)
-            self.pomdp.learn_B(action, before, post, lr=0.25 * lr)
+            if not expanded:
+                self.pomdp.learn_B(action, before, post, lr=0.25 * lr)
         self.qs = post
         return post
+
+
+@dataclass
+class CoupledDecision:
+    faculty: str
+    action_name: str
+    spatial_decision: Decision
+    causal_decision: Decision
+    spatial_min_G: float
+    causal_min_G: float
+
+
+class CoupledEFEAgent:
+    """Pick the faculty whose minimal one-step Expected Free Energy is lower."""
+
+    def __init__(self, spatial: ActiveInferenceAgent, causal: ActiveInferenceAgent):
+        self.spatial = spatial
+        self.causal = causal
+
+    def decide(self) -> CoupledDecision:
+        ds = self.spatial.decide()
+        dc = self.causal.decide()
+        gs = min(ev.expected_free_energy for ev in ds.policies)
+        gc = min(ev.expected_free_energy for ev in dc.policies)
+        if gs <= gc:
+            return CoupledDecision("spatial", ds.action_name, ds, dc, gs, gc)
+        return CoupledDecision("causal", dc.action_name, ds, dc, gs, gc)
+
+
+def build_causal_epistemic_pomdp(
+    scm,
+    *,
+    treatment: str = "T",
+    outcome: str = "Y",
+    outcome_hit: object = 1,
+) -> CategoricalPOMDP:
+    """POMDP where epistemic actions distinguish observational vs interventional reads.
+
+    Hidden states encode whether the average treatment effect on ``outcome_hit``
+    is non-negative (state 0) or negative (state 1), aligned with an enumerated
+    ``FiniteSCM``. Observational probes are noisier where Simpson-style masking
+    disagrees with do-calculus.
+    """
+    from .causal import FiniteSCM
+
+    if not isinstance(scm, FiniteSCM):
+        raise TypeError("scm must be a FiniteSCM")
+
+    p_y_do_t1 = scm.probability({outcome: outcome_hit}, interventions={treatment: 1})
+    p_y_do_t0 = scm.probability({outcome: outcome_hit}, interventions={treatment: 0})
+
+    p_y_t1 = scm.probability({outcome: outcome_hit}, given={treatment: 1})
+    p_y_t0 = scm.probability({outcome: outcome_hit}, given={treatment: 0})
+    obs_positive_grad = (p_y_t1 - p_y_t0) >= 0.0
+
+    delta_obs = abs(p_y_t1 - p_y_t0)
+    delta_do = abs(p_y_do_t1 - p_y_do_t0)
+    assoc = 0.5 + 0.5 * min(1.0, abs(delta_obs - delta_do))
+    trial = max(assoc, 0.5 + 0.5 * min(1.0, delta_do))
+
+    observe_rows: list[list[float]] = []
+    for obs_idx in range(2):
+        col_over_s: list[float] = []
+        for s in range(2):
+            world_pos = s == 0
+            aligned_read = obs_positive_grad == world_pos
+            p_match = assoc if aligned_read else (1.0 - assoc)
+            col_over_s.append(p_match if obs_idx == 0 else (1.0 - p_match))
+        observe_rows.append(col_over_s)
+
+    trial_rows: list[list[float]] = []
+    for obs_idx in range(2):
+        row: list[float] = []
+        for s in range(2):
+            if obs_idx == 0:
+                row.append(trial if s == 0 else (1.0 - trial))
+            else:
+                row.append((1.0 - trial) if s == 0 else trial)
+        trial_rows.append(row)
+
+    states = ["ate_non_negative", "ate_negative"]
+    actions = ["observe_association", "run_intervention_readout"]
+    observations = ["signal_matches_intervention", "signal_mismatch_intervention"]
+    B = identity_transition(2, 2)
+    margin_do = abs(p_y_do_t1 - p_y_do_t0)
+    c_match = 0.5 + 0.5 * min(1.0, margin_do)
+    C = normalize([c_match, max(_EPS, 1.0 - c_match)])
+    D = [0.5, 0.5]
+    return CategoricalPOMDP([observe_rows, trial_rows], B, C, D, states, actions, observations)
 
 
 def identity_transition(n_actions: int, n_states: int) -> list[list[list[float]]]:
@@ -212,11 +366,18 @@ def identity_transition(n_actions: int, n_states: int) -> list[list[list[float]]
     ]
 
 
-def build_tiger_pomdp(reliability: float = 0.85) -> CategoricalPOMDP:
+def derived_listen_channel_reliability(*, n_hidden_states: int) -> float:
+    """Listen diagonal slack tied to latent cardinality (symmetric confusion ~ 1/(2|S|^2))."""
+
+    denom = float(max(1, 2 * int(n_hidden_states) * int(n_hidden_states)))
+    return float(max(0.5 + _EPS, min(1.0 - _EPS, 1.0 - 1.0 / denom)))
+
+
+def build_tiger_pomdp() -> CategoricalPOMDP:
     states = ["left", "right"]
     actions = ["listen", "open_left", "open_right"]
     observations = ["hear_left", "hear_right", "reward", "punish"]
-    r = float(reliability)
+    r = derived_listen_channel_reliability(n_hidden_states=len(states))
     # A[action][obs][state]
     listen = [
         [r, 1.0 - r],       # hear_left
@@ -247,8 +408,8 @@ def build_tiger_pomdp(reliability: float = 0.85) -> CategoricalPOMDP:
 class TigerDoorEnv:
     """Noisy listen/open environment for active-inference experiments."""
 
-    def __init__(self, reliability: float = 0.85, seed: int = 0):
-        self.reliability = float(reliability)
+    def __init__(self, seed: int = 0):
+        self.reliability = derived_listen_channel_reliability(n_hidden_states=2)
         self.rng = random.Random(seed)
         self.hidden_state = 0
 

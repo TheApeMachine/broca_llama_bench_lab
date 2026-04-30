@@ -2,9 +2,24 @@ from __future__ import annotations
 
 from typing import Iterable, Mapping, Optional, Sequence, Tuple
 
+import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+from .active_inference import CoupledDecision, CoupledEFEAgent
+
+
+def derived_residual_token_strength(d_model: int, n_outcomes: int) -> float:
+    """Scale for injecting a discrete faculty direction into d_model-space.
+
+    Matches the order of KVMemoryGraft writing magnitude: proportional to ``d_model``
+    times a slowly-growing factor in the number of distinct outcomes (actions,
+    binary causal labels, etc.).
+    """
+
+    dm = float(int(d_model))
+    return dm * math.sqrt(math.log1p(float(max(1, int(n_outcomes)))))
 
 
 class BaseGraft(nn.Module):
@@ -39,20 +54,17 @@ def _trigger_mask(token_ids: torch.Tensor, trigger_ids: Sequence[int] | None) ->
 class KVMemoryGraft(BaseGraft):
     """Content-addressable memory grafted into a residual stream.
 
-    Keys and values are activation vectors. A query hidden state retrieves
-    nearest keys, then adds the retrieved value direction to the final token.
-    This changes logits through the host's internal representation.
+    Strength, temperature, and neighbor count derive from ``d_model`` and store
+    size. Gating uses only geometry: (1) how peaked the query–key similarities
+    are relative to their mean, and (2) whether the best key match exceeds the
+    typical *inter-key* similarity of the loaded store—so prompts that sit
+    outside the memory manifold are not driven by spurious nearest neighbors.
     """
 
     def __init__(
         self,
         d_model: int,
         *,
-        strength: float = 16.0,
-        temperature: float = 0.03,
-        threshold: float | None = 0.85,
-        gate_sharpness: float = 40.0,
-        top_k: int | None = None,
         max_items: int = 8192,
         query_mode: str = "sequence_mean",
     ):
@@ -60,23 +72,32 @@ class KVMemoryGraft(BaseGraft):
         if query_mode not in {"token", "sequence_mean"}:
             raise ValueError("query_mode must be 'token' or 'sequence_mean'")
         self.d_model = int(d_model)
-        self.strength = float(strength)
-        self.temperature = float(temperature)
-        self.threshold = threshold
-        self.gate_sharpness = float(gate_sharpness)
-        self.top_k = top_k
+        dm = float(self.d_model)
+        log_store = math.log1p(float(max_items))
+        self.strength = dm * math.sqrt(log_store)
+        self.temperature = math.sqrt(log_store) / max(dm, 1.0)
         self.max_items = int(max_items)
         self.query_mode = query_mode
-        self.register_buffer("keys", torch.empty(0, d_model))
-        self.register_buffer("values", torch.empty(0, d_model))
+        self.register_buffer("keys", torch.empty(0, self.d_model))
+        self.register_buffer("values", torch.empty(0, self.d_model))
         self.metadata: list[dict] = []
         self.last_debug: dict = {}
+        self.spread_matrix: torch.Tensor | None = None
 
     def clear(self) -> None:
         self.keys = self.keys.new_empty(0, self.d_model)
         self.values = self.values.new_empty(0, self.d_model)
         self.metadata.clear()
         self.last_debug = {}
+        self.spread_matrix = None
+
+    def set_spread_matrix(self, mat: torch.Tensor | None) -> None:
+        """Row-stochastic operator indexed like ``remember`` order (from activation store)."""
+
+        if mat is None or mat.numel() == 0:
+            self.spread_matrix = None
+            return
+        self.spread_matrix = mat.detach().float().clone()
 
     @torch.no_grad()
     def remember(self, key: torch.Tensor, value: torch.Tensor, metadata: dict | None = None) -> None:
@@ -90,22 +111,50 @@ class KVMemoryGraft(BaseGraft):
             self.metadata.append(dict(metadata or {}))
         self.metadata = self.metadata[-self.max_items:]
 
-    def _retrieve(self, queries: torch.Tensor, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    def _retrieve(self, queries: torch.Tensor, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, dict]:
         q = F.normalize(queries, dim=-1)
         k = F.normalize(self.keys.to(x.device), dim=-1)
-        sims = q @ k.T
-        if self.top_k is not None and self.top_k < sims.shape[-1]:
-            vals, idx = sims.topk(self.top_k, dim=-1)
-            masked = torch.full_like(sims, torch.finfo(sims.dtype).min)
-            sims = masked.scatter(-1, idx, vals)
-        weights = F.softmax(sims / max(self.temperature, 1e-6), dim=-1)
-        retrieved = weights @ self.values.to(x.device)
-        max_sim = sims.max(dim=-1).values
-        if self.threshold is None:
-            gate = torch.ones_like(max_sim).unsqueeze(-1)
+        raw_sims = q @ k.T
+        nk = raw_sims.shape[-1]
+        sqrt_d = math.sqrt(float(queries.shape[-1]))
+
+        mean_raw = raw_sims.mean(dim=-1)
+        std_raw = raw_sims.std(dim=-1, unbiased=False).clamp_min(1e-6)
+        max_raw = raw_sims.max(dim=-1).values
+        z_peak = (max_raw - mean_raw) / std_raw
+        gate_peak = torch.sigmoid(z_peak * sqrt_d)
+
+        if nk >= 2:
+            gram = k @ k.T
+            eye = torch.eye(nk, device=gram.device, dtype=torch.bool)
+            masked = gram.masked_fill(eye, torch.finfo(gram.dtype).min)
+            neighbor_max = masked.max(dim=-1).values
+            tau = neighbor_max.median()
+            sigma = neighbor_max.std(unbiased=False).clamp_min(1e-6)
+            gate_manifold = torch.sigmoid((max_raw - tau) / sigma * sqrt_d)
+            manifold_dbg = {
+                "tau_key_manifold": float(tau.detach().cpu()),
+                "sigma_key_manifold": float(sigma.detach().cpu()),
+            }
         else:
-            gate = torch.sigmoid((max_sim - self.threshold) * self.gate_sharpness).unsqueeze(-1)
-        return self.strength * gate * retrieved, weights, gate.squeeze(-1)
+            gate_manifold = torch.ones(raw_sims.shape[0], device=x.device, dtype=raw_sims.dtype)
+            manifold_dbg = {"tau_key_manifold": 0.0, "sigma_key_manifold": 1.0}
+
+        sims = raw_sims.clone()
+        eff_k = min(nk, max(2, int(math.ceil(math.sqrt(float(nk)) * math.log1p(float(nk))))))
+        if eff_k < nk:
+            vals, idx = sims.topk(eff_k, dim=-1)
+            masked_row = torch.full_like(sims, torch.finfo(sims.dtype).min)
+            sims = masked_row.scatter(-1, idx, vals)
+        weights = F.softmax(sims / max(self.temperature, 1e-6), dim=-1)
+        sm = self.spread_matrix
+        if sm is not None and sm.shape == (nk, nk):
+            sm_dev = sm.to(device=weights.device, dtype=weights.dtype)
+            weights = torch.matmul(weights, sm_dev)
+            weights = weights / weights.sum(dim=-1, keepdim=True).clamp_min(1e-9)
+        retrieved = weights @ self.values.to(x.device)
+        gate = (gate_peak * gate_manifold).unsqueeze(-1)
+        return self.strength * gate * retrieved, weights, gate.squeeze(-1), manifold_dbg
 
     def forward(self, x: torch.Tensor, state: dict) -> torch.Tensor:
         if not self.enabled or self.keys.numel() == 0:
@@ -115,18 +164,19 @@ class KVMemoryGraft(BaseGraft):
         if mask is None:
             mask = torch.ones(bsz, seq_len, device=x.device, dtype=torch.bool)
         if self.query_mode == "token":
-            delta, weights, gate = self._retrieve(x.reshape(-1, d_model), x)
-            self.last_debug = {"weights": weights.detach().cpu(), "gate": gate.detach().cpu()}
-            return x + delta.reshape(bsz, seq_len, d_model)
+            delta, weights, gate, manifold_dbg = self._retrieve(x.reshape(-1, d_model), x)
+            self.last_debug = {"weights": weights.detach().cpu(), "gate": gate.detach().cpu(), **manifold_dbg}
+            delta_view = delta.reshape(bsz, seq_len, d_model)
+            return x + delta_view
 
         weights_for_mean = mask.to(x.dtype).unsqueeze(-1)
         lengths = weights_for_mean.sum(dim=1).clamp_min(1.0)
         queries = (x * weights_for_mean).sum(dim=1) / lengths
-        delta, weights, gate = self._retrieve(queries, x)
+        delta, weights, gate, manifold_dbg = self._retrieve(queries, x)
         out = x.clone()
         last = _last_indices(state, x)
         out[torch.arange(bsz, device=x.device), last] += delta
-        self.last_debug = {"weights": weights.detach().cpu(), "gate": gate.detach().cpu()}
+        self.last_debug = {"weights": weights.detach().cpu(), "gate": gate.detach().cpu(), **manifold_dbg}
         return out
 
 
@@ -289,6 +339,20 @@ class ActiveInferenceTokenGraft(TriggeredTokenDirectionGraft):
     def choose_name(self, state: dict) -> str | None:
         decision = self.agent.decide()
         self.last_decision = decision
+        return decision.action_name
+
+
+class CoupledActiveInferenceTokenGraft(TriggeredTokenDirectionGraft):
+    """Arbitrates spatial vs causal active-inference faculties in one forward pass."""
+
+    def __init__(self, coupled: CoupledEFEAgent, token_by_action: Mapping[str, int], *, trigger_ids: Sequence[int] | None = None, strength: float = 18.0):
+        super().__init__(token_by_action, trigger_ids=trigger_ids, strength=strength)
+        self.coupled = coupled
+        self.last_coupled: CoupledDecision | None = None
+
+    def choose_name(self, state: dict) -> str | None:
+        decision = self.coupled.decide()
+        self.last_coupled = decision
         return decision.action_name
 
 

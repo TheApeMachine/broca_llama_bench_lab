@@ -43,7 +43,8 @@ class FakeLlamaLM(nn.Module):
 def test_llama_broca_host_layer_post_hook_changes_residual_stream():
     lm = FakeLlamaLM()
     host = LlamaBrocaHost(lm)
-    host.add_graft("layer.0.post", AddGraft())
+    slot = LlamaBrocaHost.layer_post_slot(0)
+    host.add_graft(slot, AddGraft())
 
     idx = torch.tensor([[1, 2, 3]])
     logits, cache = host(idx, return_cache=True)
@@ -53,3 +54,13 @@ def test_llama_broca_host_layer_post_hook_changes_residual_stream():
     assert "layer.0.post.post" in cache
     diff = cache["layer.0.post.post"] - cache["layer.0.post.pre"]
     assert torch.allclose(diff, torch.full_like(diff, 10.0))
+
+
+def test_llama_clear_slot_grafts_removes_layer_hook():
+    lm = FakeLlamaLM()
+    host = LlamaBrocaHost(lm)
+    slot = LlamaBrocaHost.layer_post_slot(0)
+    host.add_graft(slot, AddGraft())
+    assert 0 in host._hook_handles
+    host.clear_slot_grafts(slot)
+    assert 0 not in host._hook_handles

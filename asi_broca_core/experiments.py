@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import random
 from dataclasses import dataclass
 from pathlib import Path
@@ -11,16 +12,19 @@ import torch.nn.functional as F
 
 from .active_inference import ActiveInferenceAgent, TigerDoorEnv, build_tiger_pomdp, random_episode, run_episode
 from .causal import build_frontdoor_scm, build_simpson_scm
+from .device_utils import pick_torch_device
 from .grafts import (
     ActiveInferenceTokenGraft,
     CausalEffectTokenGraft,
     FeatureVectorGraft,
     KVMemoryGraft,
+    derived_residual_token_strength,
     memorize_persistent_next_token,
 )
-from .host import TinyCausalTransformer, TinyConfig, count_parameters, freeze_module
+from .hf_tokenizer_compat import HuggingFaceBrocaTokenizer
+from .host import count_parameters, freeze_module
+from .llama_broca_host import LlamaBrocaHost, load_llama_broca_host
 from .memory import SQLiteActivationMemory
-from .tokenizer import RegexTokenizer
 
 
 FACTS: list[tuple[str, str]] = [
@@ -40,13 +44,6 @@ UNIFIED_TASKS: list[tuple[str, str, str]] = [
     ("causal", "does treatment help ? answer :", "helps"),
 ]
 
-EXTRA_TOKENS = [
-    "berlin", "madrid", "lisbon", "vienna", "mars", "venus", "earth", "jupiter",
-    "true", "false", "safe", "unsafe", "unknown",
-    "listen", "open_left", "open_right", "action", "should", "take",
-    "treatment", "help", "helps", "hurts", "causal", "memory", "intervene", "faculty",
-]
-
 
 @dataclass
 class EvalRow:
@@ -64,35 +61,51 @@ def seed_everything(seed: int) -> None:
     torch.set_num_threads(1)
 
 
-def build_tokenizer() -> RegexTokenizer:
-    texts: list[str] = []
-    for p, t in FACTS:
-        texts.extend([p, t])
-    for _, p, t in UNIFIED_TASKS:
-        texts.extend([p, t])
-    return RegexTokenizer.fit(texts, extra_tokens=EXTRA_TOKENS)
+DEFAULT_FACULTY_MODEL_ID = os.environ.get("ASI_BROCA_MODEL_ID", "meta-llama/Llama-3.2-1B-Instruct")
 
 
-def make_model(tokenizer: RegexTokenizer, seed: int = 0, *, d_model: int = 96) -> TinyCausalTransformer:
+def load_faculty_llama(
+    seed: int = 0,
+    *,
+    model_id: str | None = None,
+    device: torch.device | str | None = None,
+    token: str | bool | None = None,
+) -> tuple[LlamaBrocaHost, HuggingFaceBrocaTokenizer]:
     seed_everything(seed)
-    cfg = TinyConfig(
-        vocab_size=len(tokenizer),
-        d_model=d_model,
-        n_layers=2,
-        n_heads=4,
-        d_ff=2 * d_model,
-        max_seq_len=48,
-        dropout=0.0,
-    )
-    model = TinyCausalTransformer(cfg)
-    model.eval()
-    return model
+    resolved = device if isinstance(device, torch.device) else pick_torch_device(device)
+    host, tok = load_llama_broca_host(model_id or DEFAULT_FACULTY_MODEL_ID, device=resolved, token=token)
+    host.eval()
+    return host, tok
+
+
+def _normalize_hf_piece(text: str) -> str:
+    return text.strip().lower().replace("Ġ", "").strip()
+
+
+def faculty_prediction_matches(prediction: str, target: str) -> bool:
+    p = _normalize_hf_piece(prediction)
+    t = _normalize_hf_piece(target)
+    if not t:
+        return False
+    if p == t:
+        return True
+    parts = p.split()
+    return t in parts or p.startswith(t) or t.startswith(p)
 
 
 @torch.no_grad()
-def predict_next(model: TinyCausalTransformer, tokenizer: RegexTokenizer, prompt: str, *, extra_state: dict | None = None) -> tuple[str, float]:
-    batch = tokenizer.batch_encode([prompt], device=next(model.parameters()).device)
-    logits = model(batch.ids, batch.attention_mask, extra_state=extra_state)
+def predict_next(
+    model: LlamaBrocaHost,
+    tokenizer: HuggingFaceBrocaTokenizer,
+    prompt: str,
+    *,
+    extra_state: dict | None = None,
+) -> tuple[str, float]:
+    device = next(model.parameters()).device
+    batch = tokenizer.batch_encode([prompt], device=device)
+    es = dict(extra_state or {})
+    es.setdefault("tokenizer", tokenizer)
+    logits = model(batch.ids, batch.attention_mask, extra_state=es)
     last = batch.lengths[0].item() - 1
     probs = F.softmax(logits[0, last], dim=-1)
     pred_id = int(probs.argmax().item())
@@ -100,7 +113,11 @@ def predict_next(model: TinyCausalTransformer, tokenizer: RegexTokenizer, prompt
 
 
 @torch.no_grad()
-def evaluate_next_token(model: TinyCausalTransformer, tokenizer: RegexTokenizer, items: Sequence[tuple[str, str] | tuple[str, str, str]]) -> tuple[float, list[EvalRow]]:
+def evaluate_next_token(
+    model: LlamaBrocaHost,
+    tokenizer: HuggingFaceBrocaTokenizer,
+    items: Sequence[tuple[str, str] | tuple[str, str, str]],
+) -> tuple[float, list[EvalRow]]:
     rows: list[EvalRow] = []
     for item in items:
         if len(item) == 2:
@@ -108,8 +125,17 @@ def evaluate_next_token(model: TinyCausalTransformer, tokenizer: RegexTokenizer,
             prompt, target = item  # type: ignore[misc]
         else:
             kind, prompt, target = item  # type: ignore[misc]
-        pred, conf = predict_next(model, tokenizer, prompt)
-        rows.append(EvalRow(prompt=prompt, target=target, prediction=pred, confidence=conf, correct=(pred == target), kind=kind))
+        pred, conf = predict_next(model, tokenizer, prompt, extra_state={"tokenizer": tokenizer})
+        rows.append(
+            EvalRow(
+                prompt=prompt,
+                target=target,
+                prediction=pred,
+                confidence=conf,
+                correct=faculty_prediction_matches(pred, target),
+                kind=kind,
+            )
+        )
     acc = sum(r.correct for r in rows) / max(1, len(rows))
     return acc, rows
 
@@ -139,15 +165,15 @@ def format_rows(rows: Sequence[EvalRow]) -> str:
 
 
 def install_persistent_memory(
-    model: TinyCausalTransformer,
-    tokenizer: RegexTokenizer,
+    model: LlamaBrocaHost,
+    tokenizer: HuggingFaceBrocaTokenizer,
     store: SQLiteActivationMemory,
     *,
     namespace: str,
     facts: Sequence[tuple[str, str]] = FACTS,
     write: bool = True,
 ) -> KVMemoryGraft:
-    graft = KVMemoryGraft(model.cfg.d_model, strength=18.0, threshold=0.86, temperature=0.025, query_mode="sequence_mean")
+    graft = KVMemoryGraft(model.cfg.d_model)
     model.add_graft("final_hidden", graft)
     if write:
         for prompt, target in facts:
@@ -167,7 +193,6 @@ def install_persistent_memory(
 
 
 def run_memory_experiment(seed: int = 0, db_path: str | Path = "runs/faculty_memory.sqlite", verbose: bool = True) -> dict:
-    tokenizer = build_tokenizer()
     path = Path(db_path)
     if path.exists():
         path.unlink()
@@ -177,14 +202,14 @@ def run_memory_experiment(seed: int = 0, db_path: str | Path = "runs/faculty_mem
             sp.unlink()
     namespace = f"seed_{seed}"
     store = SQLiteActivationMemory(path, default_namespace=namespace)
-    model = make_model(tokenizer, seed)
+    model, tokenizer = load_faculty_llama(seed)
     freeze_module(model)
 
     before, before_rows = evaluate_next_token(model, tokenizer, FACTS)
     graft = install_persistent_memory(model, tokenizer, store, namespace=namespace, write=True)
     after_write, after_rows = evaluate_next_token(model, tokenizer, FACTS)
 
-    restarted = make_model(tokenizer, seed)
+    restarted, _tok = load_faculty_llama(seed)
     freeze_module(restarted)
     fresh_graft = install_persistent_memory(restarted, tokenizer, store, namespace=namespace, write=False)
     loaded = len(fresh_graft.metadata)
@@ -219,8 +244,8 @@ def run_memory_experiment(seed: int = 0, db_path: str | Path = "runs/faculty_mem
 
 
 def run_active_inference_experiment(seed: int = 0, episodes: int = 80, verbose: bool = True) -> dict:
-    pomdp = build_tiger_pomdp(reliability=0.85)
-    agent = ActiveInferenceAgent(pomdp, horizon=1, precision=8.0, learn=True)
+    pomdp = build_tiger_pomdp()
+    agent = ActiveInferenceAgent(pomdp, horizon=1, learn=True)
     d0 = agent.decide()
 
     policy_rows = []
@@ -342,7 +367,6 @@ def run_causal_experiment(verbose: bool = True) -> dict:
 
 
 def build_unified_stack(seed: int = 0, db_path: str | Path = "runs/faculty_stack.sqlite"):
-    tokenizer = build_tokenizer()
     namespace = f"unified_{seed}"
     path = Path(db_path)
     if path.exists():
@@ -352,18 +376,18 @@ def build_unified_stack(seed: int = 0, db_path: str | Path = "runs/faculty_stack
         if sp.exists():
             sp.unlink()
     store = SQLiteActivationMemory(path, default_namespace=namespace)
-    model = make_model(tokenizer, seed)
+    model, tokenizer = load_faculty_llama(seed)
     freeze_module(model)
 
     memory_graft = install_persistent_memory(model, tokenizer, store, namespace=namespace, facts=FACTS, write=True)
 
-    pomdp = build_tiger_pomdp(reliability=0.85)
-    active_agent = ActiveInferenceAgent(pomdp, horizon=1, precision=8.0, learn=False)
+    pomdp = build_tiger_pomdp()
+    active_agent = ActiveInferenceAgent(pomdp, horizon=1, learn=False)
     active_graft = ActiveInferenceTokenGraft(
         active_agent,
-        token_by_action={name: tokenizer.token_to_id[name] for name in pomdp.action_names if name in tokenizer.token_to_id},
-        trigger_ids=[tokenizer.token_to_id["action"]],
-        strength=20.0,
+        token_by_action={name: tokenizer.primary_token_id(name) for name in pomdp.action_names},
+        trigger_ids=[tokenizer.primary_token_id("action")],
+        strength=derived_residual_token_strength(model.cfg.d_model, len(pomdp.action_names)),
     )
     model.add_graft("final_hidden", active_graft)
 
@@ -373,19 +397,18 @@ def build_unified_stack(seed: int = 0, db_path: str | Path = "runs/faculty_stack
         treatment="T",
         outcome="Y",
         outcome_value=1,
-        positive_token=tokenizer.token_to_id["helps"],
-        negative_token=tokenizer.token_to_id["hurts"],
+        positive_token=tokenizer.primary_token_id("helps"),
+        negative_token=tokenizer.primary_token_id("hurts"),
         treatment_values=(1, 0),
-        trigger_ids=[tokenizer.token_to_id["treatment"]],
-        strength=20.0,
+        trigger_ids=[tokenizer.primary_token_id("treatment")],
+        strength=derived_residual_token_strength(model.cfg.d_model, 2),
     )
     model.add_graft("final_hidden", causal_graft)
     return model, tokenizer, store, memory_graft, active_graft, causal_graft
 
 
 def run_unified_stack_experiment(seed: int = 0, db_path: str | Path = "runs/faculty_stack.sqlite", verbose: bool = True) -> dict:
-    tokenizer = build_tokenizer()
-    plain = make_model(tokenizer, seed)
+    plain, tokenizer = load_faculty_llama(seed)
     freeze_module(plain)
     before, before_rows = evaluate_next_token(plain, tokenizer, UNIFIED_TASKS)
 
@@ -414,7 +437,7 @@ def run_unified_stack_experiment(seed: int = 0, db_path: str | Path = "runs/facu
 
 
 
-def _bridge_dataset(tokenizer: RegexTokenizer):
+def _bridge_dataset(tokenizer: HuggingFaceBrocaTokenizer):
     """Feature vectors from causal estimates and policy posteriors.
 
     Layout:
@@ -431,7 +454,7 @@ def _bridge_dataset(tokenizer: RegexTokenizer):
         ([0.0, 1.0, 0.70, 0.15, 0.15, 1.0], "listen"),
     ]
     features = torch.tensor([x for x, _ in examples], dtype=torch.float32)
-    targets = torch.tensor([tokenizer.token_to_id[y] for _, y in examples], dtype=torch.long)
+    targets = torch.tensor([tokenizer.primary_token_id(y) for _, y in examples], dtype=torch.long)
     prompts = ["faculty answer :" for _ in examples]
     return prompts, features, targets, [y for _, y in examples]
 
@@ -439,25 +462,26 @@ def _bridge_dataset(tokenizer: RegexTokenizer):
 def run_trainable_bridge_experiment(seed: int = 0, steps: int = 220, verbose: bool = True) -> dict:
     """Train only a graft that maps faculty-state vectors into hidden space."""
 
-    tokenizer = build_tokenizer()
-    model = make_model(tokenizer, seed)
+    model, tokenizer = load_faculty_llama(seed)
     freeze_module(model)
-    trigger_id = tokenizer.token_to_id["faculty"]
+    trigger_id = tokenizer.primary_token_id("faculty")
     bridge = FeatureVectorGraft(d_features=6, d_model=model.cfg.d_model, trigger_ids=[trigger_id], strength=1.0)
     model.add_graft("final_hidden", bridge)
     for p in bridge.parameters():
         p.requires_grad = True
 
     prompts, features, targets, target_names = _bridge_dataset(tokenizer)
-    batch = tokenizer.batch_encode(prompts)
+    dev = next(model.parameters()).device
+    features = features.to(dev)
+    batch = tokenizer.batch_encode(prompts, device=dev)
     last = batch.lengths - 1
 
     def eval_bridge():
         with torch.no_grad():
             logits = model(batch.ids, batch.attention_mask, extra_state={"faculty_features": features})
-            pred_ids = logits[torch.arange(len(prompts)), last].argmax(dim=-1)
-            preds = [tokenizer.decode_id(int(i)) for i in pred_ids]
-            acc = sum(p == t for p, t in zip(preds, target_names)) / len(target_names)
+            pred_ids = logits[torch.arange(len(prompts), device=dev), last].argmax(dim=-1)
+            acc = sum(int(pi) == int(ti) for pi, ti in zip(pred_ids.tolist(), targets.tolist())) / len(target_names)
+            preds = [tokenizer.decode_id(int(i)) for i in pred_ids.tolist()]
             return acc, preds
 
     before, before_preds = eval_bridge()
@@ -466,7 +490,7 @@ def run_trainable_bridge_experiment(seed: int = 0, steps: int = 220, verbose: bo
     for _ in range(steps):
         opt.zero_grad(set_to_none=True)
         logits = model(batch.ids, batch.attention_mask, extra_state={"faculty_features": features})
-        loss = torch.nn.functional.cross_entropy(logits[torch.arange(len(prompts)), last], targets)
+        loss = torch.nn.functional.cross_entropy(logits[torch.arange(len(prompts), device=dev), last], targets.to(dev))
         loss.backward()
         opt.step()
         losses.append(float(loss.detach()))

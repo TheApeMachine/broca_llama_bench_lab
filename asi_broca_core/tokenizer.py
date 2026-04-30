@@ -10,6 +10,14 @@ import torch
 
 _TOKEN_RE = re.compile(r"[A-Za-z0-9_]+|[^\sA-Za-z0-9_]")
 
+SPEECH_BRIDGE_PREFIX = "speak :"
+
+
+def utterance_words(text: str) -> list[str]:
+    """Lowercase word/punct tokens for routing (same rules as ``RegexTokenizer.tokenize``)."""
+
+    return _TOKEN_RE.findall(text.lower())
+
 
 @dataclass
 class Batch:
@@ -44,7 +52,7 @@ class RegexTokenizer:
 
     @staticmethod
     def tokenize(text: str) -> list[str]:
-        return _TOKEN_RE.findall(text.lower())
+        return utterance_words(text)
 
     @classmethod
     def fit(cls, texts: Iterable[str], extra_tokens: Iterable[str] = ()) -> "RegexTokenizer":

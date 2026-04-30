@@ -21,20 +21,14 @@ def main() -> None:
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--out-dir", default="runs")
     parser.add_argument(
-        "--broca-backend",
-        choices=["tiny", "llama"],
-        default="tiny",
-        help="Language host: deterministic tiny transformer (tests/CI default) or meta-llama/Llama-3.2-1B-Instruct.",
-    )
-    parser.add_argument(
         "--broca-device",
         default=None,
         help="Torch device override (cpu, mps, cuda:0). Default auto-prefers Apple MPS, then CUDA, else CPU.",
     )
     parser.add_argument(
         "--broca-model-id",
-        default="meta-llama/Llama-3.2-1B-Instruct",
-        help="HF model id when --broca-backend=llama (requires gated access + HF_TOKEN for Meta Llama checkpoints).",
+        default=None,
+        help="HF model id (default meta-llama/Llama-3.2-1B-Instruct or ASI_BROCA_MODEL_ID). Requires HF access for gated checkpoints.",
     )
     parser.add_argument(
         "--no-train-bridge",
@@ -52,7 +46,6 @@ def main() -> None:
             seed=args.seed,
             db_path=out / "broca_semantic_memory.sqlite",
             verbose=True,
-            backend=args.broca_backend,
             llama_model_id=args.broca_model_id,
             device=args.broca_device,
             train_bridge=not args.no_train_bridge,
@@ -62,7 +55,6 @@ def main() -> None:
             seed=args.seed,
             db_path=out / "broca_semantic_memory.sqlite",
             verbose=True,
-            backend=args.broca_backend,
             llama_model_id=args.broca_model_id,
             device=args.broca_device,
             train_bridge=not args.no_train_bridge,

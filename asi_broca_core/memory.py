@@ -74,6 +74,76 @@ class SQLiteActivationMemory:
                 """
             )
             con.execute("CREATE INDEX IF NOT EXISTS idx_activation_namespace_kind ON activation_memory(namespace, kind)")
+            con.execute(
+                """
+                CREATE TABLE IF NOT EXISTS activation_association (
+                    lo INTEGER NOT NULL,
+                    hi INTEGER NOT NULL,
+                    weight REAL NOT NULL,
+                    updated_at REAL NOT NULL,
+                    PRIMARY KEY(lo, hi)
+                )
+                """
+            )
+            con.execute("CREATE INDEX IF NOT EXISTS idx_activation_assoc_lo ON activation_association(lo)")
+            con.execute("CREATE INDEX IF NOT EXISTS idx_activation_assoc_hi ON activation_association(hi)")
+
+    def bump_association(self, id_a: int, id_b: int, *, delta: float = 1.0) -> None:
+        """Symmetric co-activation counter between activation_memory rows.
+
+        Call this when two records are jointly recruited by the substrate (not for
+        arbitrary insertion order); edges drive one spreading step in KVMemory.
+        """
+
+        ia, ib = int(id_a), int(id_b)
+        if ia == ib:
+            return
+        lo, hi = (ia, ib) if ia < ib else (ib, ia)
+        now = time.time()
+        with self._connect() as con:
+            row = con.execute(
+                "SELECT weight FROM activation_association WHERE lo=? AND hi=?",
+                (lo, hi),
+            ).fetchone()
+            w = float(row[0]) + float(delta) if row else float(delta)
+            con.execute(
+                """
+                INSERT INTO activation_association(lo, hi, weight, updated_at)
+                VALUES (?,?,?,?)
+                ON CONFLICT(lo, hi) DO UPDATE SET weight=excluded.weight, updated_at=excluded.updated_at
+                """,
+                (lo, hi, w, now),
+            )
+
+    def normalized_spread_matrix(self, record_ids: list[int]) -> torch.Tensor:
+        """Row-stochastic spread operator over ordered graft slots (derived self-loop + co-access mass)."""
+
+        nk = len(record_ids)
+        if nk == 0:
+            return torch.empty(0, 0)
+        index_of = {int(rid): i for i, rid in enumerate(record_ids)}
+        accum = torch.eye(nk, dtype=torch.float32)
+        if nk < 2:
+            return accum
+
+        ids_tuple = tuple(sorted(index_of.keys()))
+        placeholders = ",".join("?" for _ in ids_tuple)
+        sql = (
+            f"SELECT lo, hi, weight FROM activation_association WHERE lo IN ({placeholders}) AND hi IN ({placeholders})"
+        )
+        args = ids_tuple + ids_tuple
+        with self._connect() as con:
+            rows = con.execute(sql, args).fetchall()
+        for lo, hi, w in rows:
+            i = index_of.get(int(lo))
+            j = index_of.get(int(hi))
+            if i is None or j is None:
+                continue
+            wf = float(w)
+            accum[i, j] += wf
+            accum[j, i] += wf
+        row_sums = accum.sum(dim=-1, keepdim=True).clamp_min(1e-9)
+        return accum / row_sums
 
     def clear(self, *, namespace: Optional[str] = None, kind: Optional[str] = None) -> None:
         namespace = namespace or self.default_namespace
@@ -183,6 +253,11 @@ class SQLiteActivationMemory:
             meta["memory_id"] = rec.id
             meta["confidence"] = rec.confidence
             graft.remember(rec.key.reshape(1, -1), rec.value.reshape(1, -1), metadata=meta)
+        ids = [rec.id for rec in records]
+        spread = self.normalized_spread_matrix(ids)
+        setter = getattr(graft, "set_spread_matrix", None)
+        if callable(setter):
+            setter(spread if spread.numel() else None)
         return len(records)
 
 

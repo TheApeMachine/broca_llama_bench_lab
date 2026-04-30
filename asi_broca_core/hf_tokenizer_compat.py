@@ -4,6 +4,10 @@ from __future__ import annotations
 
 from typing import Any, Iterable, Sequence
 
+import torch
+
+from .tokenizer import Batch
+
 
 def _fallback_pad_id(tok: Any) -> int:
     eos = getattr(tok, "eos_token_id", None)
@@ -58,5 +62,28 @@ class HuggingFaceBrocaTokenizer:
 
         text = " ".join(str(w).lower() for w in words)
         return self.encode(text, add_special_tokens=False)
+
+    def primary_token_id(self, word: str) -> int:
+        """First sub-token id for ``word`` (used where we need a single CE label / trigger id)."""
+
+        ids = self.encode(str(word).strip(), add_special_tokens=False)
+        return int(ids[0]) if ids else self.pad_id
+
+    def batch_encode(self, texts: Sequence[str], *, device: torch.device | str | None = None) -> Batch:
+        encoded = [self.encode(t, add_special_tokens=False) for t in texts]
+        max_len = max(1, max(len(row) for row in encoded))
+        pad = self.pad_id
+        ids = torch.full((len(encoded), max_len), pad, dtype=torch.long)
+        mask = torch.zeros((len(encoded), max_len), dtype=torch.bool)
+        lengths = torch.tensor([max(1, len(row)) for row in encoded], dtype=torch.long)
+        for i, row in enumerate(encoded):
+            if row:
+                ids[i, : len(row)] = torch.tensor(row, dtype=torch.long)
+                mask[i, : len(row)] = True
+        if device is not None:
+            ids = ids.to(device)
+            mask = mask.to(device)
+            lengths = lengths.to(device)
+        return Batch(ids=ids, attention_mask=mask, lengths=lengths)
 
 

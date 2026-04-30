@@ -11,7 +11,9 @@ Supported graft slots:
   layer.{i}.post        output hidden states of HF Llama decoder layer i
 
 The layer slots are installed as HF forward hooks, so real Llama layers can be
-intervened on without rewriting the transformers model internals.
+intervened on without rewriting the transformers model internals. Hooks are
+removed when the last graft on that layer slot is detached (see ``remove_graft`` /
+``clear_slot_grafts``).
 """
 
 from __future__ import annotations
@@ -47,7 +49,7 @@ def quiet_transformers_benchmark_log_warnings() -> None:
 class LlamaBrocaHost(nn.Module):
     """Broca-compatible host wrapping ``transformers.LlamaForCausalLM``.
 
-    Mirrors ``TinyCausalTransformer`` graft API: ``add_graft``,
+    Broca graft API: ``add_graft``, ``remove_graft``, ``clear_slot_grafts``,
     ``grafts_enabled``, ``forward``.  The wrapped HF model remains frozen.
     """
 
@@ -66,6 +68,12 @@ class LlamaBrocaHost(nn.Module):
         self._active_state: dict[str, Any] | None = None
         self._active_cache: Optional[Dict[str, torch.Tensor]] = None
         self._hook_handles: dict[int, Any] = {}
+
+    @staticmethod
+    def layer_post_slot(layer_idx: int) -> str:
+        """Canonical slot name for interventions after decoder layer ``layer_idx``."""
+
+        return f"layer.{int(layer_idx)}.post"
 
     @staticmethod
     def _slot_key(slot: str) -> str:
@@ -137,6 +145,67 @@ class LlamaBrocaHost(nn.Module):
             return self._apply_grafts(slot, hidden, state, self._active_cache)
 
         self._hook_handles[layer_idx] = layers[layer_idx].register_forward_hook(_hook)
+
+    def _teardown_layer_hook_if_unused(self, layer_idx: int) -> None:
+        slot = self.layer_post_slot(layer_idx)
+        key = self._slot_key(slot)
+        if key in self.grafts and len(self.grafts[key]) > 0:
+            return
+        handle = self._hook_handles.pop(layer_idx, None)
+        if handle is not None:
+            handle.remove()
+
+    def remove_graft(self, slot: str, index: int = -1) -> nn.Module | None:
+        """Remove one graft from a slot (default: last appended). Returns the module or ``None``."""
+
+        key = self._slot_key(slot)
+        if key not in self.grafts:
+            return None
+        lst = self.grafts[key]
+        if len(lst) == 0:
+            del self.grafts[key]
+            layer_idx = self._parse_layer_slot(slot)
+            if layer_idx is not None:
+                self._teardown_layer_hook_if_unused(layer_idx)
+            return None
+        removed = lst.pop(index)
+        if len(lst) == 0:
+            del self.grafts[key]
+        layer_idx = self._parse_layer_slot(slot)
+        if layer_idx is not None:
+            self._teardown_layer_hook_if_unused(layer_idx)
+        return removed
+
+    def clear_slot_grafts(self, slot: str) -> list[nn.Module]:
+        """Detach all grafts for ``slot`` and remove layer hooks when applicable."""
+
+        key = self._slot_key(slot)
+        if key not in self.grafts:
+            return []
+        lst = self.grafts[key]
+        out: list[nn.Module] = []
+        while len(lst) > 0:
+            out.append(lst.pop(-1))
+        out.reverse()
+        del self.grafts[key]
+        layer_idx = self._parse_layer_slot(slot)
+        if layer_idx is not None:
+            self._teardown_layer_hook_if_unused(layer_idx)
+        return out
+
+    def clear_all_grafts(self) -> list[tuple[str, nn.Module]]:
+        """Remove every graft; returns ``(canonical_slot, module)`` pairs in arbitrary order."""
+
+        pairs: list[tuple[str, nn.Module]] = []
+        for key, lst in list(self.grafts.items()):
+            slot = key.replace("__", ".")
+            while len(lst) > 0:
+                m = lst.pop(-1)
+                pairs.append((slot, m))
+            del self.grafts[key]
+        for layer_idx in list(self._hook_handles.keys()):
+            self._teardown_layer_hook_if_unused(layer_idx)
+        return pairs
 
     @contextlib.contextmanager
     def grafts_enabled(self, enabled: bool) -> Iterator[None]:
