@@ -2,10 +2,11 @@
 
 Run:
 
-  python -m core.chat_tui --broca-db runs/broca_chat.sqlite
+  python -m core.chat_tui
 
-The center column streams the substrate-biased chat (same path as
-``chat_cli.py`` ``--broca``). The left column shows comprehension state
+Uses the canonical substrate SQLite path (``runs/broca_substrate.sqlite``, or test
+isolate under pytest). Generation and DMN timings use fixed defaults from
+:class:`core.substrate_runtime` (no CLI tuning). The left column shows comprehension state
 (current cognitive frame, working memory, intrinsic cues, logit bias) and
 the right column shows substrate dynamics (semantic memory, DMN background,
 self-improve worker, Hawkes intensities, confidence sparkline). The bottom
@@ -28,7 +29,6 @@ import logging
 import os
 import time
 from collections import deque
-from pathlib import Path
 from typing import Any
 
 try:
@@ -60,6 +60,17 @@ from .device_utils import pick_torch_device
 from .event_bus import EventBus, LogToBusHandler, get_default_bus
 from .llama_broca_host import quiet_transformers_benchmark_log_warnings, resolve_hf_hub_token
 from .logging_setup import configure_lab_logging
+from .substrate_runtime import (
+    BROCA_BACKGROUND_INTERVAL_S,
+    CHAT_DO_SAMPLE,
+    CHAT_MAX_NEW_TOKENS,
+    CHAT_NAMESPACE,
+    CHAT_TEMPERATURE,
+    CHAT_TOP_P,
+    default_model_id,
+    default_substrate_sqlite_path,
+    ensure_parent_dir,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -250,25 +261,10 @@ class BrocaChatApp(App):
 
     busy: reactive[bool] = reactive(False)
 
-    def __init__(
-        self,
-        *,
-        mind: BrocaMind,
-        bus: EventBus,
-        max_new_tokens: int = 512,
-        do_sample: bool = True,
-        temperature: float = 0.7,
-        top_p: float = 0.9,
-        debug_substrate: bool = False,
-    ) -> None:
+    def __init__(self, *, mind: BrocaMind, bus: EventBus) -> None:
         super().__init__()
         self.mind = mind
         self.bus = bus
-        self.max_new_tokens = int(max_new_tokens)
-        self.do_sample = bool(do_sample)
-        self.temperature = float(temperature)
-        self.top_p = float(top_p)
-        self.debug_substrate = bool(debug_substrate)
 
         self._messages: list[dict[str, str]] = []
         self._reply_buffer: list[str] = []
@@ -626,10 +622,10 @@ class BrocaChatApp(App):
         try:
             frame, reply = self.mind.chat_reply(
                 self._messages,
-                max_new_tokens=self.max_new_tokens,
-                do_sample=self.do_sample,
-                temperature=self.temperature,
-                top_p=self.top_p,
+                max_new_tokens=CHAT_MAX_NEW_TOKENS,
+                do_sample=CHAT_DO_SAMPLE,
+                temperature=CHAT_TEMPERATURE,
+                top_p=CHAT_TOP_P,
                 on_token=on_token,
             )
             self.app.call_from_thread(self._on_reply_done, frame.intent, frame.confidence, reply)
@@ -642,15 +638,13 @@ class BrocaChatApp(App):
         running = "".join(self._reply_buffer)
         self.query_one("#streaming", Static).update(f"[bold magenta]Assistant[/bold magenta]  {running}")
 
-    def _on_reply_done(self, intent: str, confidence: float, reply: str) -> None:
+    def _on_reply_done(self, _intent: str, _confidence: float, reply: str) -> None:
         self.busy = False
         text = "".join(self._reply_buffer) or reply
         text = text.strip() or "[empty reply]"
         self._messages.append({"role": "assistant", "content": text})
         chatlog = self.query_one("#chatlog", RichLog)
         chatlog.write(f"[bold magenta]Assistant[/bold magenta]  {text}")
-        if self.debug_substrate:
-            chatlog.write(f"[dim]substrate: intent={intent} confidence={confidence:.2f}[/dim]")
         self.query_one("#streaming", Static).update("")
         self._reply_buffer.clear()
 
@@ -681,40 +675,8 @@ class BrocaChatApp(App):
 
 
 def _build_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(description="Textual TUI for the Broca substrate chat.")
-    p.add_argument(
-        "--model",
-        default=os.environ.get("MODEL_ID", "meta-llama/Llama-3.2-1B-Instruct"),
-        help="HF model id (default: MODEL_ID env or Llama-3.2-1B-Instruct).",
-    )
-    p.add_argument("--device", default=os.environ.get("M_DEVICE"), help="Torch device override (cpu, mps, cuda:0).")
-    p.add_argument(
-        "--token",
-        default=None,
-        help="HF hub token string, or omit to use HF_TOKEN / huggingface-cli login.",
-    )
-    p.add_argument("--max-new-tokens", type=int, default=512)
-    p.add_argument("--sample", action="store_true", help="Use sampling instead of greedy decoding.")
-    p.add_argument("--temperature", type=float, default=0.7)
-    p.add_argument("--top-p", type=float, default=0.9)
-    p.add_argument(
-        "--broca-db",
-        type=Path,
-        default=None,
-        help="SQLite path for BrocaMind. Default: runs/broca_chat.sqlite",
-    )
-    p.add_argument("--broca-namespace", default="chat", help="Semantic memory namespace.")
-    p.add_argument("--no-background", action="store_true", help="Disable DMN background consolidation.")
-    p.add_argument("--background-interval", type=float, default=5.0)
-    p.add_argument("--self-improve", action="store_true", help="Enable Docker-backed self-improve worker.")
-    p.add_argument("--no-self-improve", action="store_true")
-    p.add_argument("--self-improve-interval", type=float, default=None)
-    p.add_argument("--debug-substrate", action="store_true")
-    p.add_argument(
-        "--log-level",
-        default=os.environ.get("TUI_LOG_LEVEL", "INFO"),
-        help="Level forwarded into the activity feed (DEBUG, INFO, WARNING, ERROR). Default: INFO.",
-    )
+    p = argparse.ArgumentParser(description="Textual TUI for the Mosaic substrate chat (fixed runtime).")
+    p.add_argument("-h", "--help", action="help", help="Show this message and exit.")
     return p
 
 
@@ -723,54 +685,39 @@ def main() -> None:
     # rotating file handler still records the full event stream.
     os.environ.setdefault("LOG_SILENT", "1")
     configure_lab_logging()
-    args = _build_parser().parse_args()
+    _build_parser().parse_args()
     os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
     quiet_transformers_benchmark_log_warnings()
 
     bus = get_default_bus()
-    log_level = getattr(logging, args.log_level.upper(), logging.INFO)
+    log_level = getattr(logging, str(os.environ.get("TUI_LOG_LEVEL", "INFO")).upper(), logging.INFO)
     handler = LogToBusHandler(bus, level=log_level)
     handler.setFormatter(logging.Formatter("%(message)s"))
     logging.getLogger("core").addHandler(handler)
 
-    resolved_device = pick_torch_device(args.device)
-    if args.token is None:
-        token_kw: str | bool | None = resolve_hf_hub_token(None)
-    elif args.token.strip() == "":
-        token_kw = True
-    else:
-        token_kw = args.token.strip()
+    resolved_device = pick_torch_device(os.environ.get("M_DEVICE"))
+    token_kw: str | bool | None = resolve_hf_hub_token(None)
 
-    db_path = args.broca_db or Path("runs/broca_chat.sqlite")
-    db_path.parent.mkdir(parents=True, exist_ok=True)
+    db_path = default_substrate_sqlite_path()
+    ensure_parent_dir(db_path)
 
     mind = BrocaMind(
         seed=0,
         db_path=db_path,
-        namespace=args.broca_namespace,
-        llama_model_id=args.model,
+        namespace=CHAT_NAMESPACE,
+        llama_model_id=default_model_id(),
         device=resolved_device,
         hf_token=token_kw,
     )
     mind.event_bus = bus  # ensure shared bus
 
-    if not args.no_background:
-        mind.start_background(interval_s=max(0.1, float(args.background_interval)))
+    mind.start_background(interval_s=BROCA_BACKGROUND_INTERVAL_S)
 
     si_env = os.environ.get("BROCA_SELF_IMPROVE", "").strip().lower() in {"1", "true", "yes", "on"}
-    enable_self_improve = (args.self_improve or si_env) and not args.no_self_improve
-    if enable_self_improve:
-        mind.start_self_improve_worker(interval_s=args.self_improve_interval, enabled=True)
+    if si_env:
+        mind.start_self_improve_worker(interval_s=None, enabled=True)
 
-    app = BrocaChatApp(
-        mind=mind,
-        bus=bus,
-        max_new_tokens=args.max_new_tokens,
-        do_sample=args.sample,
-        temperature=args.temperature,
-        top_p=args.top_p,
-        debug_substrate=args.debug_substrate,
-    )
+    app = BrocaChatApp(mind=mind, bus=bus)
     try:
         app.run()
     finally:

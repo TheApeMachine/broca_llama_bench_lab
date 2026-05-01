@@ -5,7 +5,7 @@ This is independent of :class:`CognitiveBackgroundWorker` (DMN). It uses the sam
 and (2) persistent outcomes via semantic claims, reflections, journal, and Hopfield.
 
 **Opt-in:** set ``BROCA_SELF_IMPROVE=1`` or pass ``--self-improve`` to
-``python -m core.chat_cli --broca``. Requires ``GITHUB_TOKEN`` with ``repo``
+``python -m core.chat_cli``. Requires ``GITHUB_TOKEN`` with ``repo``
 scope, ``docker`` on PATH, and ``BROCA_SELF_IMPROVE_REPO`` (or a resolveable
 ``git`` remote).
 

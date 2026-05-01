@@ -2,13 +2,15 @@
 """Native Hugging Face-datasets benchmark harness for the Broca/Llama stack.
 
 This module intentionally does not depend on EleutherAI's lm-eval harness.  It
-loads public benchmark datasets through ``datasets.load_dataset`` and scores a
-local causal LM by length-normalized continuation log-likelihood (multiple
-choice) or exact normalized answer matching (generation).
+loads public benchmark datasets through ``datasets.load_dataset`` and scores
+vanilla ``AutoModelForCausalLM``, a ``LlamaBrocaHost`` replay on the same
+weights, and (for Llama checkpoints) full :class:`~core.broca.BrocaMind` on that
+host --- by length-normalized continuation log-likelihood (multiple choice) or
+deterministic generation with normalized exact matching where applicable.
 
-The default model for the CLI is ``meta-llama/Llama-3.2-1B-Instruct``.  That
-checkpoint is gated on the Hugging Face Hub, so real runs normally require
-``HF_TOKEN`` or ``huggingface-cli login``.
+Real runs use the unified entry point::
+
+  HF_TOKEN=... python -m core.benchmarks
 """
 
 from __future__ import annotations
@@ -23,6 +25,7 @@ import math
 import os
 import random
 import re
+import sys
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -31,13 +34,16 @@ from typing import Any, Callable, Iterable, Iterator, Mapping, Protocol, Sequenc
 import torch
 import torch.nn.functional as F
 
+from core.broca import BrocaMind
 from core.device_utils import inference_dtype, pick_torch_device
+from core.hf_tokenizer_compat import HuggingFaceBrocaTokenizer
 from core.llama_broca_host import (
     LlamaBrocaHost,
     load_llama_broca_host,
     quiet_transformers_benchmark_log_warnings,
     resolve_hf_hub_token,
 )
+from core.substrate_runtime import CHAT_NAMESPACE, default_substrate_sqlite_path
 
 
 DEFAULT_LLAMA_MODEL = "meta-llama/Llama-3.2-1B-Instruct"
@@ -609,6 +615,85 @@ class HFLocalLlamaBrocaShell:
         ).strip()
 
 
+class HFLocalBrocaMindBench:
+    """Full BrocaMind stack: comprehend → graft-biased ``LlamaBrocaHost`` forward.
+
+    Expects ``mind.host`` to be the same :class:`~core.llama_broca_host.LlamaBrocaHost`
+    instance already used for the paired ``broca_shell`` pass (no second weight load).
+    """
+
+    def __init__(self, mind: BrocaMind, hf_local: HFLocalCausalLM) -> None:
+        self.mind = mind
+        self.device = hf_local.device
+        self.max_seq_len = hf_local.max_seq_len
+        self.tokenizer = mind.tokenizer.inner
+
+    def format_prompt(self, prompt: str, *, chat_template: bool = False) -> str:
+        return _shared_hf_format_prompt(self.tokenizer, prompt, chat_template=chat_template)
+
+    def _encode_context_choice(self, context: str, choice: str) -> tuple[list[int], int, int]:
+        return _shared_hf_encode_context_choice(self.tokenizer, self.max_seq_len, context, choice)
+
+    @torch.no_grad()
+    def score_choices(
+        self, prompt: str, choices: Sequence[str], *, normalize: bool = True, chat_template: bool = False
+    ) -> tuple[list[float], list[float], list[int]]:
+        context = self.format_prompt(prompt, chat_template=chat_template)
+        frame = self.mind.comprehend(context)
+        feats = self.mind.broca_features_from_frame(frame).to(self.device)
+        bias = self.mind.content_logit_bias_from_frame(frame)
+        substrate_confidence = float(max(0.0, min(1.0, float(frame.confidence))))
+        encoded = [self._encode_context_choice(context, c) for c in choices]
+        max_len = max(len(ids) for ids, _, _ in encoded)
+        substrate_inertia = math.log1p(float(max(len(ids) for ids, _, _ in encoded)))
+        pad_id = getattr(self.tokenizer, "pad_token_id", None)
+        if pad_id is None:
+            pad_id = getattr(self.tokenizer, "eos_token_id", 0) or 0
+        input_ids = torch.full((len(encoded), max_len), int(pad_id), dtype=torch.long, device=self.device)
+        attn = torch.zeros((len(encoded), max_len), dtype=torch.bool, device=self.device)
+        for i, (ids, _, _) in enumerate(encoded):
+            input_ids[i, : len(ids)] = torch.tensor(ids, dtype=torch.long, device=self.device)
+            attn[i, : len(ids)] = True
+        extra_state: dict[str, Any] = {
+            "tokenizer": self.mind.tokenizer,
+            "broca_features": feats,
+            "substrate_confidence": substrate_confidence,
+            "substrate_inertia": float(substrate_inertia),
+        }
+        if bias:
+            extra_state["broca_logit_bias"] = bias
+            extra_state["broca_logit_bias_decay"] = 1.0
+        logits = self.mind.host(input_ids, attention_mask=attn, extra_state=extra_state).float()
+        logprobs = F.log_softmax(logits, dim=-1)
+        raw_scores: list[float] = []
+        norm_scores: list[float] = []
+        token_counts: list[int] = []
+        for row, (ids, cont_start, cont_len) in enumerate(encoded):
+            total = 0.0
+            usable = 0
+            for j in range(cont_start, cont_start + cont_len):
+                if j <= 0 or j >= len(ids):
+                    continue
+                total += float(logprobs[row, j - 1, int(ids[j])].item())
+                usable += 1
+            raw_scores.append(total)
+            token_counts.append(max(usable, 1))
+            norm_scores.append(total / max(usable, 1) if normalize else total)
+        return norm_scores, raw_scores, token_counts
+
+    @torch.no_grad()
+    def generate(self, prompt: str, *, max_new_tokens: int = 128, chat_template: bool = True) -> str:
+        text = self.format_prompt(prompt, chat_template=chat_template)
+        _frame, reply = self.mind.chat_reply(
+            [{"role": "user", "content": text}],
+            max_new_tokens=max_new_tokens,
+            do_sample=False,
+            temperature=1.0,
+            top_p=1.0,
+        )
+        return reply.strip()
+
+
 class BenchmarkBackendProtocol(Protocol):
     """Structural protocol for MC scoring and greedy generation backends."""
 
@@ -860,7 +945,7 @@ def evaluate_task(
 
 
 def _run_hf_tasks_to_dir(
-    backend: BenchmarkBackendProtocol | HFLocalCausalLM | HFLocalLlamaBrocaShell,
+    backend: BenchmarkBackendProtocol | HFLocalCausalLM | HFLocalLlamaBrocaShell | HFLocalBrocaMindBench,
     *,
     run_root: Path,
     task_out_dir: Path,
@@ -940,14 +1025,37 @@ def _print_leaderboard_comparison_table(
     micro_nv: int,
     micro_cv: int,
     micro_cs: int,
+    per_mind: dict[str, Any] | None = None,
+    macro_m: float | None = None,
+    micro_m: float | None = None,
+    micro_cm: int | None = None,
 ) -> None:
-    print("\n" + "=" * 88, flush=True)
-    print(
-        "LEADERBOARD COMPARISON  vanilla_lm (HFLocalCausalLM)  vs  broca_shell (LlamaBrocaHost, same weights)",
-        flush=True,
+    has_mind = (
+        per_mind is not None
+        and macro_m is not None
+        and micro_m is not None
+        and micro_cm is not None
     )
-    print("=" * 88, flush=True)
-    hdr = f"{'task':<18} {'n':>5} {'vanilla_acc':>12} {'broca_acc':>12} {'delta':>10}  jsonl_paths"
+    width = 120 if has_mind else 88
+    print("\n" + "=" * width, flush=True)
+    if has_mind:
+        print(
+            "LEADERBOARD  vanilla_lm  |  broca_shell (LlamaBrocaHost)  |  broca_mind (BrocaMind + same host)",
+            flush=True,
+        )
+    else:
+        print(
+            "LEADERBOARD COMPARISON  vanilla_lm (HFLocalCausalLM)  vs  broca_shell (LlamaBrocaHost, same weights)",
+            flush=True,
+        )
+    print("=" * width, flush=True)
+    if has_mind:
+        hdr = (
+            f"{'task':<16} {'n':>5} {'vanilla':>9} {'shell':>9} {'mind':>9} "
+            f"{'dS':>8} {'dM':>8}  jsonl paths"
+        )
+    else:
+        hdr = f"{'task':<18} {'n':>5} {'vanilla_acc':>12} {'broca_acc':>12} {'delta':>10}  jsonl_paths"
     print(hdr, flush=True)
     print("-" * len(hdr), flush=True)
     for t in tasks:
@@ -955,24 +1063,52 @@ def _print_leaderboard_comparison_table(
         ps = per_shell[t]
         acc_v = float(pv["accuracy"])
         acc_s = float(ps["accuracy"])
-        delta = acc_s - acc_v
         n = int(pv["n"])
         rel_v = Path(t + ".jsonl").as_posix()
         rel_sh = Path("broca_shell") / (t + ".jsonl")
+        if has_mind:
+            assert per_mind is not None
+            pm = per_mind[t]
+            acc_mm = float(pm["accuracy"])
+            d_s = acc_s - acc_v
+            d_mm = acc_mm - acc_v
+            rel_mm = Path("broca_mind") / (t + ".jsonl")
+            print(
+                f"{t:<16} {n:5d} {acc_v:9.3f} {acc_s:9.3f} {acc_mm:9.3f} {d_s:+8.3f} {d_mm:+8.3f}  "
+                f"{rel_v} | {rel_sh.as_posix()} | {rel_mm.as_posix()}",
+                flush=True,
+            )
+        else:
+            delta = acc_s - acc_v
+            print(
+                f"{t:<18} {n:5d} {acc_v:12.3f} {acc_s:12.3f} {delta:+10.3f}  {rel_v}  |  {rel_sh.as_posix()}",
+                flush=True,
+            )
+    print("-" * len(hdr), flush=True)
+    if has_mind:
+        assert macro_m is not None and micro_m is not None and micro_cm is not None
         print(
-            f"{t:<18} {n:5d} {acc_v:12.3f} {acc_s:12.3f} {delta:+10.3f}  {rel_v}  |  {rel_sh.as_posix()}",
+            f"{'macro_accuracy':<16}      {macro_v:9.3f} {macro_s:9.3f} {macro_m:9.3f} "
+            f"{macro_s - macro_v:+8.3f} {macro_m - macro_v:+8.3f}",
             flush=True,
         )
-    print("-" * len(hdr), flush=True)
-    print(
-        f"{'macro_accuracy':<18}      {macro_v:12.3f} {macro_s:12.3f} {macro_s - macro_v:+10.3f}",
-        flush=True,
-    )
-    print(
-        f"{'micro_accuracy':<18}  {micro_nv:5d} {micro_v:12.3f} {micro_s:12.3f} {micro_s - micro_v:+10.3f}  (hits {micro_cv} vanilla vs {micro_cs} shell / n={micro_nv})",
-        flush=True,
-    )
-    print("=" * 88, flush=True)
+        print(
+            f"{'micro_accuracy':<16} {micro_nv:5d} {micro_v:9.3f} {micro_s:9.3f} {micro_m:9.3f} "
+            f"{micro_s - micro_v:+8.3f} {micro_m - micro_v:+8.3f}  "
+            f"(hits V={micro_cv} S={micro_cs} M={micro_cm} / n={micro_nv})",
+            flush=True,
+        )
+    else:
+        print(
+            f"{'macro_accuracy':<18}      {macro_v:12.3f} {macro_s:12.3f} {macro_s - macro_v:+10.3f}",
+            flush=True,
+        )
+        print(
+            f"{'micro_accuracy':<18}  {micro_nv:5d} {micro_v:12.3f} {micro_s:12.3f} {micro_s - micro_v:+10.3f}  "
+            f"(hits {micro_cv} vanilla vs {micro_cs} shell / n={micro_nv})",
+            flush=True,
+        )
+    print("=" * width, flush=True)
     print(f"artifact root: {root}", flush=True)
 
 
@@ -997,9 +1133,10 @@ def run_hf_datasets_benchmark(
 ) -> dict[str, Any]:
     """Run HF-datasets MC/generation benchmarks.
 
-    ``compare_llama_broca_host_shell``: ``None`` (default) turns on a paired LlamaBrocaHost replay for
-    Llama checkpoints only and prints one side-by-side accuracy table. Pass ``False`` to disable; pass
-    ``True`` to force comparison when possible (no-op with a skip message if not Llama).
+    ``compare_llama_broca_host_shell``: ``None`` (default) turns on paired runs for
+    Llama checkpoints: ``broca_shell`` (host forward, no substrate) and ``broca_mind``
+    (full :class:`~core.broca.BrocaMind` on the same loaded host). Pass ``False`` to run
+    vanilla only; pass ``True`` to force when possible (skip with a message if not Llama).
     """
 
     run_stamp = _dt.datetime.now(tz=_dt.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
@@ -1029,7 +1166,7 @@ def run_hf_datasets_benchmark(
 
     if do_compare:
         print(
-            "\n--- Native HF leaderboard (paired: vanilla_lm + broca_shell · same tasks, same checkpoint) ---",
+            "\n--- Native HF leaderboard (vanilla_lm + broca_shell + broca_mind · same tasks, same checkpoint) ---",
             flush=True,
         )
     else:
@@ -1051,6 +1188,7 @@ def run_hf_datasets_benchmark(
                 "tasks": list(tasks),
                 "limit": limit,
                 "compare_shell": bool(do_compare),
+                "compare_broca_mind": bool(do_compare),
             },
         )
     silent_first = bool(do_compare)
@@ -1157,6 +1295,55 @@ def run_hf_datasets_benchmark(
                 "artifacts_subdir": "broca_shell",
             }
         }
+        mind_preload = (shell_back.host, HuggingFaceBrocaTokenizer(shell_back.tokenizer))
+        bm = BrocaMind(
+            seed=int(seed),
+            db_path=default_substrate_sqlite_path(),
+            namespace=CHAT_NAMESPACE,
+            preload_host_tokenizer=mind_preload,
+            llama_model_id=model_id,
+            device=str(shell_back.device),
+            hf_token=hf_token,
+        )
+        mind_backend = HFLocalBrocaMindBench(bm, backend)
+        mind_dir = out / "broca_mind"
+        per_mind, _rows_mind = _run_hf_tasks_to_dir(
+            mind_backend,
+            run_root=out,
+            task_out_dir=mind_dir,
+            tasks=tasks,
+            limit=limit,
+            split=split,
+            streaming=streaming,
+            seed=seed,
+            shuffle=shuffle,
+            normalize=normalize,
+            chat_template=chat_template,
+            generation_max_new_tokens=generation_max_new_tokens,
+            silent=True,
+            arm_label="broca_mind",
+        )
+        macro_m = sum(float(v["accuracy"]) for v in per_mind.values()) / max(1, len(per_mind))
+        micro_n_m = sum(int(v["n"]) for v in per_mind.values())
+        micro_c_m = sum(int(v["correct"]) for v in per_mind.values())
+        micro_acc_m = micro_c_m / max(1, micro_n_m)
+        macro_m = round(float(macro_m), 2)
+        micro_acc_m = round(float(micro_acc_m), 2)
+        comparison["broca_mind"] = {
+            "device": str(shell_back.device),
+            "aggregate": {
+                "macro_accuracy": macro_m,
+                "micro_accuracy": micro_acc_m,
+                "micro_n": micro_n_m,
+                "micro_correct": micro_c_m,
+                "macro_delta_vs_vanilla_lm": round(macro_m - macro, 2),
+                "micro_delta_vs_vanilla_lm": round(micro_acc_m - micro_acc, 2),
+                "macro_delta_vs_llama_broca_shell": round(macro_m - macro_s, 2),
+                "micro_delta_vs_llama_broca_shell": round(micro_acc_m - micro_acc_s, 2),
+            },
+            "per_task": per_mind,
+            "artifacts_subdir": "broca_mind",
+        }
         _print_leaderboard_comparison_table(
             tasks=tasks,
             root=out,
@@ -1169,6 +1356,10 @@ def run_hf_datasets_benchmark(
             micro_nv=micro_n,
             micro_cv=micro_correct,
             micro_cs=micro_c_s,
+            per_mind=per_mind,
+            macro_m=macro_m,
+            micro_m=micro_acc_m,
+            micro_cm=micro_c_m,
         )
 
     if comparison:
@@ -1191,55 +1382,22 @@ def run_hf_datasets_benchmark(
     return result
 
 
-def build_arg_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(description="Native HuggingFace-datasets benchmark harness for Llama/Broca.")
-    p.add_argument("--model", default=os.environ.get("BENCHMARK_MODEL", DEFAULT_LLAMA_MODEL))
-    p.add_argument("--preset", choices=sorted(DEFAULT_NATIVE_PRESETS), default=os.environ.get("BENCHMARK_PRESET", "quick"))
-    p.add_argument("--tasks", default=os.environ.get("BENCHMARK_TASKS", ""), help="Comma-separated explicit tasks; overrides --preset.")
-    p.add_argument("--limit", type=int, default=int(os.environ.get("BENCHMARK_LIMIT", "50")), help="Examples per task. Use -1 for full split.")
-    p.add_argument("--split", default=None, help="Override split for all tasks, e.g. validation or test.")
-    p.add_argument("--device", default=os.environ.get("BENCHMARK_DEVICE"))
-    p.add_argument("--output-dir", type=Path, default=Path(os.environ.get("BENCHMARK_OUTPUT_DIR", "runs/hf_benchmarks")))
-    p.add_argument("--streaming", action="store_true", help="Use HF iterable streaming where supported.")
-    p.add_argument("--shuffle", action="store_true", help="Shuffle before limiting, for less prefix-biased smoke runs.")
-    p.add_argument("--seed", type=int, default=int(os.environ.get("BENCHMARK_SEED", "0")))
-    p.add_argument("--no-normalize", action="store_true", help="Use raw continuation log-prob instead of length-normalized scores.")
-    p.add_argument("--chat-template", action="store_true", help="Wrap prompts using tokenizer.apply_chat_template when available.")
-    p.add_argument("--max-seq-len", type=int, default=None)
-    p.add_argument("--generation-max-new-tokens", type=int, default=128)
-    p.add_argument("--trust-remote-code", action="store_true")
-    p.add_argument(
-        "--no-broca-host-compare",
-        action="store_true",
-        help="Disable paired LlamaBrocaHost leaderboard replay (default: on for Llama checkpoints).",
-    )
-    return p
+def print_hf_datasets_benchmark_help() -> None:
+    print("Standalone module for library imports. Run the unified harness via:\n  python -m core.benchmarks\n")
 
 
 def main(argv: Sequence[str] | None = None) -> None:
-    args = build_arg_parser().parse_args(argv)
-    tasks = resolve_task_names(args.tasks, preset=args.preset)
-    limit = None if args.limit is not None and args.limit < 0 else args.limit
-    hf_tok_raw = os.environ.get("HF_TOKEN")
-    hf_token: str | bool | None = hf_tok_raw if hf_tok_raw and hf_tok_raw.strip() else None
-    run_hf_datasets_benchmark(
-        model_id=args.model,
-        tasks=tasks,
-        output_dir=args.output_dir,
-        limit=limit,
-        split=args.split,
-        device=args.device,
-        hf_token=hf_token,
-        streaming=args.streaming,
-        seed=args.seed,
-        shuffle=args.shuffle,
-        normalize=not args.no_normalize,
-        chat_template=args.chat_template,
-        max_seq_len=args.max_seq_len,
-        generation_max_new_tokens=args.generation_max_new_tokens,
-        trust_remote_code=args.trust_remote_code,
-        compare_llama_broca_host_shell=False if args.no_broca_host_compare else None,
-    )
+    hp = argparse.ArgumentParser(add_help=False)
+    hp.add_argument("-h", "--help", action="store_true")
+    hpre, trailing = hp.parse_known_args(argv if argv is not None else sys.argv[1:])
+    if hpre.help:
+        print_hf_datasets_benchmark_help()
+        return
+    if trailing:
+        print("hf_datasets_eval has no tuning flags; use `python -m core.benchmarks`.", file=sys.stderr)
+        raise SystemExit(2)
+
+
 
 
 if __name__ == "__main__":

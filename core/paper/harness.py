@@ -175,9 +175,53 @@ def write_comparison_table_tex(summary: Mapping[str, Any], dest: Path) -> None:
     per_v = summary.get("per_task") or {}
     comp = summary.get("comparison") or {}
     shell = (comp.get("llama_broca_shell") or {}).get("per_task") or {}
+    mind = (comp.get("broca_mind") or {}).get("per_task") or {}
     tasks = sorted(set(per_v.keys()) & set(shell.keys()))
+    if mind:
+        tasks = sorted(set(tasks) & set(mind.keys()))
     if not tasks:
-        dest.write_text("% (no paired Broca-shell comparison in summary)\n", encoding="utf-8")
+        dest.write_text("% (no paired comparison in summary)\n", encoding="utf-8")
+        return
+    if mind:
+        lines = [
+            r"\begin{tabular}{lrrrrrr}",
+            r"\toprule",
+            r"Task & $n$ & Vanilla & Broca shell & Broca mind & $\Delta$(sh$-$va) & $\Delta$(mi$-$va) \\",
+            r"\midrule",
+        ]
+        for task in tasks:
+            pv = per_v[task]
+            ps = shell[task]
+            pm = mind[task]
+            if not isinstance(pv, Mapping) or not isinstance(ps, Mapping) or not isinstance(pm, Mapping):
+                continue
+            acc_v = float(pv.get("accuracy", 0.0))
+            acc_s = float(ps.get("accuracy", 0.0))
+            acc_m = float(pm.get("accuracy", 0.0))
+            n = int(pv.get("n", 0))
+            safe_task = _latex_escape(str(task))
+            lines.append(
+                f"{safe_task} & {n} & {acc_v:.4f} & {acc_s:.4f} & {acc_m:.4f} & {acc_s - acc_v:+.4f} & {acc_m - acc_v:+.4f} \\\\",
+            )
+        v_agg = summary.get("aggregate") or {}
+        shell_agg = (comp.get("llama_broca_shell") or {}).get("aggregate") or {}
+        mind_agg = (comp.get("broca_mind") or {}).get("aggregate") or {}
+        v_macro = float(v_agg.get("macro_accuracy", 0.0))
+        s_macro = float(shell_agg.get("macro_accuracy", 0.0))
+        m_macro = float(mind_agg.get("macro_accuracy", 0.0))
+        micro_n = int(v_agg.get("micro_n", 0))
+        v_micro = float(v_agg.get("micro_accuracy", 0.0))
+        s_micro = float(shell_agg.get("micro_accuracy", 0.0))
+        m_micro = float(mind_agg.get("micro_accuracy", 0.0))
+        lines.extend([
+            r"\midrule",
+            f"\\textit{{Macro avg}} & & {v_macro:.4f} & {s_macro:.4f} & {m_macro:.4f} & {s_macro - v_macro:+.4f} & {m_macro - v_macro:+.4f} \\\\",
+            f"\\textit{{Micro avg}} & {micro_n} & {v_micro:.4f} & {s_micro:.4f} & {m_micro:.4f} & {s_micro - v_micro:+.4f} & {m_micro - v_micro:+.4f} \\\\",
+            r"\bottomrule",
+            r"\end{tabular}",
+            "",
+        ])
+        dest.write_text("\n".join(lines), encoding="utf-8")
         return
     lines = [
         r"\begin{tabular}{lrrrr}",
@@ -197,7 +241,6 @@ def write_comparison_table_tex(summary: Mapping[str, Any], dest: Path) -> None:
         lines.append(
             f"{safe_task} & {n} & {acc_v:.4f} & {acc_s:.4f} & {acc_s - acc_v:+.4f} \\\\",
         )
-    # Add aggregate row
     shell_agg = (comp.get("llama_broca_shell") or {}).get("aggregate") or {}
     v_agg = summary.get("aggregate") or {}
     v_macro = float(v_agg.get("macro_accuracy", 0.0))
@@ -219,6 +262,12 @@ def _has_paired_shell_comparison(summary: Mapping[str, Any]) -> bool:
     shell = (comp.get("llama_broca_shell") or {}).get("per_task") or {}
     per_v = summary.get("per_task") or {}
     return bool(set(per_v.keys()) & set(shell.keys()))
+
+
+def _has_broca_mind_in_comparison(summary: Mapping[str, Any]) -> bool:
+    comp = summary.get("comparison") or {}
+    mind = (comp.get("broca_mind") or {}).get("per_task") or {}
+    return bool(mind)
 
 
 def _generate_hf_native_prose(summary: Mapping[str, Any]) -> str:
@@ -318,6 +367,20 @@ def _generate_hf_native_prose(summary: Mapping[str, Any]) -> str:
                 "rounding differences between the batched and per-item forward paths. "
             )
 
+    if _has_broca_mind_in_comparison(summary):
+        comp = summary.get("comparison", {})
+        mind_agg = (comp.get("broca_mind") or {}).get("aggregate") or {}
+        shell_agg = (comp.get("llama_broca_shell") or {}).get("aggregate") or {}
+        m_macro = float(mind_agg.get("macro_accuracy", 0.0))
+        s_macro2 = float(shell_agg.get("macro_accuracy", 0.0))
+        d_mv = m_macro - macro
+        d_ms = m_macro - s_macro2
+        prose.append(
+            f"The same benchmark rows are also scored with the full Broca substrate active on the "
+            f"shared backbone. Macro accuracy moves by {d_mv:+.4f} vs.\\ vanilla and {d_ms:+.4f} vs.\\ the "
+            f"host shell pass alone. "
+        )
+
     return "\n".join(prose)
 
 
@@ -381,10 +444,16 @@ def write_hf_native_experiment_tex(
     ]
 
     if _has_paired_shell_comparison(summary):
+        cap = (
+            "Paired comparison: vanilla decoder vs.\\ LlamaBrocaHost shell vs.\\ full BrocaMind "
+            "(identical backbone weights, same items)."
+            if _has_broca_mind_in_comparison(summary)
+            else "Paired comparison: vanilla decoder vs.\\ LlamaBrocaHost shell (identical weights, same items)."
+        )
         blocks.extend([
             r"\begin{table}[htbp]",
             r"\centering",
-            r"\caption{Paired comparison: vanilla decoder vs.\ LlamaBrocaHost shell (identical weights, same items).}",
+            rf"\caption{{{cap}}}",
             r"\label{tab:hf-native-broca-shell}",
             r"\input{include/experiment/hf_native_comparison_table}",
             r"\end{table}",

@@ -101,7 +101,7 @@ def _macro_name_for_pattern(pattern: Sequence[str]) -> str:
 class MacroChunkRegistry:
     """SQLite-backed registry of proceduralized motifs.
 
-    Lives in the same SQLite file as the rest of the substrate (``broca_semantic_memory.sqlite``)
+    Lives in the same SQLite file as the rest of the substrate (e.g. ``broca_substrate.sqlite``)
     so a substrate handed to a fresh process inherits prior chunking.
     """
 

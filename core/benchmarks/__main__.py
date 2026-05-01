@@ -1,31 +1,12 @@
+"""Unified Mosaic benchmark suite (fixed wiring, no tuning flags).
 
-"""Benchmark entrypoint for the Broca/Llama architecture.
+Runs the native HF-datasets leaderboard (vanilla LM, Broca host shell, full BrocaMind),
+Eleuther LM-eval parity, dataset smoke sanity checks, and Broca architecture
+baseline-vs-enhanced probes. Model id follows ``MODEL_ID`` / ``BENCHMARK_MODEL``.
+Substrate probes persist to ``runs/broca_substrate.sqlite`` (pytest uses
+``MOSAIC_TEST_DB``).
 
-There are three benchmark paths:
-
-1. ``--engine native`` (default): a first-party HuggingFace-datasets harness.
-   It loads real datasets such as BoolQ, PIQA, ARC, WinoGrande, HellaSwag,
-   CommonsenseQA, OpenBookQA, MMLU subset, and GSM8K, then scores
-   ``meta-llama/Llama-3.2-1B-Instruct`` locally.
-
-2. ``--engine lm-eval``: EleutherAI lm-evaluation-harness parity.  This runs a
-   vanilla HF causal LM and, for Llama checkpoints, the same model wrapped in an
-   empty ``LlamaBrocaHost`` shell.  The delta should be close to zero.
-
-Native runs default to a **paired leaderboard table** (vanilla LM vs ``LlamaBrocaHost`` shell, same
-checkpoint) for Llama models. Opt out with ``--no-broca-host-compare``.
-
-3. Broca architecture probes: scripted baseline-vs-Broca questions (orthogonal to the leaderboard table).
-
-Examples:
-
-  HF_TOKEN=... python -m core.benchmarks --engine native --preset quick --limit 50
-  HF_TOKEN=... python -m core.benchmarks --engine native --no-broca-host-compare --preset quick --limit 50
-  HF_TOKEN=... python -m core.benchmarks --engine both --preset standard --limit 100
-  python -m core.benchmarks.hf_datasets_eval --model meta-llama/Llama-3.2-1B-Instruct --tasks boolq,piqa --limit 20
-
-Use ``--model gpt2`` only for a public smoke check; the intended model is
-``meta-llama/Llama-3.2-1B-Instruct``.
+  HF_TOKEN=... python -m core.benchmarks
 """
 
 from __future__ import annotations
@@ -35,11 +16,24 @@ import datetime as _dt
 import json
 import logging
 import os
+import sqlite3
 import sys
-import tempfile
 import warnings
 from pathlib import Path
-from typing import Any
+from typing import Any, Sequence
+
+from core.substrate_runtime import (
+    BENCHMARK_ENGINE,
+    BENCHMARK_FIXED_SEED,
+    BENCHMARK_GEN_MAX_NEW_TOKENS,
+    BENCHMARK_LIMIT,
+    BENCHMARK_LM_EVAL_PRESET,
+    BENCHMARK_NATIVE_PRESET,
+    benchmark_output_root,
+    default_model_id,
+    default_substrate_sqlite_path,
+    ensure_parent_dir,
+)
 
 from core.benchmarks.architecture_eval import run_broca_architecture_eval
 from core.benchmarks.hf_datasets_eval import (
@@ -55,6 +49,23 @@ from core.event_bus import get_default_bus
 logger = logging.getLogger(__name__)
 
 DEFAULT_BENCHMARK_MODEL = DEFAULT_LLAMA_MODEL
+
+
+def _touch_canonical_substrate_sqlite_early(*, model_id: str) -> None:
+    """Create ``runs/broca_substrate.sqlite`` when the suite starts (non-tests, Llama backends).
+
+    The native HF leg may open :class:`~core.broca.BrocaMind` for the ``broca_mind`` arm when
+    pairing on Llama checkpoints; lm-eval stays host-only; architecture eval runs *last*.
+    Touching early avoids ``runs/`` looking empty during long leaderboard phases."""
+
+    if os.environ.get("MOSAIC_UNDER_TEST", "").strip().lower() in {"1", "true", "yes"}:
+        return
+    if model_id.strip().lower().startswith("gpt2"):
+        return
+    p = default_substrate_sqlite_path()
+    ensure_parent_dir(p)
+    con = sqlite3.connect(str(p))
+    con.close()
 
 
 LM_EVAL_PRESETS: dict[str, dict[str, str | None]] = {
@@ -106,35 +117,6 @@ def normalize_limit_override(limit_override: str | int | None) -> str | None:
         return None
     stripped = str(limit_override).strip()
     return stripped if stripped else None
-
-
-def _benchmark_seed(args: argparse.Namespace) -> int:
-    if args.seed is not None:
-        return int(args.seed)
-    raw = os.environ.get("BENCHMARK_SEED", "0")
-    try:
-        return int(str(raw).strip())
-    except ValueError:
-        print(f"Invalid BENCHMARK_SEED={raw!r} (expected integer).", file=sys.stderr)
-        raise SystemExit(2) from None
-
-
-def _resolved_limit_strings_and_native_int(args: argparse.Namespace) -> tuple[str | None, int | None]:
-    if args.limit is not None:
-        limit_s = str(int(args.limit))
-    else:
-        limit_s = normalize_limit_override(os.environ.get("BENCHMARK_LIMIT"))
-    if limit_s is None:
-        native_limit = 50
-    else:
-        try:
-            native_limit = int(limit_s)
-        except ValueError:
-            print(f"Invalid --limit / BENCHMARK_LIMIT value {limit_s!r} (expected integer).", file=sys.stderr)
-            raise SystemExit(2) from None
-    if native_limit < 0:
-        return limit_s, None
-    return limit_s, native_limit
 
 
 def _try_print_architecture_suite_metrics(result: dict[str, Any], *, artifact_path: Path) -> None:
@@ -308,28 +290,28 @@ def run_broca_architecture_benchmark(
         {"phase": "architecture_eval", "model_id": llama_model_id, "device": dev},
     )
 
-    with tempfile.TemporaryDirectory(prefix="broca_bench_mem_") as tmp:
-        db_path = Path(tmp) / "benchmark.sqlite"
-        try:
-            result = run_broca_architecture_eval(
-                seed=0,
-                db_path=db_path,
-                llama_model_id=llama_model_id,
-                device=dev,
-                hf_token=hf_token,
-                output_path=path,
-            )
-        except Exception as exc:  # pragma: no cover
-            result = {
-                "kind": "broca_architecture_eval",
-                "model_id": llama_model_id,
-                "device": dev,
-                "error": f"failed_to_load_broca_backend: {exc!r}",
-            }
-            path.write_text(json.dumps(result, indent=2), encoding="utf-8")
-            print(f"Broca architecture eval: could not load Llama Broca stack ({exc})", file=sys.stderr)
-            bus.publish("bench.phase.complete", {"phase": "architecture_eval", "error": str(exc)})
-            return result
+    db_path = default_substrate_sqlite_path()
+    ensure_parent_dir(db_path)
+    try:
+        result = run_broca_architecture_eval(
+            seed=0,
+            db_path=db_path,
+            llama_model_id=llama_model_id,
+            device=dev,
+            hf_token=hf_token,
+            output_path=path,
+        )
+    except Exception as exc:  # pragma: no cover
+        result = {
+            "kind": "broca_architecture_eval",
+            "model_id": llama_model_id,
+            "device": dev,
+            "error": f"failed_to_load_broca_backend: {exc!r}",
+        }
+        path.write_text(json.dumps(result, indent=2), encoding="utf-8")
+        print(f"Broca architecture eval: could not load Llama Broca stack ({exc})", file=sys.stderr)
+        bus.publish("bench.phase.complete", {"phase": "architecture_eval", "error": str(exc)})
+        return result
 
     _try_print_architecture_suite_metrics(result, artifact_path=path)
     metrics = result.get("metrics") if isinstance(result, dict) else None
@@ -371,73 +353,70 @@ def write_suite_manifest(
     print(f"Wrote {p}", flush=True)
 
 
-def build_arg_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Llama 3.2 Broca + HuggingFace datasets benchmark suite.")
-    parser.add_argument("--engine", choices=["native", "lm-eval", "both"], default=os.environ.get("BENCHMARK_ENGINE", "native"))
-    parser.add_argument("--preset", default=os.environ.get("BENCHMARK_PRESET", "quick"), help="native preset or lm-eval preset.")
-    parser.add_argument("--tasks", default=os.environ.get("BENCHMARK_TASKS", ""), help="Native HF comma-separated task override.")
-    parser.add_argument(
-        "--model",
-        default=os.environ.get("BENCHMARK_MODEL", DEFAULT_BENCHMARK_MODEL),
-        help=f"HF model id (default {DEFAULT_BENCHMARK_MODEL}).",
-    )
-    parser.add_argument("--device", default=None, help="Torch device (cpu, mps, cuda:0). Default: auto.")
-    parser.add_argument("--limit", type=int, default=None, help="Examples per task. Use -1 for full native split.")
-    parser.add_argument("--split", default=None, help="Native HF split override.")
-    parser.add_argument("--output-dir", type=Path, default=Path(os.environ.get("BENCHMARK_OUTPUT_DIR", "runs/benchmarks")))
-    parser.add_argument("--skip-smoke", action="store_true")
-    parser.add_argument("--skip-architecture-eval", "--no-broca-probes", dest="skip_architecture_eval", action="store_true")
-    parser.add_argument("--streaming", action="store_true", help="Native HF streaming.")
-    parser.add_argument("--shuffle", action="store_true", help="Native shuffle before limit.")
-    parser.add_argument("--seed", type=int, default=None, help="RNG seed (default: BENCHMARK_SEED env or 0).")
-    parser.add_argument("--chat-template", action="store_true", help="Native HF benchmark: use tokenizer chat template.")
-    parser.add_argument("--max-seq-len", type=int, default=None)
-    parser.add_argument("--generation-max-new-tokens", type=int, default=128)
-    parser.add_argument(
-        "--no-broca-host-compare",
-        action="store_true",
-        help="Disable paired vanilla vs LlamaBrocaHost leaderboard table (enabled by default for Llama checkpoints).",
-    )
-    parser.add_argument("--num-fewshot", type=int, default=0, help="lm-eval fewshot count.")
-    return parser
+def print_benchmark_cli_help() -> None:
+    run_root = benchmark_output_root()
+    print("Mosaic benchmarks — unified fixed configuration (no tuning flags).\n")
+    print("Phases:")
+    print("  • HF datasets smoke")
+    print(f"  • Native leaderboard (preset {BENCHMARK_NATIVE_PRESET}, limit {BENCHMARK_LIMIT})")
+    print(f"  • LM-eval host parity (preset {BENCHMARK_LM_EVAL_PRESET})")
+    print("  • Broca architecture probes (baseline bare host vs enhanced Broca stack)\n")
+    print(f"Model: MODEL_ID / BENCHMARK_MODEL (resolved at runtime → {default_model_id()})")
+    print(f"Artifacts: OUTPUT_DIR={run_root}")
+    print("Substrate DB: MOSAIC_TEST_DB when MOSAIC_UNDER_TEST=1 else runs/broca_substrate.sqlite\n")
 
 
-def main() -> None:
-    args = build_arg_parser().parse_args()
+def main(argv: Sequence[str] | None = None) -> None:
+    if argv is None:
+        argv = sys.argv[1:]
+    helper = argparse.ArgumentParser(add_help=False)
+    helper.add_argument("-h", "--help", action="store_true")
+    hargs, extra = helper.parse_known_args(argv)
+    if hargs.help:
+        print_benchmark_cli_help()
+        return
+    if extra:
+        print("This benchmark entry point accepts no CLI arguments besides -h/--help.", file=sys.stderr)
+        print(f"Remove: {' '.join(extra)}", file=sys.stderr)
+        raise SystemExit(2)
+
     os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 
-    bench_device = args.device if args.device is not None else normalize_device_arg(os.environ.get("BENCHMARK_DEVICE"))
-    bench_seed = _benchmark_seed(args)
-    limit_s, native_limit_or_none = _resolved_limit_strings_and_native_int(args)
+    model_id = default_model_id()
+    bench_device = normalize_device_arg(os.environ.get("BENCHMARK_DEVICE"))
+    bench_seed = BENCHMARK_FIXED_SEED
+    limit_s = str(BENCHMARK_LIMIT)
+    native_limit = BENCHMARK_LIMIT
+
+    _touch_canonical_substrate_sqlite_early(model_id=model_id)
 
     bus = get_default_bus()
     bus.publish(
         "bench.suite.start",
         {
-            "engine": args.engine,
-            "preset": args.preset,
-            "model": args.model,
-            "limit": native_limit_or_none,
+            "engine": BENCHMARK_ENGINE,
+            "preset": f"{BENCHMARK_NATIVE_PRESET}+{BENCHMARK_LM_EVAL_PRESET}",
+            "model": model_id,
+            "limit": native_limit,
             "device": bench_device,
             "seed": bench_seed,
         },
     )
 
-    if not args.skip_smoke:
-        bus.publish("bench.phase.start", {"phase": "smoke"})
-        smoke_payload: dict[str, Any] = {"phase": "smoke"}
-        try:
-            hf_datasets_smoke(verbose=True)
-        except Exception as exc:
-            smoke_payload["error"] = str(exc)
-            logger.exception("HF datasets smoke phase failed")
-        finally:
-            bus.publish("bench.phase.complete", smoke_payload)
+    bus.publish("bench.phase.start", {"phase": "smoke"})
+    smoke_payload: dict[str, Any] = {"phase": "smoke"}
+    try:
+        hf_datasets_smoke(verbose=True)
+    except Exception as exc:
+        smoke_payload["error"] = str(exc)
+        logger.exception("HF datasets smoke phase failed")
+    finally:
+        bus.publish("bench.phase.complete", smoke_payload)
 
     hf_tok_raw = os.environ.get("HF_TOKEN")
     hf_token: str | bool | None = hf_tok_raw if hf_tok_raw and hf_tok_raw.strip() else None
 
-    run_root = args.output_dir
+    run_root = benchmark_output_root()
     run_root.mkdir(parents=True, exist_ok=True)
 
     native_result: dict[str, Any] | None = None
@@ -445,58 +424,66 @@ def main() -> None:
     architecture_eval: dict[str, Any] | None = None
     manifest_dir = run_root
 
-    if args.engine in {"native", "both"}:
-        tasks = resolve_task_names(args.tasks, preset=args.preset if args.preset in DEFAULT_NATIVE_PRESETS else "quick")
+    if BENCHMARK_ENGINE in {"native", "both"}:
+        preset = (
+            BENCHMARK_NATIVE_PRESET
+            if BENCHMARK_NATIVE_PRESET in DEFAULT_NATIVE_PRESETS
+            else "quick"
+        )
+        tasks = resolve_task_names("", preset=preset)
         print("\n--- Native HuggingFace-datasets benchmark ---", flush=True)
-        print(f"model={args.model} tasks={','.join(tasks)} limit={native_limit_or_none} device={bench_device or 'auto'}", flush=True)
+        print(
+            f"model={model_id} tasks={','.join(tasks)} limit={native_limit} device={bench_device or 'auto'}",
+            flush=True,
+        )
         native_result = run_hf_datasets_benchmark(
-            model_id=args.model,
+            model_id=model_id,
             tasks=tasks,
             output_dir=run_root,
-            limit=native_limit_or_none,
-            split=args.split,
+            limit=native_limit,
+            split=None,
             device=bench_device,
             hf_token=hf_token,
-            streaming=args.streaming,
+            streaming=False,
             seed=bench_seed,
-            shuffle=args.shuffle,
-            chat_template=args.chat_template,
-            max_seq_len=args.max_seq_len,
-            generation_max_new_tokens=args.generation_max_new_tokens,
-            compare_llama_broca_host_shell=False if args.no_broca_host_compare else None,
+            shuffle=False,
+            chat_template=False,
+            max_seq_len=None,
+            generation_max_new_tokens=BENCHMARK_GEN_MAX_NEW_TOKENS,
+            compare_llama_broca_host_shell=None,
         )
 
-    if args.engine in {"lm-eval", "both"}:
+    if BENCHMARK_ENGINE in {"lm-eval", "both"}:
+        lm_preset = BENCHMARK_LM_EVAL_PRESET if BENCHMARK_LM_EVAL_PRESET in LM_EVAL_PRESETS else "quick"
         code, lm_dir = run_lm_eval_harness(
-            model_id=args.model,
-            preset=args.preset if args.preset in LM_EVAL_PRESETS else "quick",
+            model_id=model_id,
+            preset=lm_preset,
             device=bench_device,
             limit_override=limit_s,
             output_dir=run_root,
-            num_fewshot=args.num_fewshot,
+            num_fewshot=0,
         )
         lm_status = "completed" if code == 0 else f"failed:{code}"
         if lm_dir is not None:
             manifest_dir = lm_dir
-        if code != 0 and args.engine == "lm-eval":
+        if code != 0 and BENCHMARK_ENGINE == "lm-eval":
             sys.exit(code)
 
-    # Native result contains its own timestamped artifact directory. Use that for
-    # the manifest when available.
     if native_result is not None:
-        # run_hf_datasets_benchmark returns relative artifact names, so find newest native dir.
         native_dirs = sorted(run_root.glob("hf_native_*"), key=lambda p: p.stat().st_mtime)
         if native_dirs:
             manifest_dir = native_dirs[-1]
 
-    model_l = args.model.strip().lower()
-    if args.skip_architecture_eval:
-        pass
-    elif model_l.startswith("gpt2"):
-        print("\nSkipping Broca architecture eval (--model is gpt2). Use the Llama 3.2 Instruct id for this probe.", flush=True)
+    model_l = model_id.strip().lower()
+    if model_l.startswith("gpt2"):
+        print(
+            "\nSkipping Broca architecture eval (gpt2 smoke backend). "
+            "Use the Llama 3.2 Instruct id for probes.",
+            flush=True,
+        )
     else:
         architecture_eval = run_broca_architecture_benchmark(
-            llama_model_id=args.model,
+            llama_model_id=model_id,
             device=bench_device,
             hf_token=hf_token,
             output_run_dir=manifest_dir,
@@ -504,8 +491,8 @@ def main() -> None:
 
     write_suite_manifest(
         manifest_dir,
-        model_id=args.model,
-        engine=args.engine,
+        model_id=model_id,
+        engine=BENCHMARK_ENGINE,
         native_result=native_result,
         lm_eval_status=lm_status,
         architecture_eval=architecture_eval,
@@ -513,7 +500,7 @@ def main() -> None:
     bus.publish(
         "bench.suite.complete",
         {
-            "engine": args.engine,
+            "engine": BENCHMARK_ENGINE,
             "manifest_dir": str(manifest_dir),
             "lm_eval_status": lm_status,
         },

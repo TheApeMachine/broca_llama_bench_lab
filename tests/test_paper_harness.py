@@ -43,7 +43,34 @@ def test_write_vanilla_and_comparison_tables(tmp_path: Path) -> None:
     assert "0.0500" in txt or "-0.0500" in txt or "+0.0500" in txt
 
 
-def test_experiment_inputs_manifest_sorted(tmp_path: Path) -> None:
+def test_write_comparison_three_arm_table(tmp_path: Path) -> None:
+    summary = {
+        "aggregate": {"macro_accuracy": 0.5, "micro_accuracy": 0.5, "micro_n": 10},
+        "per_task": {
+            "boolq": {"n": 10, "accuracy": 0.5},
+        },
+        "comparison": {
+            "llama_broca_shell": {
+                "aggregate": {"macro_accuracy": 0.51, "micro_accuracy": 0.51, "micro_n": 10},
+                "per_task": {
+                    "boolq": {"n": 10, "accuracy": 0.55},
+                },
+            },
+            "broca_mind": {
+                "aggregate": {"macro_accuracy": 0.52, "micro_accuracy": 0.52, "micro_n": 10},
+                "per_task": {
+                    "boolq": {"n": 10, "accuracy": 0.6},
+                },
+            },
+        },
+    }
+    p = tmp_path / "triple.tex"
+    write_comparison_table_tex(summary, p)
+    txt = p.read_text(encoding="utf-8")
+    assert "Broca mind" in txt
+    assert "0.6000" in txt
+
+
     (tmp_path / "exp_zzz.tex").write_text("%\n", encoding="utf-8")
     (tmp_path / "exp_aaa.tex").write_text("%\n", encoding="utf-8")
     write_experiment_inputs_manifest(tmp_path)

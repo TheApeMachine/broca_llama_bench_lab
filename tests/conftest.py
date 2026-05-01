@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import os
 import re
+from pathlib import Path
 from typing import Callable
 
 # Keep the CPU test suite deterministic and prevent OpenMP/PyTorch worker pools
@@ -25,6 +26,14 @@ except RuntimeError:
     # PyTorch may reject interop-thread changes after a backend initialized; the
     # environment variables above still keep fresh test processes bounded.
     pass
+
+
+@pytest.fixture(autouse=True)
+def _mosaic_test_sqlite(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """Isolate substrate SQLite so unit tests never touch ``runs/``."""
+
+    monkeypatch.setenv("MOSAIC_UNDER_TEST", "1")
+    monkeypatch.setenv("MOSAIC_TEST_DB", str(tmp_path / "mosaic_test.sqlite"))
 
 
 def _hf_token_available() -> bool:

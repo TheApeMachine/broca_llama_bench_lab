@@ -1,9 +1,8 @@
 """Scored baseline-vs-Broca architecture benchmark.
 
-This is intentionally separate from leaderboard-style lm-eval. The benchmark
-asks the bare language host and the full Broca architecture the same substrate
-questions, then scores whether the produced answer/speech matches the known
-faculty result.
+Questions the bare language host and the full Broca stack the same way interactive
+chat does: canonical SQLite, :data:`core.substrate_runtime.CHAT_NAMESPACE`, one
+:class:`BrocaMind` session for the probe series.
 """
 
 from __future__ import annotations
@@ -17,6 +16,7 @@ from pathlib import Path
 from typing import Any, Sequence
 
 from core.broca import BrocaMind, generate_without_broca
+from core.substrate_runtime import CHAT_NAMESPACE
 
 logger = logging.getLogger(__name__)
 
@@ -135,8 +135,9 @@ def run_broca_architecture_eval(
 ) -> dict[str, Any]:
     """Run a direct scored comparison between bare host and Broca architecture.
 
-    Each case uses a new ``BrocaMind`` so ``setup_prompts`` and semantic state
-    do not carry over across cases within this run.
+    Uses a **single** :class:`BrocaMind` load and the same SQLite + namespace as
+    interactive chat (:data:`CHAT_NAMESPACE`), so benchmarks exercise and persist
+    through the identical substrate stack—not an alternate memory partition.
     """
 
     mid = llama_model_id or os.environ.get("MODEL_ID", "meta-llama/Llama-3.2-1B-Instruct")
@@ -155,20 +156,20 @@ def run_broca_architecture_eval(
     rows: list[dict[str, Any]] = []
     graft_reports_by_case: dict[str, str] = {}
     total_cases = len(cases)
+    mind = BrocaMind(
+        seed=seed,
+        db_path=db_path,
+        namespace=CHAT_NAMESPACE,
+        llama_model_id=mid,
+        device=device,
+        hf_token=hf_token,
+    )
     for ci, case in enumerate(cases, start=1):
         if bus is not None:
             bus.publish(
                 "bench.arch_case.start",
                 {"case_id": case.id, "task_type": case.task_type, "i": ci, "total": total_cases},
             )
-        mind = BrocaMind(
-            seed=seed,
-            db_path=db_path,
-            namespace=f"architecture_eval_{seed}_{case.id}",
-            llama_model_id=mid,
-            device=device,
-            hf_token=hf_token,
-        )
         graft_reports_by_case[case.id] = mind.host.graft_report()
         for setup in case.setup_prompts:
             mind.comprehend(setup)
@@ -239,8 +240,8 @@ def run_broca_architecture_eval(
         "description": (
             "Direct scored comparison: bare frozen language host vs BrocaMind with semantic memory, "
             "active inference, causal substrate, workspace frames, and residual-stream graft verbalization. "
-            "Semantic-memory cases must provide their own setup_prompts; no facts are seeded by default. "
-            "Each evaluation case uses a fresh BrocaMind instance, so setup_prompts and memory do not persist across cases."
+            "Runs on the canonical substrate SQLite with the same namespace as chat (CHAT_NAMESPACE); "
+            "one BrocaMind session carries workspace and persistence across cases for this eval."
         ),
         "model_id": mid,
         "device": device,

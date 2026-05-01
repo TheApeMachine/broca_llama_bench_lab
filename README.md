@@ -73,12 +73,15 @@ make install
 huggingface-cli login          # …or…
 export HF_TOKEN=hf_…
 
-# Talk to the substrate with the live dashboard:
-python -m core.chat_tui --broca-db runs/broca_chat.sqlite
+# Talk to the substrate (full stack; canonical DB under ./runs/):
+make tui
+# or: python -m core.chat_tui
 
-# Or the plain CLI:
-python -m core.chat_cli --broca --broca-db runs/broca_chat.sqlite
+make chat
+# or: python -m core.chat_cli
 ```
+
+Model checkpoint and device follow environment (`MODEL_ID` / `BENCHMARK_MODEL`, `M_DEVICE`). Persistent substrate state lives in **`runs/broca_substrate.sqlite`** (see [`core/substrate_runtime.py`](core/substrate_runtime.py)). Pytest uses an isolated DB via `MOSAIC_TEST_DB`.
 
 > **Logging.** `core` does not reconfigure global logging by default. Set
 > `AUTO_CONFIGURE_LAB_LOGGING=1` to apply the lab format on import, or
@@ -546,27 +549,26 @@ cannot stall the substrate.
 │                      ├──────────────────────────────────────┤  Hawkes intensity    │
 │                      │  Activity feed (events + log tail)   │                      │
 └──────────────────────┴──────────────────────────────────────┴──────────────────────┘
-   model=…   device=…   db=runs/broca_chat.sqlite   namespace=chat
+   model=…   device=…   db=runs/broca_substrate.sqlite   namespace=chat
 ```
 
-Run with:
+Run with `make tui` or `python -m core.chat_tui`. There are **no chat tuning flags** on the CLI;
+decoding and DMN timing are fixed in [`core/substrate_runtime.py`](core/substrate_runtime.py)
+(`CHAT_*`, `BROCA_BACKGROUND_INTERVAL_S`). Optional **infrastructure** knobs use the environment only,
+for example:
 
-```bash
-python -m core.chat_tui --broca-db runs/broca_chat.sqlite
-```
+| Variable | Role |
+|----------|------|
+| `MODEL_ID` / `BENCHMARK_MODEL` | Hugging Face checkpoint id |
+| `M_DEVICE` | Torch device override (`cpu`, `mps`, `cuda:0`, …) |
+| `HF_TOKEN` | Hub auth when not using `huggingface-cli login` |
+| `TUI_LOG_LEVEL` | Log lines forwarded into the activity feed (default `INFO`) |
+| `BROCA_SELF_IMPROVE=1` | Enable the Docker/GitHub self-improve worker |
 
-| Flag                                     | Meaning                                                |
-|------------------------------------------|--------------------------------------------------------|
-| `--broca-db PATH`                        | SQLite path (default `runs/broca_chat.sqlite`)         |
-| `--broca-namespace NAME`                 | Memory namespace (default `chat`)                      |
-| `--no-background`                        | Disable the DMN daemon                                 |
-| `--background-interval S`                | DMN tick period (default 5.0)                          |
-| `--self-improve`                         | Enable the Docker self-improve worker                  |
-| `--sample` / `--temperature` / `--top-p` | Decoding                                               |
-| `--debug-substrate`                      | Annotate each reply with substrate intent + confidence |
-| `--log-level LEVEL`                      | Activity-feed log level (default `INFO`)               |
-| `Ctrl+C`                                 | Quit                                                   |
-| `Ctrl+L`                                 | Clear chat                                             |
+| Keys | Action |
+|------|--------|
+| `Ctrl+C` | Quit |
+| `Ctrl+L` | Clear chat |
 
 The TUI sets `LOG_SILENT=1` automatically so the stderr handler does
 not fight the UI; the rotating file handler at `runs/broca.log` still
@@ -595,18 +597,15 @@ HF_TOKEN=… python -m core.demo \
 
 ### Plain chat CLI
 
-Streaming, no TUI:
+Streaming terminal chat with the **same** full substrate and canonical DB as the TUI (`runs/broca_substrate.sqlite`):
 
 ```bash
-HF_TOKEN=… python -m core.chat_cli --broca \
-  --broca-db runs/broca_chat.sqlite
-```
-
-Vanilla mode (no substrate, just HF streaming) — useful as a baseline:
-
-```bash
+make chat
+# or
 HF_TOKEN=… python -m core.chat_cli
 ```
+
+There is no separate “vanilla HF only” path: `chat_cli` always loads `BrocaMind`. For LLM-only vs full-stack **metrics**, use the [benchmarks](#benchmarks) leaderboard and architecture probes.
 
 ### Refresh the paper
 
@@ -624,19 +623,42 @@ for what gets generated and the full env-var matrix.
 
 ## Benchmarks
 
-Two engines live under [core/benchmarks/](core/benchmarks/):
+The lab ships **one unified benchmark driver** (`python -m core.benchmarks`) that always runs the
+full mosaic: HF dataset sanity smoke, native leaderboard, Eleuther parity, plus Broca **architecture eval**
+(scored bare-language-host vs enhanced stack). Vanilla LM vs Broca-shell **paired leaderboard** comparison
+inside the native harness stays enabled for Llama checkpoints. Configuration is fixed in
+[`core/substrate_runtime.py`](core/substrate_runtime.py) (`BENCHMARK_ENGINE=both`,
+`BENCHMARK_NATIVE_PRESET` / `BENCHMARK_LM_EVAL_PRESET=standard`, `BENCHMARK_LIMIT=250`, canonical SQLite for probes).
 
-- **Native HF datasets harness.** Multiple-choice tasks scored by
-  length-normalized continuation log-likelihood; GSM8K scored by
-  deterministic generation + normalized numeric exact match.
-- **EleutherAI lm-evaluation-harness parity.** Wrapper-integrity check:
-  vanilla HF logits vs the same model inside an *empty* `LlamaBrocaHost`.
+Implementations:
+
+- **Native HF datasets** ([core/benchmarks/hf_datasets_eval.py](core/benchmarks/hf_datasets_eval.py)) — MC tasks via length-normalized continuation LL; GSM8K via generation + normalized numeric match.
+- **LM-eval parity** ([core/benchmarks/lm_eval_pair.py](core/benchmarks/lm_eval_pair.py)) — vanilla HF logits vs the same checkpoint in an empty `LlamaBrocaHost` shell.
+
+Run from the Makefile or Python (no tuning flags — only `-h` / `--help`):
 
 ```bash
-HF_TOKEN=… python -m core.benchmarks \
-  --engine native --preset standard --limit 250 \
-  --model meta-llama/Llama-3.2-1B-Instruct
+make bench-cli              # stdout
+make bench                  # Textual dashboard (core.bench_tui)
+HF_TOKEN=… python -m core.benchmarks
+python -m core.benchmarks -h     # prints fixed-configuration summary
+python -m core.bench_tui -h       # TUI help + same benchmark summary
 ```
+
+**Infrastructure environment** (artifacts location, checkpoint, device) still uses vars such as `MODEL_ID`, `BENCHMARK_MODEL`, `BENCHMARK_OUTPUT_DIR` (default `runs/benchmarks`), `BENCHMARK_DEVICE`, `M_DEVICE`, `HF_TOKEN`.
+
+Artifacts land under:
+
+```text
+runs/benchmarks/hf_native_<timestamp>/
+  summary.json
+  boolq.jsonl
+  piqa.jsonl
+  …
+  benchmark_suite_manifest.json
+```
+
+The native harness module also defines **named presets** (for readers of the code and for the separate **paper harness**, which keeps its own `PAPER_*` env tuning):
 
 | Preset      | Tasks                                                                     |
 |-------------|---------------------------------------------------------------------------|
@@ -650,24 +672,7 @@ Full registry: `boolq`, `piqa`, `arc_easy`, `arc_challenge`,
 `winogrande`, `hellaswag`, `commonsenseqa`, `openbookqa`,
 `mmlu_abstract_algebra`, `gsm8k`.
 
-Outputs:
-
-```text
-runs/benchmarks/hf_native_<timestamp>/
-  summary.json
-  boolq.jsonl
-  piqa.jsonl
-  …
-  benchmark_suite_manifest.json
-```
-
-Run both engines for a like-for-like check:
-
-```bash
-HF_TOKEN=… python -m core.benchmarks \
-  --engine both --preset quick --limit 50 \
-  --model meta-llama/Llama-3.2-1B-Instruct
-```
+Do **not** use `python -m core.benchmarks.hf_datasets_eval` for product runs — it only prints a pointer to `core.benchmarks`.
 
 ---
 
@@ -677,7 +682,7 @@ HF_TOKEN=… python -m core.benchmarks \
 pytest -q
 ```
 
-Tests do not download Llama or HF datasets. They cover the tiny
+Tests do not download Llama or HF datasets. Pytest (`conftest.py`) sets `MOSAIC_UNDER_TEST=1` and `MOSAIC_TEST_DB` to a fresh SQLite file under each test's `tmp_path` whenever substrate code resolves the canonical path. Individual tests can still override with an explicit `db_path`. They cover the tiny
 backend, faculties, dataset row builders, scoring plumbing, the Llama
 host's real layer-hook graft slot via a fake Llama-like module, and
 the algebra modules end-to-end.
@@ -699,6 +704,7 @@ Highlights:
 | [core/llama_broca_host.py](core/llama_broca_host.py)                                                                                                       | Frozen Llama wrapper with named graft slots                |
 | [core/host.py](core/host.py) · [core/grafts.py](core/grafts.py)                                                                                            | Tiny CPU-friendly backend + graft base classes             |
 | [core/broca.py](core/broca.py)                                                                                                                             | `BrocaMind`, frame router, workspace, DMN                  |
+| [core/substrate_runtime.py](core/substrate_runtime.py)                                                                                                     | Canonical DB path, fixed chat/bench defaults               |
 | [core/active_inference.py](core/active_inference.py)                                                                                                       | POMDPs, EFE, coupled agent                                 |
 | [core/causal.py](core/causal.py) · [core/causal_discovery.py](core/causal_discovery.py)                                                                    | `FiniteSCM`, `do(·)`, PC algorithm                         |
 | [core/vsa.py](core/vsa.py) · [core/hopfield.py](core/hopfield.py) · [core/hawkes.py](core/hawkes.py) · [core/conformal.py](core/conformal.py)              | The algebra                                                |
@@ -714,7 +720,7 @@ Highlights:
 | [core/continuous_frame.py](core/continuous_frame.py) · [core/tokenizer.py](core/tokenizer.py) · [core/hf_tokenizer_compat.py](core/hf_tokenizer_compat.py) | Frame ↔ subword projector                                  |
 | [core/vision.py](core/vision.py)                                                                                                                           | Visual encoder (placeholder for multimodal)                |
 | [core/event_bus.py](core/event_bus.py)                                                                                                                     | Thread-safe pub/sub + log handler                          |
-| [core/chat_tui.py](core/chat_tui.py)                                                                                                                       | Textual live dashboard                                     |
+| [core/chat_tui.py](core/chat_tui.py) · [core/bench_tui.py](core/bench_tui.py)                                                                              | Textual chat + benchmark dashboards                      |
 | [core/chat_cli.py](core/chat_cli.py)                                                                                                                       | Plain streaming CLI                                        |
 | [core/demo.py](core/demo.py)                                                                                                                               | Architecture demo                                          |
 | [core/benchmarks/](core/benchmarks/)                                                                                                                       | Native HF + lm-eval harnesses                              |

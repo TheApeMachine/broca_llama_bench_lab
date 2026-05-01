@@ -68,6 +68,7 @@ from .continuous_frame import (
 from .device_utils import pick_torch_device
 from .grafts import BaseGraft, DEFAULT_GRAFT_TARGET_SNR, snr_magnitude, _state_confidence, _state_inertia
 from .hf_tokenizer_compat import HuggingFaceBrocaTokenizer
+from .substrate_runtime import default_substrate_sqlite_path, ensure_parent_dir
 from .llama_broca_host import LlamaBrocaHost, load_llama_broca_host
 from .predictive_coding import lexical_surprise_gap
 from .substrate_graph import EpisodeAssociationGraph, merge_epistemic_evidence_dict
@@ -2839,21 +2840,27 @@ class BrocaMind:
         self,
         *,
         seed: int = 0,
-        db_path: str | Path = "runs/broca_semantic_memory.sqlite",
+        db_path: str | Path | None = None,
         namespace: str = "main",
         llama_model_id: str | None = None,
         device: torch.device | str | None = None,
         hf_token: str | bool | None = None,
         lexical_target_snr: float | None = None,
+        preload_host_tokenizer: tuple[LlamaBrocaHost, HuggingFaceBrocaTokenizer] | None = None,
     ):
         self.seed = seed
-        resolved_device = device if isinstance(device, torch.device) else pick_torch_device(device)
+        rp = Path(db_path) if db_path is not None else default_substrate_sqlite_path()
+        ensure_parent_dir(rp)
         mid = llama_model_id or DEFAULT_BROCA_MODEL_ID
-        self.memory = PersistentSemanticMemory(db_path, namespace=namespace)
-        self.journal = WorkspaceJournal(Path(db_path), shared_memory=self.memory)
-        self.episode_graph = EpisodeAssociationGraph(Path(db_path))
+        self.memory = PersistentSemanticMemory(rp, namespace=namespace)
+        self.journal = WorkspaceJournal(rp, shared_memory=self.memory)
+        self.episode_graph = EpisodeAssociationGraph(rp)
         self._last_journal_id: int | None = None
-        self.host, self.tokenizer = load_llama_broca_host(mid, device=resolved_device, token=hf_token)
+        if preload_host_tokenizer is None:
+            resolved_device = device if isinstance(device, torch.device) else pick_torch_device(device)
+            self.host, self.tokenizer = load_llama_broca_host(mid, device=resolved_device, token=hf_token)
+        else:
+            self.host, self.tokenizer = preload_host_tokenizer
         self.text_encoder = frozen_subword_projector_from_model(self.host, self.tokenizer)
         snr = lexical_target_snr if lexical_target_snr is not None else default_lexical_target_snr(self.host)
         self.lexical_graft = LexicalPlanGraft(target_snr=snr)
@@ -2887,7 +2894,7 @@ class BrocaMind:
         d_model = int(getattr(self.host.cfg, "d_model", 96))
         self.vsa = VSACodebook(dim=10_000, base_seed=int(seed))
         self.hopfield_memory = HopfieldAssociativeMemory(d_model=d_model, max_items=65_536)
-        self.conformal_calibration = PersistentConformalCalibration(Path(db_path), namespace=f"{namespace}__conformal")
+        self.conformal_calibration = PersistentConformalCalibration(rp, namespace=f"{namespace}__conformal")
         self.relation_conformal = ConformalPredictor(alpha=0.1, method="lac", min_calibration=8)
         self.conformal_calibration.hydrate(self.relation_conformal, channel="relation_extraction")
         self.native_tool_conformal = ConformalPredictor(alpha=0.1, method="lac", min_calibration=8)
@@ -2895,11 +2902,11 @@ class BrocaMind:
         # Hawkes channels are populated lazily by ``observe_event`` so the
         # excitation matrix grows with the user's vocabulary instead of being
         # hardcoded.
-        self.hawkes_persistence = PersistentHawkes(Path(db_path), namespace=f"{namespace}__hawkes")
+        self.hawkes_persistence = PersistentHawkes(rp, namespace=f"{namespace}__hawkes")
         loaded = self.hawkes_persistence.load()
         self.hawkes = loaded if loaded is not None else MultivariateHawkesProcess(beta=0.5, baseline=0.05)
         # One Dirichlet preference per active-inference faculty.
-        self.preference_persistence = PersistentPreference(Path(db_path), namespace=f"{namespace}__pref")
+        self.preference_persistence = PersistentPreference(rp, namespace=f"{namespace}__pref")
         self.spatial_preference = self.preference_persistence.load("spatial") or DirichletPreference(
             len(self.pomdp.observation_names),
             initial_C=list(self.pomdp.C),
@@ -2912,7 +2919,7 @@ class BrocaMind:
         )
         self._sync_preference_to_pomdp()
         # Hebbian-promoted ontology axes share the sketch dimension.
-        self.ontology_persistence = PersistentOntologicalRegistry(Path(db_path), namespace=f"{namespace}__ontology")
+        self.ontology_persistence = PersistentOntologicalRegistry(rp, namespace=f"{namespace}__ontology")
         self.ontology = self.ontology_persistence.load(dim=SKETCH_DIM, frequency_threshold=8)
         # Causal-discovery learns a fresh SCM from observation data when DMN
         # decides the user has accumulated enough coherent variables to
@@ -2926,13 +2933,13 @@ class BrocaMind:
         # Proceduralization (System 2 → System 1). The macro registry persists
         # compiled motifs across processes; the compiler runs on every DMN tick
         # and grows the registry as repeated reasoning patterns are detected.
-        self.macro_registry = MacroChunkRegistry(Path(db_path), namespace=f"{namespace}__macros")
+        self.macro_registry = MacroChunkRegistry(rp, namespace=f"{namespace}__macros")
         self.chunking_compiler = DMNChunkingCompiler(self, registry=self.macro_registry)
 
         # Native tool synthesis. Tools live in the same SQLite file but in their
         # own namespace; ``attach_tools_to_scm`` rehydrates every persisted tool
         # into the live SCM as an endogenous equation.
-        self.tool_registry = NativeToolRegistry(Path(db_path), namespace=f"{namespace}__tools")
+        self.tool_registry = NativeToolRegistry(rp, namespace=f"{namespace}__tools")
         try:
             self.tool_registry.attach_to_scm(self.scm)
         except Exception:
@@ -2942,7 +2949,7 @@ class BrocaMind:
         # file backs the activation memory; modes are stored under their own
         # kind so they don't collide with other activation rows.
         self.activation_memory = SQLiteActivationMemory(
-            Path(db_path), default_namespace=f"{namespace}__activation"
+            rp, default_namespace=f"{namespace}__activation"
         )
         self.dynamic_graft_synth = DynamicGraftSynthesizer(
             self.activation_memory, namespace=f"{namespace}__activation"
@@ -2960,7 +2967,7 @@ class BrocaMind:
         # bus so the TUI sees publishes from this mind without explicit wiring.
         self.event_bus: EventBus = get_default_bus()
         self._last_chat_meta: dict[str, Any] = {}
-        self._db_path = Path(db_path)
+        self._db_path = rp
         self._namespace = namespace
         self._llama_model_id = mid
 
@@ -3255,6 +3262,11 @@ class BrocaMind:
             vsa_bundle=vsa_vec,
             vsa_projection_seed=int(self.seed),
         )
+
+    def content_logit_bias_from_frame(self, frame: CognitiveFrame) -> dict[int, float]:
+        """Token-ID bonuses derived from frame content for scripted host scoring."""
+
+        return self._content_logit_bias(frame)
 
     def refine_extracted_claim(
         self, utterance: str, toks: Sequence[str], claim: ParsedClaim

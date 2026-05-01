@@ -50,13 +50,14 @@ import random
 import statistics
 import subprocess
 import sys
-import tempfile
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
 import torch
+
+from core.substrate_runtime import default_substrate_sqlite_path, ensure_parent_dir
 
 logger = logging.getLogger(__name__)
 
@@ -135,79 +136,80 @@ def bench_rule_shift(
     last_details: dict[str, Any] = {}
 
     stride = 1_000_003
+    base_path = default_substrate_sqlite_path()
+    ensure_parent_dir(base_path)
     for trial_idx in range(repeat_trials):
         trial_seed = seed + trial_idx * stride
         rng_py = random.Random(trial_seed)
 
-        with tempfile.TemporaryDirectory(prefix="bench_rule_shift_") as tmp:
-            mem = PersistentSemanticMemory(Path(tmp) / "bench.sqlite", namespace="rule_shift")
+        mem = PersistentSemanticMemory(base_path, namespace=f"rule_shift_{trial_seed}")
 
-            mem.upsert("ada", "location", "rome", confidence=0.9, evidence={"source": "seed"})
-            for i in range(n_initial_claims):
-                mem.record_claim(
-                    "ada",
-                    "location",
-                    "rome",
-                    confidence=0.9,
-                    status="corroborated",
-                    evidence={"source": "initial", "prediction_gap": 0.1 + 0.02 * i},
-                )
-
-            for i in range(n_challenger_claims):
-                gap = 0.05 + 0.01 * i + rng_py.uniform(0.0, 0.004)
-                mem.record_claim(
-                    "ada",
-                    "location",
-                    "paris",
-                    confidence=0.95,
-                    status="conflict",
-                    evidence={"source": "challenger", "prediction_gap": gap},
-                )
-
-            log_odds_threshold = 0.3
-            reflections = mem.consolidate_claims_once(log_odds_threshold=log_odds_threshold, min_claims=3)
-
-            current = mem.get("ada", "location")
-            final_value = current[0] if current else "unknown"
-            revised = final_value == "paris"
-
-            final_log_odds: float | None = None
-            for ref in reflections:
-                if ref.get("log_odds") is not None:
-                    final_log_odds = float(ref["log_odds"])
-                    break
-            if final_log_odds is None and reflections:
-                vals = [float(r["log_odds"]) for r in reflections if r.get("log_odds") is not None]
-                if vals:
-                    final_log_odds = max(vals)
-            updates_to_converge = len(reflections)
-            completeness_score = (
-                1.0
-                if revised
-                else (
-                    max(0.0, min(1.0, float(final_log_odds or 0.0) / log_odds_threshold))
-                    if final_log_odds is not None
-                    else 0.0
-                )
+        mem.upsert("ada", "location", "rome", confidence=0.9, evidence={"source": "seed"})
+        for i in range(n_initial_claims):
+            mem.record_claim(
+                "ada",
+                "location",
+                "rome",
+                confidence=0.9,
+                status="corroborated",
+                evidence={"source": "initial", "prediction_gap": 0.1 + 0.02 * i},
             )
 
-            last_details = {
-                "trial_index": trial_idx,
-                "trial_seed": trial_seed,
-                "initial_value": "rome",
-                "challenger_value": "paris",
-                "final_value": final_value,
-                "n_initial_claims": n_initial_claims,
-                "n_challenger_claims": n_challenger_claims,
-                "n_reflections": len(reflections),
-                "reflection_kinds": [r.get("kind") for r in reflections],
-                "revised": revised,
-                "final_log_odds": None if final_log_odds is None else round(final_log_odds, 6),
-                "updates_to_converge": updates_to_converge,
-                "completeness_score": round(completeness_score, 6),
-                "log_odds_threshold": log_odds_threshold,
-            }
-            mem.close()
+        for i in range(n_challenger_claims):
+            gap = 0.05 + 0.01 * i + rng_py.uniform(0.0, 0.004)
+            mem.record_claim(
+                "ada",
+                "location",
+                "paris",
+                confidence=0.95,
+                status="conflict",
+                evidence={"source": "challenger", "prediction_gap": gap},
+            )
+
+        log_odds_threshold = 0.3
+        reflections = mem.consolidate_claims_once(log_odds_threshold=log_odds_threshold, min_claims=3)
+
+        current = mem.get("ada", "location")
+        final_value = current[0] if current else "unknown"
+        revised = final_value == "paris"
+
+        final_log_odds: float | None = None
+        for ref in reflections:
+            if ref.get("log_odds") is not None:
+                final_log_odds = float(ref["log_odds"])
+                break
+        if final_log_odds is None and reflections:
+            vals = [float(r["log_odds"]) for r in reflections if r.get("log_odds") is not None]
+            if vals:
+                final_log_odds = max(vals)
+        updates_to_converge = len(reflections)
+        completeness_score = (
+            1.0
+            if revised
+            else (
+                max(0.0, min(1.0, float(final_log_odds or 0.0) / log_odds_threshold))
+                if final_log_odds is not None
+                else 0.0
+            )
+        )
+
+        last_details = {
+            "trial_index": trial_idx,
+            "trial_seed": trial_seed,
+            "initial_value": "rome",
+            "challenger_value": "paris",
+            "final_value": final_value,
+            "n_initial_claims": n_initial_claims,
+            "n_challenger_claims": n_challenger_claims,
+            "n_reflections": len(reflections),
+            "reflection_kinds": [r.get("kind") for r in reflections],
+            "revised": revised,
+            "final_log_odds": None if final_log_odds is None else round(final_log_odds, 6),
+            "updates_to_converge": updates_to_converge,
+            "completeness_score": round(completeness_score, 6),
+            "log_odds_threshold": log_odds_threshold,
+        }
+        mem.close()
 
         trial_scores.append(1.0 if revised else 0.0)
         trial_revised.append(revised)
@@ -399,32 +401,34 @@ def bench_memory_fidelity(*, n_triples: int = 100, seed: int = 0) -> SubstrateBe
     predicates = ["located_in", "color_of", "type_of", "related_to", "made_of"]
     objects = [f"value_{rng.randint(0, 999)}" for _ in range(n_triples)]
 
-    with tempfile.TemporaryDirectory(prefix="bench_memory_") as tmp:
-        mem = PersistentSemanticMemory(Path(tmp) / "bench.sqlite", namespace="fidelity")
+    base_path = default_substrate_sqlite_path()
+    ensure_parent_dir(base_path)
+    mem_ns = f"memory_fidelity_{seed}_{n_triples}"
+    mem = PersistentSemanticMemory(base_path, namespace=mem_ns)
 
-        written: list[tuple[str, str, str, float]] = []
-        for i in range(n_triples):
-            s = subjects[i]
-            p = rng.choice(predicates)
-            o = objects[i]
-            conf = round(rng.uniform(0.5, 1.0), 3)
-            mem.upsert(s, p, o, confidence=conf, evidence={"source": "bench", "index": i})
-            written.append((s, p, o, conf))
+    written: list[tuple[str, str, str, float]] = []
+    for i in range(n_triples):
+        s = subjects[i]
+        p = rng.choice(predicates)
+        o = objects[i]
+        conf = round(rng.uniform(0.5, 1.0), 3)
+        mem.upsert(s, p, o, confidence=conf, evidence={"source": "bench", "index": i})
+        written.append((s, p, o, conf))
 
-        # Recall
-        correct = 0
-        confidence_errors: list[float] = []
-        for s, p, o, conf in written:
-            got = mem.get(s, p)
-            if got is not None and got[0] == o:
-                correct += 1
-                confidence_errors.append(abs(got[1] - conf))
+    # Recall
+    correct = 0
+    confidence_errors: list[float] = []
+    for s, p, o, conf in written:
+        got = mem.get(s, p)
+        if got is not None and got[0] == o:
+            correct += 1
+            confidence_errors.append(abs(got[1] - conf))
 
-        recall_rate = correct / max(1, n_triples)
-        avg_conf_error = sum(confidence_errors) / max(1, len(confidence_errors)) if confidence_errors else float("nan")
-        if confidence_errors and not all(math.isfinite(x) for x in confidence_errors):
-            raise RuntimeError("bench_memory_fidelity: non-finite confidence error in recall path")
-        mem.close()
+    recall_rate = correct / max(1, n_triples)
+    avg_conf_error = sum(confidence_errors) / max(1, len(confidence_errors)) if confidence_errors else float("nan")
+    if confidence_errors and not all(math.isfinite(x) for x in confidence_errors):
+        raise RuntimeError("bench_memory_fidelity: non-finite confidence error in recall path")
+    mem.close()
 
     duration = time.time() - start
     return SubstrateBenchmarkResult(

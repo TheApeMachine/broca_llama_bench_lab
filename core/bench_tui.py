@@ -2,7 +2,7 @@
 
 Run:
 
-  python -m core.bench_tui --engine both --preset standard --limit 250
+  python -m core.bench_tui
 
 The benchmark suite executes in a Textual ``@work(thread=True)`` worker so the
 UI stays responsive. The benchmark code (``core.benchmarks``) publishes
@@ -50,9 +50,9 @@ try:
         Sparkline,
         Static,
     )
-    from textual.widgets.data_table import Column
     from textual.worker import Worker, WorkerState
     from textual import work
+    from rich.text import Text
 except ImportError as exc:  # pragma: no cover
     raise SystemExit(
         "core.bench_tui requires Textual. Install with:\n\n"
@@ -324,14 +324,18 @@ class BenchApp(App):
         self.title = "Mosaic benchmarks"
         self.sub_title = " ".join(self.bench_argv) if self.bench_argv else "default"
         results = self.query_one("#results", DataTable)
+        # Per Textual docs, ``add_columns`` takes either bare labels (auto-keyed)
+        # or ``(label, key)`` tuples for stable keys we can target with
+        # ``update_cell`` later. Passing a ``Column`` dataclass triggers a
+        # silent wrong-branch in ``add_columns`` and corrupts column metadata.
         results.add_columns(
-            Column(RESULT_COL_ARM, "arm"),
-            Column(RESULT_COL_TASK, "task"),
-            Column(RESULT_COL_N, "n"),
-            Column(RESULT_COL_ACC, "acc"),
-            Column(RESULT_COL_DELTA, "Δ"),
-            Column(RESULT_COL_SECS, "secs"),
-            Column(RESULT_COL_STATUS, "status"),
+            ("arm", RESULT_COL_ARM),
+            ("task", RESULT_COL_TASK),
+            ("n", RESULT_COL_N),
+            ("acc", RESULT_COL_ACC),
+            ("Δ", RESULT_COL_DELTA),
+            ("secs", RESULT_COL_SECS),
+            ("status", RESULT_COL_STATUS),
         )
         self.set_interval(0.25, self._tick)
         self.set_interval(1.0, self._refresh_status)
@@ -347,23 +351,16 @@ class BenchApp(App):
 
     @work(thread=True, exclusive=True)
     def _kick_off(self) -> None:
-        # Run the same entry point as ``python -m core.benchmarks``. We wrap
-        # argv so the bench parser sees the arguments the TUI was started with.
+        # Run the unified ``core.benchmarks`` entrypoint in-process (same bus).
         from core.benchmarks.__main__ import main as bench_main
 
         self.app.call_from_thread(self._on_suite_starting)
-        # Save and replace argv so argparse picks up our flags.
-        saved = sys.argv[:]
-        sys.argv = ["core.benchmarks"] + self.bench_argv
-        # Redirect stdout/stderr so the bench's print() calls don't fight the
-        # Textual full-screen app. Lines go through the bus as bench.print
-        # events and surface in the activity log.
         out_stream = _LinePublisher(self.bus, "bench.stdout")
         err_stream = _LinePublisher(self.bus, "bench.stderr")
         try:
             with contextlib.redirect_stdout(out_stream), contextlib.redirect_stderr(err_stream):
                 try:
-                    bench_main()
+                    bench_main([])
                 except SystemExit as exc:
                     self.app.call_from_thread(self._on_suite_systemexit, _system_exit_code(exc))
                     return
@@ -372,7 +369,6 @@ class BenchApp(App):
                     self.app.call_from_thread(self._on_suite_error, str(exc))
                     return
         finally:
-            sys.argv = saved
             try:
                 out_stream.flush()
                 err_stream.flush()
@@ -572,30 +568,39 @@ class BenchApp(App):
         else:
             self._row_keys[key] = table.add_row(*cells)
 
-    def _render_status(self, status: str) -> str:
+    def _render_status(self, status: str) -> Text:
         color = {
             "running": BRAND,
             "done": ONLINE,
             "error": "red",
             "queued": OFFLINE,
         }.get(status, "white")
-        return f"[{color}]{status}[/{color}]"
+        return Text(status, style=color)
 
     def _refresh_deltas(self, task: str) -> None:
         v = self._results.get(("vanilla_lm", task))
-        b = self._results.get(("broca_shell", task))
-        if not (v and b and v.get("acc") is not None and b.get("acc") is not None):
+        if not v or v.get("acc") is None:
             return
-        delta = float(b["acc"]) - float(v["acc"])
-        b["delta"] = delta
-        # Update the broca_shell row's delta cell.
+        try:
+            acc_v = float(v["acc"])
+        except (TypeError, ValueError):
+            return
         table = self.query_one("#results", DataTable)
-        rk = self._row_keys.get(("broca_shell", task))
-        if rk is not None:
+        for arm in ("broca_shell", "broca_mind"):
+            b = self._results.get((arm, task))
+            if not b or b.get("acc") is None:
+                continue
             try:
-                table.update_cell(rk, RESULT_COL_DELTA, _fmt_delta(delta))
-            except Exception:
-                pass
+                delta = float(b["acc"]) - acc_v
+            except (TypeError, ValueError):
+                continue
+            b["delta"] = delta
+            rk = self._row_keys.get((arm, task))
+            if rk is not None:
+                try:
+                    table.update_cell(rk, RESULT_COL_DELTA, _fmt_delta(delta))
+                except Exception:
+                    pass
 
     def _update_arm_totals(self, arm: str, *, n: int, correct: int) -> None:
         cur = self._totals.setdefault(arm, [0, 0])
@@ -657,17 +662,26 @@ class BenchApp(App):
         # Vanilla vs Broca delta panel
         v_total = self._totals.get("vanilla_lm")
         b_total = self._totals.get("broca_shell")
+        m_total = self._totals.get("broca_mind")
         comp_lines: list[str] = []
         if v_total:
             comp_lines.append(f"vanilla_lm   n={v_total[0]:5d}  acc={_fmt_pct(v_total[1] / max(1, v_total[0]))}")
         if b_total:
             comp_lines.append(f"broca_shell  n={b_total[0]:5d}  acc={_fmt_pct(b_total[1] / max(1, b_total[0]))}")
+        if m_total:
+            comp_lines.append(f"broca_mind   n={m_total[0]:5d}  acc={_fmt_pct(m_total[1] / max(1, m_total[0]))}")
         if v_total and b_total:
             v_acc = v_total[1] / max(1, v_total[0])
             b_acc = b_total[1] / max(1, b_total[0])
             d = b_acc - v_acc
             color = ONLINE if d >= 0 else WARNING
-            comp_lines.append(f"[{color}]Δ            {_fmt_delta(d)}[/{color}]")
+            comp_lines.append(f"[{color}]Δ shell       {_fmt_delta(d)}[/{color}]")
+        if v_total and m_total:
+            v_acc = v_total[1] / max(1, v_total[0])
+            m_acc = m_total[1] / max(1, m_total[0])
+            d2 = m_acc - v_acc
+            color = ONLINE if d2 >= 0 else WARNING
+            comp_lines.append(f"[{color}]Δ mind        {_fmt_delta(d2)}[/{color}]")
         if not comp_lines:
             comp_lines.append("[dim]waiting for first task[/dim]")
         self.query_one("#panel-compare", StatePanel).set_lines(comp_lines)
@@ -784,30 +798,24 @@ class BenchApp(App):
 
 
 def _build_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(
-        description=(
-            "Textual TUI wrapping `python -m core.benchmarks`. All flags are forwarded "
-            "verbatim to the bench entry point."
-        ),
-        add_help=False,
+    return argparse.ArgumentParser(
+        description="Textual dashboard for `python -m core.benchmarks` (fixed configuration; see -h below).",
     )
-    # Defer help / argument parsing to the underlying benchmarks parser. We
-    # accept any args and pass them through.
-    p.add_argument("--tui-log-level", default=os.environ.get("TUI_LOG_LEVEL", "INFO"))
-    p.add_argument("-h", "--help", action="store_true")
-    return p
 
 
 def main() -> None:
+    helper = argparse.ArgumentParser(add_help=False)
+    helper.add_argument("-h", "--help", action="store_true")
+    hpre, trailing = helper.parse_known_args()
     parser = _build_parser()
-    known, rest = parser.parse_known_args()
-    if known.help:
-        # Show the underlying bench parser's help as well.
+    if hpre.help:
         parser.print_help()
-        print("\n--- forwarded to core.benchmarks ---\n")
-        from core.benchmarks.__main__ import build_arg_parser as _bp
-        _bp().print_help()
+        print()
+        from core.benchmarks.__main__ import print_benchmark_cli_help
+
+        print_benchmark_cli_help()
         return
+    parser.parse_args(trailing)
 
     os.environ.setdefault("LOG_SILENT", "1")
     # The bench worker runs off the main thread; matplotlib's macOS backend
@@ -817,12 +825,12 @@ def main() -> None:
     configure_lab_logging()
 
     bus = get_default_bus()
-    log_level = getattr(logging, known.tui_log_level.upper(), logging.INFO)
+    log_level = getattr(logging, str(os.environ.get("TUI_LOG_LEVEL", "INFO")).upper(), logging.INFO)
     handler = LogToBusHandler(bus, level=log_level)
     handler.setFormatter(logging.Formatter("%(message)s"))
     logging.getLogger("core").addHandler(handler)
 
-    app = BenchApp(bus=bus, bench_argv=list(rest))
+    app = BenchApp(bus=bus, bench_argv=[])
     try:
         app.run()
     finally:
