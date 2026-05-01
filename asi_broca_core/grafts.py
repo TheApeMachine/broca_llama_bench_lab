@@ -25,6 +25,47 @@ def derived_residual_token_strength(d_model: int, n_outcomes: int) -> float:
     return dm * math.sqrt(math.log1p(float(max(1, int(n_outcomes)))))
 
 
+DEFAULT_GRAFT_TARGET_SNR = 0.30
+
+
+def host_rms(x: torch.Tensor) -> torch.Tensor:
+    """Root-mean-square energy of the host residual stream over its feature axis.
+
+    Returned shape preserves all leading dims and keeps the feature axis at size 1
+    so the result broadcasts cleanly against the unit-norm direction added back in.
+    """
+
+    return x.detach().float().pow(2).mean(dim=-1, keepdim=True).sqrt().to(dtype=x.dtype)
+
+
+def snr_magnitude(x: torch.Tensor, *, target_snr: float, confidence: float = 1.0, inertia: float = 1.0) -> torch.Tensor:
+    """Magnitude that injects a unit direction at ``target_snr`` × host RMS.
+
+    Confidence and context-inertia are multiplicative on top: high-confidence
+    substrate frames push proportionally harder, and the bias scales with the
+    autoregressive prefix length so grafts can shout over an LLM that has built
+    up momentum on a competing surface form.
+    """
+
+    return host_rms(x) * float(target_snr) * float(max(0.0, confidence)) * float(max(0.0, inertia))
+
+
+def _state_confidence(state: dict) -> float:
+    val = state.get("substrate_confidence")
+    try:
+        return float(val) if val is not None else 1.0
+    except (TypeError, ValueError):
+        return 1.0
+
+
+def _state_inertia(state: dict) -> float:
+    val = state.get("substrate_inertia")
+    try:
+        return float(val) if val is not None else 1.0
+    except (TypeError, ValueError):
+        return 1.0
+
+
 class BaseGraft(nn.Module):
     """Base class for modules inserted into a host model's internal slots."""
 
@@ -70,6 +111,7 @@ class KVMemoryGraft(BaseGraft):
         *,
         max_items: int = 8192,
         query_mode: str = "sequence_mean",
+        target_snr: float = DEFAULT_GRAFT_TARGET_SNR,
     ):
         super().__init__()
         if query_mode not in {"token", "sequence_mean"}:
@@ -77,7 +119,7 @@ class KVMemoryGraft(BaseGraft):
         self.d_model = int(d_model)
         dm = float(self.d_model)
         log_store = math.log1p(float(max_items))
-        self.strength = dm * math.sqrt(log_store)
+        self.target_snr = float(target_snr)
         self.temperature = math.sqrt(log_store) / max(dm, 1.0)
         self.max_items = int(max_items)
         self.query_mode = query_mode
@@ -122,7 +164,15 @@ class KVMemoryGraft(BaseGraft):
             self.d_model,
         )
 
-    def _retrieve(self, queries: torch.Tensor, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, dict]:
+    def _retrieve(
+        self,
+        queries: torch.Tensor,
+        x: torch.Tensor,
+        *,
+        host_at_query: torch.Tensor,
+        confidence: float = 1.0,
+        inertia: float = 1.0,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, dict]:
         q = F.normalize(queries, dim=-1)
         k = F.normalize(self.keys.to(x.device), dim=-1)
         raw_sims = q @ k.T
@@ -165,7 +215,10 @@ class KVMemoryGraft(BaseGraft):
             weights = weights / weights.sum(dim=-1, keepdim=True).clamp_min(1e-9)
         retrieved = weights @ self.values.to(x.device)
         gate = (gate_peak * gate_manifold).unsqueeze(-1)
-        return self.strength * gate * retrieved, weights, gate.squeeze(-1), manifold_dbg
+        direction = F.normalize(retrieved, dim=-1)
+        magnitude = snr_magnitude(host_at_query, target_snr=self.target_snr, confidence=confidence, inertia=inertia)
+        delta = direction * magnitude * gate
+        return delta, weights, gate.squeeze(-1), manifold_dbg
 
     def forward(self, x: torch.Tensor, state: dict) -> torch.Tensor:
         if not self.enabled or self.keys.numel() == 0:
@@ -175,8 +228,17 @@ class KVMemoryGraft(BaseGraft):
         mask = state.get("attention_mask")
         if mask is None:
             mask = torch.ones(bsz, seq_len, device=x.device, dtype=torch.bool)
+        confidence = _state_confidence(state)
+        inertia = _state_inertia(state)
         if self.query_mode == "token":
-            delta, weights, gate, manifold_dbg = self._retrieve(x.reshape(-1, d_model), x)
+            host_at_query = x.reshape(-1, d_model)
+            delta, weights, gate, manifold_dbg = self._retrieve(
+                host_at_query,
+                x,
+                host_at_query=host_at_query,
+                confidence=confidence,
+                inertia=inertia,
+            )
             self.last_debug = {"weights": weights.detach().cpu(), "gate": gate.detach().cpu(), **manifold_dbg}
             delta_view = delta.reshape(bsz, seq_len, d_model)
             gmax = float(gate.detach().max().item()) if gate.numel() else 0.0
@@ -195,9 +257,16 @@ class KVMemoryGraft(BaseGraft):
         weights_for_mean = mask.to(x.dtype).unsqueeze(-1)
         lengths = weights_for_mean.sum(dim=1).clamp_min(1.0)
         queries = (x * weights_for_mean).sum(dim=1) / lengths
-        delta, weights, gate, manifold_dbg = self._retrieve(queries, x)
-        out = x.clone()
         last = _last_indices(state, x)
+        host_at_last = x[torch.arange(bsz, device=x.device), last]
+        delta, weights, gate, manifold_dbg = self._retrieve(
+            queries,
+            x,
+            host_at_query=host_at_last,
+            confidence=confidence,
+            inertia=inertia,
+        )
+        out = x.clone()
         out[torch.arange(bsz, device=x.device), last] += delta
         self.last_debug = {"weights": weights.detach().cpu(), "gate": gate.detach().cpu(), **manifold_dbg}
         gmax = float(gate.detach().max().item()) if gate.numel() else 0.0
@@ -290,12 +359,12 @@ class FeatureVectorGraft(BaseGraft):
     can remain frozen.
     """
 
-    def __init__(self, d_features: int, d_model: int, *, trigger_ids: Sequence[int] | None = None, strength: float = 1.0):
+    def __init__(self, d_features: int, d_model: int, *, trigger_ids: Sequence[int] | None = None, target_snr: float = DEFAULT_GRAFT_TARGET_SNR):
         super().__init__()
         self.d_features = int(d_features)
         self.d_model = int(d_model)
         self.trigger_ids = tuple(int(x) for x in trigger_ids) if trigger_ids else tuple()
-        self.strength = float(strength)
+        self.target_snr = float(target_snr)
         self.norm = nn.LayerNorm(self.d_features)
         self.project = nn.Linear(self.d_features, self.d_model)
         nn.init.normal_(self.project.weight, std=0.02)
@@ -315,11 +384,16 @@ class FeatureVectorGraft(BaseGraft):
         applies = _trigger_mask(state["token_ids"], self.trigger_ids)
         if not bool(applies.any()):
             return x
-        delta = self.project(self.norm(feats)) * self.strength
-        out = x.clone()
+        confidence = _state_confidence(state)
+        inertia = _state_inertia(state)
         last = _last_indices(state, x)
         rows = torch.arange(x.shape[0], device=x.device)[applies]
-        out[rows, last[applies]] += delta[applies]
+        last_apply = last[applies]
+        host_at_last = x[rows, last_apply]
+        direction = F.normalize(self.project(self.norm(feats[applies])), dim=-1)
+        magnitude = snr_magnitude(host_at_last, target_snr=self.target_snr, confidence=confidence, inertia=inertia)
+        out = x.clone()
+        out[rows, last_apply] += direction * magnitude
         return out
 
 class TriggeredTokenDirectionGraft(BaseGraft):
@@ -330,11 +404,11 @@ class TriggeredTokenDirectionGraft(BaseGraft):
     corresponding token direction into the residual stream.
     """
 
-    def __init__(self, token_by_name: Mapping[str, int], *, trigger_ids: Sequence[int] | None = None, strength: float = 18.0):
+    def __init__(self, token_by_name: Mapping[str, int], *, trigger_ids: Sequence[int] | None = None, target_snr: float = DEFAULT_GRAFT_TARGET_SNR):
         super().__init__()
         self.token_by_name = {str(k): int(v) for k, v in token_by_name.items()}
         self.trigger_ids = tuple(int(x) for x in trigger_ids) if trigger_ids else tuple()
-        self.strength = float(strength)
+        self.target_snr = float(target_snr)
         self.last_name: str | None = None
         self.last_token_id: int | None = None
 
@@ -351,13 +425,18 @@ class TriggeredTokenDirectionGraft(BaseGraft):
         name = self.choose_name(state)
         if name is None or name not in self.token_by_name:
             return x
+        confidence = _state_confidence(state)
+        inertia = _state_inertia(state)
         out = x.clone()
         model = state["model"]
         tok_id = self.token_by_name[name]
         direction = F.normalize(model.lm_head.weight[tok_id].detach().to(x.device, x.dtype), dim=0)
         last = _last_indices(state, x)
         rows = torch.arange(x.shape[0], device=x.device)[applies]
-        out[rows, last[applies]] += self.strength * direction
+        last_apply = last[applies]
+        host_at_last = x[rows, last_apply]
+        magnitude = snr_magnitude(host_at_last, target_snr=self.target_snr, confidence=confidence, inertia=inertia)
+        out[rows, last_apply] += direction.unsqueeze(0) * magnitude
         self.last_name = name
         self.last_token_id = tok_id
         return out
@@ -366,8 +445,8 @@ class TriggeredTokenDirectionGraft(BaseGraft):
 class ActiveInferenceTokenGraft(TriggeredTokenDirectionGraft):
     """Projects an active-inference policy decision into the residual stream."""
 
-    def __init__(self, agent, token_by_action: Mapping[str, int], *, trigger_ids: Sequence[int] | None = None, strength: float = 18.0):
-        super().__init__(token_by_action, trigger_ids=trigger_ids, strength=strength)
+    def __init__(self, agent, token_by_action: Mapping[str, int], *, trigger_ids: Sequence[int] | None = None, target_snr: float = DEFAULT_GRAFT_TARGET_SNR):
+        super().__init__(token_by_action, trigger_ids=trigger_ids, target_snr=target_snr)
         self.agent = agent
         self.last_decision = None
 
@@ -380,8 +459,8 @@ class ActiveInferenceTokenGraft(TriggeredTokenDirectionGraft):
 class CoupledActiveInferenceTokenGraft(TriggeredTokenDirectionGraft):
     """Arbitrates spatial vs causal active-inference faculties in one forward pass."""
 
-    def __init__(self, coupled: CoupledEFEAgent, token_by_action: Mapping[str, int], *, trigger_ids: Sequence[int] | None = None, strength: float = 18.0):
-        super().__init__(token_by_action, trigger_ids=trigger_ids, strength=strength)
+    def __init__(self, coupled: CoupledEFEAgent, token_by_action: Mapping[str, int], *, trigger_ids: Sequence[int] | None = None, target_snr: float = DEFAULT_GRAFT_TARGET_SNR):
+        super().__init__(token_by_action, trigger_ids=trigger_ids, target_snr=target_snr)
         self.coupled = coupled
         self.last_coupled: CoupledDecision | None = None
 
@@ -405,9 +484,9 @@ class CausalEffectTokenGraft(TriggeredTokenDirectionGraft):
         negative_token: int,
         treatment_values: tuple = (1, 0),
         trigger_ids: Sequence[int] | None = None,
-        strength: float = 18.0,
+        target_snr: float = DEFAULT_GRAFT_TARGET_SNR,
     ):
-        super().__init__({"helps": int(positive_token), "hurts": int(negative_token)}, trigger_ids=trigger_ids, strength=strength)
+        super().__init__({"helps": int(positive_token), "hurts": int(negative_token)}, trigger_ids=trigger_ids, target_snr=target_snr)
         self.scm = scm
         self.treatment = treatment
         self.outcome = outcome

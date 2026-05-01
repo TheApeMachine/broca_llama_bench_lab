@@ -77,6 +77,110 @@ class EpisodeAssociationGraph:
             ).fetchone()
         return float(row[0]) if row else 0.0
 
+    def decay_all(self, *, gamma: float = 0.99, prune_below: float = 0.01) -> tuple[int, int]:
+        """Apply thermodynamic decay to every edge and prune the survivors.
+
+        Returns ``(decayed_edges, pruned_edges)`` so the DMN telemetry can
+        attribute work to this phase. ``gamma`` is the multiplicative damping
+        factor applied per tick; ``prune_below`` is the weight floor under
+        which edges are deleted as having decayed past usefulness.
+        """
+
+        g = float(gamma)
+        floor = float(prune_below)
+        if not (0.0 < g <= 1.0):
+            raise ValueError("gamma must be in (0, 1]")
+        with self._connect() as con:
+            decayed_cur = con.execute(
+                "UPDATE episode_association SET weight = weight * ?, updated_at = ?",
+                (g, time.time()),
+            )
+            decayed = int(decayed_cur.rowcount or 0)
+            pruned_cur = con.execute(
+                "DELETE FROM episode_association WHERE weight < ?",
+                (floor,),
+            )
+            pruned = int(pruned_cur.rowcount or 0)
+        logger.debug(
+            "EpisodeAssociationGraph.decay_all: gamma=%.4f floor=%.4f decayed=%d pruned=%d",
+            g,
+            floor,
+            decayed,
+            pruned,
+        )
+        return decayed, pruned
+
+    def edges(self, *, min_weight: float = 0.0) -> list[tuple[int, int, float]]:
+        """All edges above ``min_weight`` (lo, hi, weight). Used for centrality + dream walks."""
+
+        with self._connect() as con:
+            rows = con.execute(
+                "SELECT lo, hi, weight FROM episode_association WHERE weight >= ? ORDER BY weight DESC",
+                (float(min_weight),),
+            ).fetchall()
+        return [(int(r[0]), int(r[1]), float(r[2])) for r in rows]
+
+    def neighbors(self, episode_id: int, *, limit: int = 16, min_weight: float = 0.0) -> list[tuple[int, float]]:
+        """Top-weighted neighbors of an episode, used for transitive episode closure."""
+
+        nid = int(episode_id)
+        lim = max(1, int(limit))
+        with self._connect() as con:
+            rows = con.execute(
+                """
+                SELECT CASE WHEN lo=? THEN hi ELSE lo END AS other, weight
+                FROM episode_association
+                WHERE (lo=? OR hi=?) AND weight >= ?
+                ORDER BY weight DESC LIMIT ?
+                """,
+                (nid, nid, nid, float(min_weight), lim),
+            ).fetchall()
+        return [(int(r[0]), float(r[1])) for r in rows]
+
+    def centrality(self, *, damping: float = 0.85, iterations: int = 20, min_weight: float = 0.0) -> dict[int, float]:
+        """PageRank over the surviving episode association graph.
+
+        Returns the stationary distribution over episode ids; nodes that the
+        DMN's random walk visits often are mathematically the most central
+        across the user's whole journal, and the worker uses that score to
+        boost the confidence of semantic facts that cite those episodes.
+        """
+
+        edges = self.edges(min_weight=min_weight)
+        if not edges:
+            return {}
+        nodes: set[int] = set()
+        out_weight: dict[int, float] = {}
+        adj: dict[int, list[tuple[int, float]]] = {}
+        for lo, hi, w in edges:
+            nodes.add(lo)
+            nodes.add(hi)
+            adj.setdefault(lo, []).append((hi, w))
+            adj.setdefault(hi, []).append((lo, w))
+            out_weight[lo] = out_weight.get(lo, 0.0) + w
+            out_weight[hi] = out_weight.get(hi, 0.0) + w
+        n = len(nodes)
+        if n == 0:
+            return {}
+        d = float(damping)
+        teleport = (1.0 - d) / n
+        rank = {node: 1.0 / n for node in nodes}
+        for _ in range(max(1, int(iterations))):
+            new_rank = {node: teleport for node in nodes}
+            for src, neighbors in adj.items():
+                if not neighbors:
+                    continue
+                total = out_weight.get(src, 0.0)
+                if total <= 0.0:
+                    continue
+                share = d * rank[src] / total
+                for dst, w in neighbors:
+                    new_rank[dst] += share * w
+            rank = new_rank
+        # normalize to sum 1 in case rounding drifted
+        total = sum(rank.values()) or 1.0
+        return {node: float(score / total) for node, score in rank.items()}
+
 
 def merge_epistemic_evidence_dict(base: dict, incoming: dict) -> dict:
     """Union-merge provenance lists used across semantic rows and frames."""

@@ -6,6 +6,7 @@ import hashlib
 import logging
 import math
 import os
+import random
 import sqlite3
 import threading
 import time
@@ -27,36 +28,78 @@ from .active_inference import (
 from .causal import build_simpson_scm
 from .continuous_frame import (
     COGNITIVE_FRAME_DIM,
+    SKETCH_DIM,
     TextEncoder,
     frozen_subword_projector_from_model,
     pack_cognitive_frame,
     stable_sketch,
 )
 from .device_utils import pick_torch_device
-from .grafts import BaseGraft
+from .grafts import BaseGraft, DEFAULT_GRAFT_TARGET_SNR, snr_magnitude, _state_confidence, _state_inertia
 from .hf_tokenizer_compat import HuggingFaceBrocaTokenizer
 from .llama_broca_host import LlamaBrocaHost, load_llama_broca_host
 from .predictive_coding import lexical_surprise_gap
 from .substrate_graph import EpisodeAssociationGraph, merge_epistemic_evidence_dict
 from .tokenizer import speech_seed_ids, utterance_words
+from .vsa import VSACodebook
+from .hopfield import HopfieldAssociativeMemory
+from .conformal import ConformalPredictor, PersistentConformalCalibration
+from .hawkes import MultivariateHawkesProcess, PersistentHawkes, fit_excitation_em
+from .preference_learning import DirichletPreference, PersistentPreference, feedback_polarity_from_text
+from .ontological_expansion import OntologicalRegistry, PersistentOntologicalRegistry
+from .causal_discovery import pc_algorithm, build_scm_from_skeleton
 
 logger = logging.getLogger(__name__)
 
 DEFAULT_BROCA_MODEL_ID = os.environ.get("ASI_BROCA_MODEL_ID", "meta-llama/Llama-3.2-1B-Instruct")
 SEMANTIC_CONFIDENCE_FLOOR = 0.5
-BELIEF_REVISION_MARGIN = 0.5
-BELIEF_REVISION_MIN_CLAIMS = 2
-SURPRISE_TRUST_SCALE = 1.0
+BELIEF_REVISION_LOG_ODDS_THRESHOLD = 0.5
+BELIEF_REVISION_MIN_CLAIMS = 1
 
 
-def _claim_trust_weight(claim: dict) -> float:
-    """Trust attenuator for prediction-error-weighted consolidation.
+def _gap_population_stats(claims: Sequence[dict]) -> tuple[float, float] | None:
+    """Population mean and std of prediction gaps across the claim corpus.
 
-    A claim that the LLM finds surprising (large positive ``prediction_gap``)
-    earns a smaller per-claim weight, so a Sybil-style poisoning attack that
-    repeats an unlikely statement no longer flips a belief on raw count alone.
-    Claims without a recorded gap (e.g. corroborating observations) get full
-    weight.
+    Surprise is a moving target — what counts as a high-gap outlier depends on
+    how the LLM scored every other observation. Returns ``None`` when there is
+    not enough variance to anchor a Z-score (single sample or constant gaps),
+    which leaves :func:`_claim_trust_weight` to fall back to its standard
+    Gaussian prior with σ = 1.
+    """
+
+    gaps: list[float] = []
+    for claim in claims:
+        ev = claim.get("evidence")
+        if not isinstance(ev, dict):
+            continue
+        raw = ev.get("prediction_gap")
+        try:
+            gap = float(raw)
+        except (TypeError, ValueError):
+            continue
+        if math.isfinite(gap) and gap > 0.0:
+            gaps.append(gap)
+    if len(gaps) < 2:
+        return None
+    mu = sum(gaps) / len(gaps)
+    var = sum((g - mu) ** 2 for g in gaps) / len(gaps)
+    sigma = math.sqrt(var)
+    if sigma <= 1e-6:
+        return None
+    return mu, sigma
+
+
+def _claim_trust_weight(claim: dict, *, gap_stats: tuple[float, float] | None = None) -> float:
+    """Likelihood-ratio weight for prediction-error-weighted consolidation.
+
+    The weight is the Gaussian likelihood ratio of the claim's surprise under
+    the population's distribution of past surprises: ``exp(-0.5 * z^2)`` where
+    ``z = (gap - μ) / σ``. Surprises smaller than μ collapse to a Z of zero
+    (the claim is at-or-below typical), so a low-gap claim earns full trust.
+    Without a population (``gap_stats is None``) the formula falls back to a
+    unit-Gaussian baseline anchored at zero, which preserves the previous
+    1/(1+gap)-style decay for callers that pass a single claim with no
+    historical context.
     """
 
     ev = claim.get("evidence")
@@ -69,7 +112,13 @@ def _claim_trust_weight(claim: dict) -> float:
         return 1.0
     if not math.isfinite(gap) or gap <= 0.0:
         return 1.0
-    return 1.0 / (1.0 + SURPRISE_TRUST_SCALE * gap)
+    if gap_stats is None:
+        mu, sigma = 0.0, 1.0
+    else:
+        mu, sigma = gap_stats
+        sigma = max(1e-3, float(sigma))
+    z = max(0.0, (gap - mu) / sigma)
+    return math.exp(-0.5 * z * z)
 
 
 @dataclass(frozen=True)
@@ -719,7 +768,7 @@ class PersistentSemanticMemory:
     def consolidate_claims_once(
         self,
         *,
-        revision_margin: float = BELIEF_REVISION_MARGIN,
+        log_odds_threshold: float = BELIEF_REVISION_LOG_ODDS_THRESHOLD,
         min_claims: int = BELIEF_REVISION_MIN_CLAIMS,
     ) -> list[dict]:
         claims = self.claims()
@@ -727,6 +776,7 @@ class PersistentSemanticMemory:
         for claim in claims:
             grouped.setdefault((claim["subject"], claim["predicate"]), []).append(claim)
 
+        gap_stats = _gap_population_stats(claims)
         reflections: list[dict] = []
         for (subject, predicate), rows in grouped.items():
             if len({r["object"] for r in rows}) < 2:
@@ -734,7 +784,7 @@ class PersistentSemanticMemory:
             support: dict[str, dict[str, Any]] = {}
             for row in rows:
                 entry = support.setdefault(row["object"], {"score": 0.0, "count": 0, "claim_ids": [], "trust_weights": []})
-                trust = _claim_trust_weight(row)
+                trust = _claim_trust_weight(row, gap_stats=gap_stats)
                 entry["score"] += float(row["confidence"]) * trust
                 entry["count"] += 1
                 entry["claim_ids"].append(int(row["id"]))
@@ -746,16 +796,31 @@ class PersistentSemanticMemory:
             best_obj, best = max(support.items(), key=lambda item: (float(item[1]["score"]), int(item[1]["count"])))
             best_score = float(best["score"])
             best_count = int(best["count"])
+            # Log-odds of the candidate vs. the current belief, in nats. With
+            # adversarial high-surprise claims the candidate's score collapses
+            # under the EMA Z-score Bayes factor, so the log-odds stay
+            # negative; with low-surprise corroborating evidence the candidate
+            # accumulates above the threshold.
+            log_odds = math.log(max(best_score, 1e-12)) - math.log(max(current_score, 1e-12))
             evidence = {
                 "support": support,
                 "current_object": current_obj,
                 "candidate_object": best_obj,
-                "revision_margin": float(revision_margin),
+                "log_odds": float(log_odds),
+                "log_odds_threshold": float(log_odds_threshold),
                 "min_claims": int(min_claims),
+                "gap_stats": (
+                    {"mu": float(gap_stats[0]), "sigma": float(gap_stats[1])} if gap_stats else None
+                ),
                 "instrument": "background_claim_consolidation",
             }
 
-            if current_obj and best_obj != current_obj and best_count >= int(min_claims) and best_score >= current_score + float(revision_margin):
+            if (
+                current_obj
+                and best_obj != current_obj
+                and best_count >= int(min_claims)
+                and log_odds >= float(log_odds_threshold)
+            ):
                 claim_ids_digest = hashlib.sha256(
                     json.dumps(sorted(int(i) for i in best["claim_ids"]), separators=(",", ":")).encode()
                 ).hexdigest()
@@ -961,6 +1026,102 @@ class PersistentSemanticMemory:
         obj, conf, ev_old = got
         merged_ev = merge_epistemic_evidence_dict(dict(ev_old), incoming)
         self.upsert(subject, predicate, obj, confidence=conf, evidence=merged_ev)
+
+    def all_facts(self) -> list[tuple[str, str, str, float, dict]]:
+        """Every (subject, predicate, object, confidence, evidence) row in this namespace."""
+
+        with self._connect() as con:
+            rows = con.execute(
+                """
+                SELECT subject, predicate, object, confidence, evidence_json
+                FROM semantic_memory WHERE namespace=?
+                """,
+                (self.namespace,),
+            ).fetchall()
+        return [(str(r[0]), str(r[1]), str(r[2]), float(r[3]), json.loads(r[4])) for r in rows]
+
+    def boost_confidence(self, subject: str, predicate: str, *, factor: float, cap: float = 1.0, reason: str | None = None) -> tuple[str, float, float] | None:
+        """Multiplicatively raise the confidence of a stored fact (DMN reinforcement).
+
+        Returns ``(object, old_conf, new_conf)`` so callers can log the move,
+        or ``None`` if the row doesn't exist. Evidence is updated with a
+        ``dmn_consolidation`` note recording the boost factor and reason so
+        the provenance trail survives across runs.
+        """
+
+        got = self.get(subject, predicate)
+        if got is None:
+            return None
+        obj, conf, ev_old = got
+        new_conf = float(min(float(cap), max(0.0, conf * float(factor))))
+        ev_new = dict(ev_old)
+        notes = list(ev_new.get("dmn_consolidation") or [])
+        notes.append({
+            "ts": time.time(),
+            "factor": float(factor),
+            "old_confidence": float(conf),
+            "new_confidence": float(new_conf),
+            "reason": str(reason or "centrality_boost"),
+        })
+        ev_new["dmn_consolidation"] = notes[-32:]
+        self.upsert(subject, predicate, obj, confidence=new_conf, evidence=ev_new)
+        return obj, float(conf), float(new_conf)
+
+    def overlapping_subject_pairs(self, *, min_shared: int = 2) -> list[dict]:
+        """Pairs of distinct subjects that share ``>= min_shared`` (predicate, object) tuples.
+
+        Used by the DMN's separation phase to flag entities the substrate
+        cannot discriminate from observation alone — high overlap means
+        Fristonian ambiguity is high (observations don't separate the two
+        hypotheses), so the substrate raises an intrinsic cue asking the LLM
+        to pose a disambiguating question on the next turn.
+        """
+
+        threshold = max(1, int(min_shared))
+        # Group subjects by the (predicate, object) tuples they share.
+        bucket: dict[tuple[str, str], list[str]] = {}
+        with self._connect() as con:
+            rows = con.execute(
+                """
+                SELECT subject, predicate, object FROM semantic_memory WHERE namespace=?
+                """,
+                (self.namespace,),
+            ).fetchall()
+        per_subject: dict[str, set[tuple[str, str]]] = {}
+        for subj, pred, obj in rows:
+            subj = str(subj)
+            key = (str(pred), str(obj))
+            bucket.setdefault(key, []).append(subj)
+            per_subject.setdefault(subj, set()).add(key)
+        pair_overlap: dict[tuple[str, str], set[tuple[str, str]]] = {}
+        for key, subjects in bucket.items():
+            if len(subjects) < 2:
+                continue
+            unique = sorted(set(subjects))
+            for i in range(len(unique)):
+                for j in range(i + 1, len(unique)):
+                    pair_overlap.setdefault((unique[i], unique[j]), set()).add(key)
+        out: list[dict] = []
+        for (a, b), shared in pair_overlap.items():
+            if len(shared) < threshold:
+                continue
+            size_a = len(per_subject.get(a, set()))
+            size_b = len(per_subject.get(b, set()))
+            denom = max(1, min(size_a, size_b))
+            ratio = len(shared) / float(denom)
+            out.append(
+                {
+                    "subject_a": a,
+                    "subject_b": b,
+                    "shared": sorted(shared),
+                    "shared_count": len(shared),
+                    "size_a": size_a,
+                    "size_b": size_b,
+                    "overlap_ratio": float(ratio),
+                }
+            )
+        out.sort(key=lambda d: (-d["overlap_ratio"], -d["shared_count"], d["subject_a"], d["subject_b"]))
+        return out
 
 
 class WorkspaceJournal:
@@ -1170,16 +1331,95 @@ class GlobalWorkspace:
         return [asdict(f) for f in self.frames]
 
 
-class CognitiveBackgroundWorker:
-    """In-process consolidation loop for persisted cognitive substrate state."""
+@dataclass
+class DMNConfig:
+    """Tunable thresholds for the Default Mode Network's three idle phases.
 
-    def __init__(self, mind: "BrocaMind", *, interval_s: float = 5.0):
+    These knobs are deliberately exposed: the DMN's behavior is a function of
+    how aggressively the user wants the substrate to forget, disambiguate, and
+    speculate during idle cycles. All have safe defaults; the chat CLI can
+    override them with environment variables or constructor arguments.
+    """
+
+    # Phase 1 — consolidation
+    decay_gamma: float = 0.99
+    decay_prune_below: float = 0.01
+    centrality_iterations: int = 20
+    centrality_min_weight: float = 0.0
+    centrality_boost_floor: float = 0.05  # only boost facts whose central episode beats this PageRank mass
+    centrality_boost_factor: float = 1.05
+    centrality_boost_cap: float = 0.999
+
+    # Phase 2 — separation
+    overlap_min_shared: int = 2
+    overlap_ratio_floor: float = 0.66
+    overlap_max_cues: int = 4
+
+    # Phase 3 — latent discovery
+    dream_attempts_per_tick: int = 3
+    dream_ate_insight_threshold: float = 0.4
+    transitive_min_pair_weight: float = 0.5
+    transitive_cosine_threshold: float = 0.55
+    transitive_max_new_edges: int = 4
+
+    # REM sleep — trigger when the user has been quiet this long.
+    sleep_idle_seconds: float = 600.0
+    sleep_max_replay: int = 32
+    sleep_min_observations_for_pc: int = 24
+    sleep_pc_alpha: float = 0.05
+    sleep_hawkes_min_events: int = 6
+
+
+class CognitiveBackgroundWorker:
+    """Default Mode Network for the cognitive substrate.
+
+    Runs three thermodynamic phases on every tick — even when the user has
+    been silent — so the substrate physically reorganizes itself between
+    turns:
+
+      1. **Consolidation.** Episodic association edges decay multiplicatively
+         and weak ones are pruned. A PageRank pass over the survivors finds
+         the central episodes; the confidence of any semantic fact whose
+         provenance cites a central episode is boosted, so frequently-used
+         knowledge becomes harder to forget.
+      2. **Separation.** Subjects that share suspiciously many predicate /
+         object pairs are scored for Fristonian ambiguity (binary entropy of
+         the disambiguation distribution) and emit an intrinsic cue so the
+         next reply tends toward a clarifying question rather than committing
+         to a coin-flip identity.
+      3. **Latent discovery.** Two stochastic subroutines: the SCM is
+         "dreamt" — random treatment / outcome pairs are selected, do(·)
+         interventions are run, and large average treatment effects are
+         persisted as ``latent_causal_insight`` reflections; and the episode
+         graph is walked for transitive closure: a strongly-connected (A, B)
+         and (B, C) trigger a cosine-similarity test on A and C's frames,
+         creating a new (A, C) edge if the test fires.
+
+    Each phase emits one or more reflection-shaped dicts so the chat CLI and
+    debugger can replay what the DMN did between turns.
+    """
+
+    def __init__(
+        self,
+        mind: "BrocaMind",
+        *,
+        interval_s: float = 5.0,
+        config: DMNConfig | None = None,
+        rng: random.Random | None = None,
+        motor_trainer: Any | None = None,
+    ):
         self.mind = mind
         self.interval_s = max(0.1, float(interval_s))
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         self.iterations = 0
         self.last_error: str | None = None
+        self.config = config if config is not None else DMNConfig()
+        self._rng = rng or random.Random(0xB0CA1)
+        self.last_phase_summary: dict[str, dict[str, Any]] = {}
+        self.last_user_activity_at: float = time.time()
+        self.motor_trainer = motor_trainer
+        self.last_rem_summary: dict[str, Any] = {}
 
     @property
     def running(self) -> bool:
@@ -1189,27 +1429,511 @@ class CognitiveBackgroundWorker:
         if self.running:
             return
         self._stop.clear()
-        self._thread = threading.Thread(target=self._loop, name="broca-consolidator", daemon=True)
+        self._thread = threading.Thread(target=self._loop, name="broca-dmn", daemon=True)
         self._thread.start()
+        logger.info("CognitiveBackgroundWorker.start: interval=%.3fs config=%s", self.interval_s, asdict(self.config))
 
     def stop(self, timeout: float = 2.0) -> None:
         self._stop.set()
         if self._thread is not None:
             self._thread.join(timeout=max(0.0, float(timeout)))
+        logger.info("CognitiveBackgroundWorker.stop: iterations=%d last_error=%s", self.iterations, self.last_error)
 
     def run_once(self) -> list[dict]:
-        out = self.mind.consolidate_once()
+        """Run one DMN tick: phases 1 → 2 → 3, then claim consolidation."""
+
+        tick_started = time.time()
+        reflections: list[dict] = []
+        phase_summary: dict[str, dict[str, Any]] = {}
+
+        for name, fn in (
+            ("consolidation", self._phase1_consolidation),
+            ("separation", self._phase2_separation),
+            ("latent_discovery", self._phase3_latent_discovery),
+        ):
+            phase_started = time.time()
+            try:
+                phase_reflections, summary = fn()
+            except Exception:
+                logger.exception("DMN phase %s failed", name)
+                phase_summary[name] = {"error": True}
+                continue
+            reflections.extend(phase_reflections)
+            summary["duration_ms"] = int(round((time.time() - phase_started) * 1000))
+            summary["reflections"] = len(phase_reflections)
+            phase_summary[name] = summary
+            logger.info("DMN.phase=%s %s", name, summary)
+
+        # Reactive belief consolidation runs after the autonomous phases so
+        # any DMN-promoted edges or boosted confidences are visible to it.
+        try:
+            claim_reflections = self.mind.consolidate_once()
+        except Exception:
+            logger.exception("DMN claim consolidation failed")
+            claim_reflections = []
+        reflections.extend(claim_reflections)
+        phase_summary["claim_consolidation"] = {"reflections": len(claim_reflections)}
+
+        # REM sleep — only if the user has been quiet long enough.
+        idle = max(0.0, time.time() - self.last_user_activity_at)
+        if idle >= self.config.sleep_idle_seconds:
+            phase_started = time.time()
+            try:
+                rem_reflections, rem_summary = self._rem_sleep()
+            except Exception:
+                logger.exception("DMN REM sleep failed")
+                rem_summary = {"error": True}
+                rem_reflections = []
+            rem_summary["duration_ms"] = int(round((time.time() - phase_started) * 1000))
+            rem_summary["idle_seconds"] = float(idle)
+            rem_summary["reflections"] = len(rem_reflections)
+            phase_summary["rem_sleep"] = rem_summary
+            self.last_rem_summary = rem_summary
+            reflections.extend(rem_reflections)
+            logger.info("DMN.phase=rem_sleep %s", rem_summary)
+
         self.iterations += 1
         self.last_error = None
-        logger.debug("CognitiveBackgroundWorker.run_once: iteration=%s reflections=%d", self.iterations, len(out))
-        return out
+        self.last_phase_summary = phase_summary
+        logger.debug(
+            "CognitiveBackgroundWorker.run_once: iteration=%d total_reflections=%d duration_ms=%d idle=%.1fs",
+            self.iterations,
+            len(reflections),
+            int(round((time.time() - tick_started) * 1000)),
+            idle,
+        )
+        return reflections
+
+    def mark_user_active(self) -> None:
+        """Reset the idle clock when the user types something."""
+
+        self.last_user_activity_at = time.time()
+
+    # ------------------------------------------------------------------ Phase 1
+
+    def _phase1_consolidation(self) -> tuple[list[dict], dict[str, Any]]:
+        cfg = self.config
+        graph = self.mind.episode_graph
+        memory = self.mind.memory
+
+        decayed, pruned = graph.decay_all(gamma=cfg.decay_gamma, prune_below=cfg.decay_prune_below)
+        centrality = graph.centrality(
+            damping=0.85,
+            iterations=cfg.centrality_iterations,
+            min_weight=cfg.centrality_min_weight,
+        )
+
+        boosts: list[dict[str, Any]] = []
+        if centrality:
+            top_episodes = {ep for ep, score in centrality.items() if score >= cfg.centrality_boost_floor}
+            if top_episodes:
+                # Boost any fact whose recorded episode_ids intersect the central set.
+                for subj, pred, _obj, _conf, evidence in memory.all_facts():
+                    eps = evidence.get("episode_ids") if isinstance(evidence, dict) else None
+                    if not isinstance(eps, list):
+                        continue
+                    intersection = [int(e) for e in eps if int(e) in top_episodes]
+                    if not intersection:
+                        continue
+                    # Scale the boost by the maximum centrality mass that touched this fact.
+                    mass = max(centrality.get(int(e), 0.0) for e in intersection)
+                    factor = 1.0 + (cfg.centrality_boost_factor - 1.0) * min(1.0, mass / max(cfg.centrality_boost_floor, 1e-6))
+                    result = memory.boost_confidence(
+                        subj,
+                        pred,
+                        factor=factor,
+                        cap=cfg.centrality_boost_cap,
+                        reason=f"pagerank_central(mass={mass:.4f})",
+                    )
+                    if result is None:
+                        continue
+                    obj, old_conf, new_conf = result
+                    boosts.append({
+                        "subject": subj,
+                        "predicate": pred,
+                        "object": obj,
+                        "old_confidence": old_conf,
+                        "new_confidence": new_conf,
+                        "factor": float(factor),
+                        "central_episode_mass": float(mass),
+                        "central_episodes": intersection,
+                    })
+                    logger.debug(
+                        "DMN.phase1.boost: subj=%r pred=%r %.4f -> %.4f factor=%.4f mass=%.4f episodes=%s",
+                        subj,
+                        pred,
+                        old_conf,
+                        new_conf,
+                        float(factor),
+                        float(mass),
+                        intersection,
+                    )
+
+        reflections: list[dict] = []
+        if boosts:
+            reflections.append({
+                "kind": "consolidation_boost",
+                "boosts": boosts,
+            })
+        summary = {
+            "decayed_edges": int(decayed),
+            "pruned_edges": int(pruned),
+            "central_nodes": len(centrality),
+            "boosted_facts": len(boosts),
+        }
+        return reflections, summary
+
+    # ------------------------------------------------------------------ Phase 2
+
+    def _phase2_separation(self) -> tuple[list[dict], dict[str, Any]]:
+        cfg = self.config
+        memory = self.mind.memory
+        # Clear any prior DMN-flagged ambiguity cues so we don't accumulate stale ones across ticks.
+        ws = self.mind.workspace
+        ws.intrinsic_cues = [c for c in ws.intrinsic_cues if c.faculty != "entity_ambiguity"]
+
+        pairs = memory.overlapping_subject_pairs(min_shared=cfg.overlap_min_shared)
+        emitted: list[dict[str, Any]] = []
+        for pair in pairs[: max(0, cfg.overlap_max_cues)]:
+            ratio = float(pair["overlap_ratio"])
+            if ratio < cfg.overlap_ratio_floor:
+                continue
+            # Fristonian ambiguity ≈ binary entropy of the maximum-entropy
+            # disambiguation distribution under the observed overlap. Total
+            # overlap → 50/50 hypothesis posterior → ambiguity = log(2).
+            p = 0.5 + 0.5 * (1.0 - ratio)  # slide from 0.5 (full overlap) toward 1.0 (none)
+            p = max(1e-6, min(1 - 1e-6, p))
+            ambiguity = -(p * math.log(p) + (1 - p) * math.log(1 - p))
+            urgency = float(min(1.0, ambiguity / math.log(2)))
+            cue_evidence = {
+                "subject_a": pair["subject_a"],
+                "subject_b": pair["subject_b"],
+                "shared_count": pair["shared_count"],
+                "overlap_ratio": ratio,
+                "ambiguity_nats": float(ambiguity),
+                "shared_predicates": [list(t) for t in pair["shared"]],
+            }
+            ws.intrinsic_cues.append(IntrinsicCue(urgency=urgency, faculty="entity_ambiguity", evidence=cue_evidence))
+            emitted.append(cue_evidence | {"urgency": urgency})
+            logger.info(
+                "DMN.phase2.cue: %r ↔ %r ratio=%.3f ambiguity=%.4f nats urgency=%.3f",
+                pair["subject_a"],
+                pair["subject_b"],
+                ratio,
+                ambiguity,
+                urgency,
+            )
+
+        reflections: list[dict] = []
+        if emitted:
+            reflections.append({"kind": "separation_cue", "cues": emitted})
+
+        summary = {
+            "candidate_pairs": len(pairs),
+            "cues_emitted": len(emitted),
+        }
+        return reflections, summary
+
+    # ------------------------------------------------------------------ Phase 3
+
+    def _phase3_latent_discovery(self) -> tuple[list[dict], dict[str, Any]]:
+        reflections: list[dict] = []
+        causal = self._causal_dreaming()
+        reflections.extend(causal["reflections"])
+        transitive = self._transitive_episode_closure()
+        reflections.extend(transitive["reflections"])
+        summary = {
+            "causal_attempts": causal["attempts"],
+            "causal_insights": causal["insights"],
+            "transitive_pairs_examined": transitive["pairs_examined"],
+            "transitive_edges_added": transitive["edges_added"],
+        }
+        return reflections, summary
+
+    def _causal_dreaming(self) -> dict[str, Any]:
+        cfg = self.config
+        scm = getattr(self.mind, "scm", None)
+        if scm is None:
+            return {"reflections": [], "attempts": 0, "insights": 0}
+        endogenous = list(scm.endogenous_names)
+        if len(endogenous) < 2:
+            return {"reflections": [], "attempts": 0, "insights": 0}
+
+        attempts = 0
+        insights: list[dict[str, Any]] = []
+        for _ in range(max(0, int(cfg.dream_attempts_per_tick))):
+            attempts += 1
+            treatment, outcome = self._rng.sample(endogenous, 2)
+            try:
+                t_dom = scm.domains.get(treatment)
+                o_dom = scm.domains.get(outcome)
+                if not t_dom or not o_dom or len(t_dom) < 2 or len(o_dom) < 2:
+                    continue
+                t_pos, t_neg = t_dom[0], t_dom[1]
+                outcome_value = o_dom[0]
+                p_pos = scm.probability({outcome: outcome_value}, interventions={treatment: t_pos})
+                p_neg = scm.probability({outcome: outcome_value}, interventions={treatment: t_neg})
+            except (KeyError, ValueError, RuntimeError):
+                logger.debug("DMN.phase3.dream: failed treatment=%s outcome=%s", treatment, outcome, exc_info=True)
+                continue
+            ate = float(p_pos - p_neg)
+            logger.debug(
+                "DMN.phase3.dream: do(%s=%s)→P(%s=%s)=%.4f vs do(%s=%s)→%.4f ate=%.4f",
+                treatment,
+                t_pos,
+                outcome,
+                outcome_value,
+                p_pos,
+                treatment,
+                t_neg,
+                p_neg,
+                ate,
+            )
+            if abs(ate) < cfg.dream_ate_insight_threshold:
+                continue
+            relation_label = scm.labels.get("positive_effect" if ate >= 0 else "negative_effect")
+            relation = relation_label or ("causes_increase" if ate >= 0 else "causes_decrease")
+            evidence = {
+                "treatment": treatment,
+                "outcome": outcome,
+                "outcome_value": outcome_value,
+                "treatment_values": [t_pos, t_neg],
+                "p_do_positive": float(p_pos),
+                "p_do_negative": float(p_neg),
+                "ate": ate,
+                "instrument": "dmn_causal_dream",
+            }
+            dedupe = f"latent_causal_insight:{treatment}->{outcome}:{relation}"
+            reflection_id = self.mind.memory.record_reflection(
+                "latent_causal_insight",
+                treatment,
+                relation,
+                f"dreamt that intervening on {treatment} {relation} {outcome} (ATE={ate:+.2f})",
+                evidence,
+                dedupe_key=dedupe,
+            )
+            if reflection_id is None:
+                continue
+            insights.append({"id": reflection_id, "kind": "latent_causal_insight", **evidence})
+            logger.info(
+                "DMN.phase3.dream.insight: id=%d %s %s %s ate=%+.3f",
+                reflection_id,
+                treatment,
+                relation,
+                outcome,
+                ate,
+            )
+
+        return {"reflections": insights, "attempts": attempts, "insights": len(insights)}
+
+    def _transitive_episode_closure(self) -> dict[str, Any]:
+        cfg = self.config
+        graph = self.mind.episode_graph
+        edges = graph.edges(min_weight=cfg.transitive_min_pair_weight)
+        if not edges:
+            return {"reflections": [], "pairs_examined": 0, "edges_added": 0}
+
+        # Index neighbors by node so we can spot A–B–C chains efficiently.
+        neighbors: dict[int, list[tuple[int, float]]] = {}
+        for lo, hi, w in edges:
+            neighbors.setdefault(lo, []).append((hi, w))
+            neighbors.setdefault(hi, []).append((lo, w))
+
+        pairs_examined = 0
+        added: list[dict[str, Any]] = []
+        text_encoder = getattr(self.mind, "text_encoder", None)
+        for hub, hub_edges in neighbors.items():
+            if len(hub_edges) < 2 or len(added) >= cfg.transitive_max_new_edges:
+                continue
+            # Sample a pair of distinct neighbors; the random thermal kick is
+            # what lets the system jump between local minima rather than
+            # rediscovering the same closures every tick.
+            sampled = self._rng.sample(hub_edges, k=min(len(hub_edges), 4))
+            for i in range(len(sampled)):
+                for j in range(i + 1, len(sampled)):
+                    a, _w_a = sampled[i]
+                    c, _w_c = sampled[j]
+                    if a == c:
+                        continue
+                    pairs_examined += 1
+                    if graph.weight(a, c) > 0.0:
+                        continue
+                    cosine = self._episode_frame_similarity(a, c, text_encoder=text_encoder)
+                    logger.debug(
+                        "DMN.phase3.transitive: hub=%d a=%d c=%d cosine=%s",
+                        hub,
+                        a,
+                        c,
+                        ("%.4f" % cosine) if cosine is not None else "n/a",
+                    )
+                    if cosine is None or cosine < cfg.transitive_cosine_threshold:
+                        continue
+                    delta = float(cosine)
+                    graph.bump(a, c, delta=delta)
+                    added.append({
+                        "lo": min(a, c),
+                        "hi": max(a, c),
+                        "via_hub": hub,
+                        "cosine": float(cosine),
+                        "weight_added": delta,
+                    })
+                    logger.info("DMN.phase3.transitive.edge: %d↔%d via %d cosine=%.4f", a, c, hub, cosine)
+                    if len(added) >= cfg.transitive_max_new_edges:
+                        break
+                if len(added) >= cfg.transitive_max_new_edges:
+                    break
+
+        reflections: list[dict] = []
+        if added:
+            reflections.append({"kind": "transitive_episode_closure", "edges": added})
+        return {"reflections": reflections, "pairs_examined": pairs_examined, "edges_added": len(added)}
+
+    def _episode_frame_similarity(self, a: int, b: int, *, text_encoder) -> float | None:
+        row_a = self.mind.journal.fetch(a)
+        row_b = self.mind.journal.fetch(b)
+        if row_a is None or row_b is None:
+            return None
+        frame_a = cognitive_frame_from_episode_row(row_a)
+        frame_b = cognitive_frame_from_episode_row(row_b)
+        text_a = " ".join(_frame_descriptor_tokens(frame_a))
+        text_b = " ".join(_frame_descriptor_tokens(frame_b))
+        if not text_a.strip() or not text_b.strip():
+            return None
+        try:
+            return float(_cosine(_text_vector(text_a, text_encoder), _text_vector(text_b, text_encoder)))
+        except (RuntimeError, ValueError):
+            logger.debug("DMN.phase3.transitive.similarity_failed a=%d b=%d", a, b, exc_info=True)
+            return None
+
+    # ------------------------------------------------------------------ REM sleep
+
+    def _rem_sleep(self) -> tuple[list[dict], dict[str, Any]]:
+        """REM-style consolidation: motor learning + causal discovery + Hawkes refit.
+
+        Runs only when the user has been idle long enough that a multi-second
+        compute spike won't affect interactive latency. Each subroutine is
+        wrapped so a failure in one doesn't block the others.
+        """
+
+        cfg = self.config
+        summary: dict[str, Any] = {}
+        reflections: list[dict] = []
+
+        # 1. Motor learning — re-train the Broca grafts on recent journals.
+        motor = {"ran": False}
+        if self.motor_trainer is not None and getattr(self.mind, "motor_replay", None):
+            replay = list(self.mind.motor_replay)[-cfg.sleep_max_replay :]
+            try:
+                step = self.motor_trainer.step(replay)
+            except Exception:
+                logger.exception("REM.motor: step failed")
+                step = {"skipped": True, "reason": "exception"}
+            motor.update(step)
+            motor["ran"] = True
+            if step.get("skipped") is False:
+                reflections.append({"kind": "rem_motor_learning", **step})
+        summary["motor"] = motor
+
+        # 2. Hawkes refit — relearn excitation matrix from recent journal events.
+        hawkes_summary: dict[str, Any] = {"ran": False}
+        try:
+            recent = self.mind.journal.recent(limit=128)
+        except Exception:
+            logger.exception("REM.hawkes: journal recent failed")
+            recent = []
+        events: list[tuple[str, float]] = []
+        for row in recent:
+            channel = str(row.get("intent", "") or "unknown")
+            ts = float(row.get("ts", 0.0))
+            events.append((channel, ts))
+        if len(events) >= cfg.sleep_hawkes_min_events:
+            channels = sorted({c for c, _ in events})
+            try:
+                mu, alpha = fit_excitation_em(events, channels, beta=self.mind.hawkes.beta)
+            except Exception:
+                logger.exception("REM.hawkes: EM fit failed")
+                mu, alpha = None, None
+            if mu is not None and alpha is not None:
+                from .hawkes import HawkesState
+
+                self.mind.hawkes.channels = list(channels)
+                self.mind.hawkes.mu = list(mu)
+                self.mind.hawkes.alpha = [list(row) for row in alpha]
+                # Fresh per-channel state caches so the relearned model decays
+                # cleanly from the moment of refit instead of carrying stale
+                # cache values from the prior excitation matrix.
+                self.mind.hawkes._states = [HawkesState(last_t=time.time()) for _ in channels]
+                try:
+                    self.mind.hawkes_persistence.save(self.mind.hawkes)
+                except Exception:
+                    logger.exception("REM.hawkes: persistence save failed")
+                hawkes_summary = {
+                    "ran": True,
+                    "channels": channels,
+                    "events": len(events),
+                    "mu_max": float(max(mu)) if mu else 0.0,
+                    "alpha_norm": float(sum(sum(abs(x) for x in row) for row in alpha)),
+                }
+                reflections.append({"kind": "rem_hawkes_refit", **hawkes_summary})
+        summary["hawkes"] = hawkes_summary
+
+        # 3. Causal discovery — re-run PC on observation memory and rebuild SCM.
+        cd_summary: dict[str, Any] = {"ran": False}
+        try:
+            observations = self._collect_observations_for_pc()
+        except Exception:
+            logger.exception("REM.causal_discovery: observation collection failed")
+            observations = []
+        if len(observations) >= cfg.sleep_min_observations_for_pc:
+            try:
+                graph = pc_algorithm(observations, alpha=cfg.sleep_pc_alpha)
+                if graph.directed_edges or graph.undirected_edges:
+                    new_scm = build_scm_from_skeleton(graph, observations)
+                    self.mind.discovered_scm = new_scm
+                    cd_summary = {
+                        "ran": True,
+                        "n_observations": len(observations),
+                        "directed_edges": [list(e) for e in sorted(graph.directed_edges)],
+                        "undirected_edges": [sorted(list(e)) for e in graph.undirected_edges],
+                        "variables": list(graph.variables),
+                    }
+                    reflections.append({"kind": "rem_causal_discovery", **cd_summary})
+            except Exception:
+                logger.exception("REM.causal_discovery: PC algorithm failed")
+        summary["causal_discovery"] = cd_summary
+
+        # 4. Persist preference + ontology to disk.
+        try:
+            self.mind.preference_persistence.save("spatial", self.mind.spatial_preference)
+            self.mind.preference_persistence.save("causal", self.mind.causal_preference)
+            self.mind.ontology_persistence.save(self.mind.ontology)
+            self.mind.conformal_calibration.persist(self.mind.relation_conformal, "relation_extraction")
+        except Exception:
+            logger.exception("REM.persist: save failed")
+
+        return reflections, summary
+
+    def _collect_observations_for_pc(self) -> list[dict[str, object]]:
+        """Build a row-per-subject observation table for PC discovery.
+
+        Each row is one subject; columns are predicates; cells are the stored
+        objects. Rows missing a column are dropped per-pair by the CI test, so
+        sparse coverage isn't fatal.
+        """
+
+        rows: list[dict[str, object]] = []
+        for subject in self.mind.memory.subjects():
+            record = {pred: obj for pred, obj, _conf, _ev in self.mind.memory.records_for_subject(subject)}
+            if record:
+                rows.append(record)
+        return rows
 
     def _loop(self) -> None:
         while not self._stop.wait(self.interval_s):
             try:
                 self.run_once()
             except Exception as exc:  # pragma: no cover - background safety net
-                logger.exception("Broca background consolidation loop failed")
+                logger.exception("Broca background DMN loop failed")
                 self.last_error = repr(exc)
 
 
@@ -1221,9 +1945,9 @@ class LexicalPlanGraft(BaseGraft):
     into hidden-state directions that the frozen language host can emit.
     """
 
-    def __init__(self, *, strength: float = 28.0):
+    def __init__(self, *, target_snr: float = DEFAULT_GRAFT_TARGET_SNR):
         super().__init__()
-        self.strength = float(strength)
+        self.target_snr = float(target_snr)
         self.mixer_priority = 2.0
         self.last_token_id: int | None = None
         self.last_token: str | None = None
@@ -1244,10 +1968,14 @@ class LexicalPlanGraft(BaseGraft):
         step = step.clamp_min(0).clamp_max(plan.shape[1] - 1)
         target_ids = plan[torch.arange(x.shape[0], device=x.device), step]
         directions = F.normalize(state["model"].lm_head.weight[target_ids].detach().to(x.device, x.dtype), dim=-1)
-        out = x.clone()
         last = state["last_indices"].to(x.device)
         rows = torch.arange(x.shape[0], device=x.device)
-        out[rows, last] += self.strength * directions
+        host_at_last = x[rows, last]
+        confidence = _state_confidence(state)
+        inertia = _state_inertia(state)
+        magnitude = snr_magnitude(host_at_last, target_snr=self.target_snr, confidence=confidence, inertia=inertia)
+        out = x.clone()
+        out[rows, last] += directions * magnitude
         self.last_token_id = int(target_ids[0].item())
         tok = getattr(state.get("tokenizer", None), "decode_id", None)
         self.last_token = tok(self.last_token_id) if callable(tok) else None
@@ -1261,11 +1989,11 @@ class TrainableBrocaGraft(BaseGraft):
     faculty-state vector plus a production step into the residual stream.
     """
 
-    def __init__(self, d_features: int, d_model: int, *, max_steps: int = 10, step_dim: int = 16, hidden: int = 160, strength: float = 1.0):
+    def __init__(self, d_features: int, d_model: int, *, max_steps: int = 10, step_dim: int = 16, hidden: int = 160, target_snr: float = DEFAULT_GRAFT_TARGET_SNR):
         super().__init__()
         self.d_features = int(d_features)
         self.max_steps = int(max_steps)
-        self.strength = float(strength)
+        self.target_snr = float(target_snr)
         self.mixer_priority = 0.35
         self.norm = nn.LayerNorm(d_features)
         self.step_emb = nn.Embedding(max_steps, step_dim)
@@ -1296,31 +2024,47 @@ class TrainableBrocaGraft(BaseGraft):
             step = torch.full((x.shape[0],), int(step), device=x.device, dtype=torch.long)
         step = step.to(x.device).long().view(-1).clamp(0, self.max_steps - 1)
         z = torch.cat([self.norm(feats), self.step_emb(step).to(device=x.device, dtype=param_dtype)], dim=-1)
-        delta = (self.net(z) * self.strength).to(device=x.device, dtype=x.dtype)
-        out = x.clone()
         last = state["last_indices"].to(x.device)
         rows = torch.arange(x.shape[0], device=x.device)
-        out[rows, last] += delta
+        host_at_last = x[rows, last]
+        direction = F.normalize(self.net(z).to(device=x.device, dtype=x.dtype), dim=-1)
+        confidence = _state_confidence(state)
+        inertia = _state_inertia(state)
+        magnitude = snr_magnitude(host_at_last, target_snr=self.target_snr, confidence=confidence, inertia=inertia)
+        out = x.clone()
+        out[rows, last] += direction * magnitude
         return out
 
 
 class SubstrateLogitBiasGraft(BaseGraft):
-    """Additive logit bias on substrate-supplied vocabulary IDs.
+    """Dynamic, context-aware logit bias on substrate-supplied vocabulary IDs.
 
-    Wired into the host's ``logits`` slot. The cognitive substrate fills two
-    optional state keys:
+    Wired into the host's ``logits`` slot. The cognitive substrate supplies the
+    set of token ids it wants to surface; the graft itself derives the actual
+    push at every step from the host's current logit distribution so the bias
+    is meaningful regardless of how confident the LLM happens to be.
 
-      ``broca_logit_bias`` — ``Mapping[int, float]`` of additive bonuses (in
-      nats) applied to the listed token ids at the last position of every batch.
-      ``broca_logit_bias_decay`` — scalar multiplier applied to every bonus
-      this step. Callers typically anneal it to zero over the first few
-      generation steps so content tokens are surfaced early without being
-      hammered into every position.
+    State keys it reads (all optional except ``broca_logit_bias``):
 
-    This is the Broca-correct soft steering signal: the substrate raises the
-    LLM's prior over content tokens it wants to see (subject, predicate,
-    answer subwords), and the LLM still chooses fluency, ordering, syntax —
-    no plan-forcing, no surface-form puppetry.
+      ``broca_logit_bias`` — ``Mapping[int, float]`` of base nat-scale bonuses.
+      ``broca_logit_bias_decay`` — semantic multiplier (typically 1.0 until the
+        target concept has appeared in the prefix, then collapses).
+      ``substrate_confidence`` — scalar in [0, 1] from the substrate frame.
+      ``substrate_inertia`` — log1p(prefix length); how much momentum the LLM
+        has built up that the bias must shout over.
+
+    The dynamic push has two parts:
+      1. ``target_boost = max(0, max_logit - target_logit) * confidence``
+         — drag the target up to (and past) the current top logit, scaled by
+         how strongly the substrate believes in the answer.
+      2. ``stubborn_push = stubbornness * base_bonus``
+         — augment with a structural bonus where ``stubbornness`` is the
+         normalized peakedness of the distribution (1.0 when the LLM is a
+         delta, ≈0 when it is uniform). A confident-but-wrong LLM gets a
+         bigger nudge than an indecisive one.
+      The combined value is then scaled by ``decay`` (semantic) and
+      ``inertia`` (sequence-length) so the bias keeps up with autoregressive
+      momentum until the target concept actually appears.
     """
 
     def __init__(self):
@@ -1340,14 +2084,35 @@ class SubstrateLogitBiasGraft(BaseGraft):
             decay = 1.0
         if decay <= 0.0:
             return x
+
+        confidence = float(_state_confidence(state))
+        confidence = max(0.0, min(1.0, confidence))
+        inertia = float(_state_inertia(state))
+        if inertia <= 0.0:
+            return x
+
         out = x.clone()
         last = state["last_indices"].to(x.device)
         rows = torch.arange(x.shape[0], device=x.device)
+
+        last_logits = out[rows, last].float()                           # [B, V]
+        max_logit = last_logits.max(dim=-1, keepdim=True).values         # [B, 1]
+        log_probs = F.log_softmax(last_logits, dim=-1)
+        probs = log_probs.exp()
+        entropy_val = -(probs * log_probs).sum(dim=-1)                   # [B]
+        log_vocab = math.log(max(2, last_logits.shape[-1]))
+        # peakedness ∈ [0, 1]: 1.0 when distribution is a delta, ~0 when uniform
+        stubbornness = (1.0 - entropy_val / log_vocab).clamp(0.0, 1.0).unsqueeze(-1)
+
         for token_id, bonus in bias.items():
             tid = int(token_id)
             if tid < 0 or tid >= out.shape[-1]:
                 continue
-            out[rows, last, tid] = out[rows, last, tid] + decay * float(bonus)
+            cur = last_logits[:, tid:tid + 1]                            # [B, 1]
+            target_boost = (max_logit - cur).clamp_min(0.0) * confidence
+            stubborn_push = stubbornness * float(bonus)
+            delta = ((target_boost + stubborn_push) * decay * inertia).to(out.dtype)
+            out[rows, last, tid] = out[rows, last, tid] + delta.squeeze(-1)
         return out
 
 
@@ -1368,10 +2133,17 @@ def _batch_from_ids(rows: Sequence[Sequence[int]], pad_id: int, *, device: torch
     return ids, mask, lengths
 
 
-def default_lexical_strength(model: nn.Module) -> float:
-    cfg = getattr(model, "cfg", None)
-    d_model = float(getattr(cfg, "d_model", 96))
-    return 30.0 * (d_model / 96.0) ** 0.5
+def default_lexical_target_snr(model: nn.Module) -> float:
+    """Target SNR for the lexical Broca graft.
+
+    Geometry-independent: the graft injects ``target_snr`` × host RMS energy
+    along the planned token direction, so the same fraction works regardless of
+    ``d_model``. The argument is accepted for API compatibility with callers
+    that still want to inspect the host's configuration.
+    """
+
+    _ = model
+    return DEFAULT_GRAFT_TARGET_SNR
 
 
 def decode_generation(tokenizer: Any, generated: Sequence[int]) -> str:
@@ -1667,7 +2439,7 @@ class BrocaMind:
         llama_model_id: str | None = None,
         device: torch.device | str | None = None,
         hf_token: str | bool | None = None,
-        lexical_strength: float | None = None,
+        lexical_target_snr: float | None = None,
     ):
         self.seed = seed
         resolved_device = device if isinstance(device, torch.device) else pick_torch_device(device)
@@ -1678,13 +2450,13 @@ class BrocaMind:
         self._last_journal_id: int | None = None
         self.host, self.tokenizer = load_llama_broca_host(mid, device=resolved_device, token=hf_token)
         self.text_encoder = frozen_subword_projector_from_model(self.host, self.tokenizer)
-        graft_strength = lexical_strength if lexical_strength is not None else default_lexical_strength(self.host)
-        self.lexical_graft = LexicalPlanGraft(strength=graft_strength)
+        snr = lexical_target_snr if lexical_target_snr is not None else default_lexical_target_snr(self.host)
+        self.lexical_graft = LexicalPlanGraft(target_snr=snr)
         self.host.add_graft("final_hidden", self.lexical_graft)
         self.feature_graft = TrainableBrocaGraft(
             COGNITIVE_FRAME_DIM,
             int(getattr(self.host.cfg, "d_model", 96)),
-            strength=0.1,
+            target_snr=snr,
         )
         params = getattr(self.host, "parameters", None)
         if callable(params):
@@ -1704,6 +2476,44 @@ class BrocaMind:
         self.unified_agent = CoupledEFEAgent(self.active_agent, self.causal_agent)
         self._background_worker: CognitiveBackgroundWorker | None = None
 
+        # New substrates ----------------------------------------------------
+        d_model = int(getattr(self.host.cfg, "d_model", 96))
+        self.vsa = VSACodebook(dim=10_000, base_seed=int(seed))
+        self.hopfield_memory = HopfieldAssociativeMemory(d_model=d_model, max_items=65_536)
+        self.conformal_calibration = PersistentConformalCalibration(Path(db_path), namespace=f"{namespace}__conformal")
+        self.relation_conformal = ConformalPredictor(alpha=0.1, method="lac", min_calibration=8)
+        self.conformal_calibration.hydrate(self.relation_conformal, channel="relation_extraction")
+        # Hawkes channels are populated lazily by ``observe_event`` so the
+        # excitation matrix grows with the user's vocabulary instead of being
+        # hardcoded.
+        self.hawkes_persistence = PersistentHawkes(Path(db_path), namespace=f"{namespace}__hawkes")
+        loaded = self.hawkes_persistence.load()
+        self.hawkes = loaded if loaded is not None else MultivariateHawkesProcess(beta=0.5, baseline=0.05)
+        # One Dirichlet preference per active-inference faculty.
+        self.preference_persistence = PersistentPreference(Path(db_path), namespace=f"{namespace}__pref")
+        self.spatial_preference = self.preference_persistence.load("spatial") or DirichletPreference(
+            len(self.pomdp.observation_names),
+            initial_C=list(self.pomdp.C),
+            prior_strength=4.0,
+        )
+        self.causal_preference = self.preference_persistence.load("causal") or DirichletPreference(
+            len(self.causal_pomdp.observation_names),
+            initial_C=list(self.causal_pomdp.C),
+            prior_strength=4.0,
+        )
+        self._sync_preference_to_pomdp()
+        # Hebbian-promoted ontology axes share the sketch dimension.
+        self.ontology_persistence = PersistentOntologicalRegistry(Path(db_path), namespace=f"{namespace}__ontology")
+        self.ontology = self.ontology_persistence.load(dim=SKETCH_DIM, frequency_threshold=8)
+        # Causal-discovery learns a fresh SCM from observation data when DMN
+        # decides the user has accumulated enough coherent variables to
+        # justify rebuilding the model. The learned SCM is kept separate from
+        # the bootstrap Simpson model so it is easy to A/B in benchmarks.
+        self.discovered_scm: Any = None
+        # Replay buffer for motor learning. Each item is one chat turn the
+        # substrate produced; the trainer pulls items from here at REM time.
+        self.motor_replay: list[dict] = []
+
     @property
     def background_worker(self) -> CognitiveBackgroundWorker | None:
         return self._background_worker
@@ -1713,11 +2523,74 @@ class BrocaMind:
         logger.debug("BrocaMind.consolidate_once: reflections=%d", len(out))
         return out
 
-    def start_background(self, *, interval_s: float = 5.0) -> CognitiveBackgroundWorker:
+    # -- New substrate plumbing -----------------------------------------------
+
+    def _sync_preference_to_pomdp(self) -> None:
+        """Push the Dirichlet means into the live POMDPs' C vectors."""
+
+        try:
+            self.pomdp.C = list(self.spatial_preference.expected_C())
+        except (AttributeError, TypeError):
+            logger.exception("BrocaMind._sync_preference_to_pomdp: spatial sync failed")
+        try:
+            self.causal_pomdp.C = list(self.causal_preference.expected_C())
+        except (AttributeError, TypeError):
+            logger.exception("BrocaMind._sync_preference_to_pomdp: causal sync failed")
+
+    def observe_user_feedback(self, *, faculty: str, observation_index: int, polarity: float, weight: float = 1.0, reason: str = "") -> None:
+        """Forward user feedback into the right Dirichlet preference and sync."""
+
+        target = self.spatial_preference if faculty == "spatial" else self.causal_preference
+        target.update(observation_index, polarity=polarity, weight=weight, reason=reason)
+        self._sync_preference_to_pomdp()
+        try:
+            self.preference_persistence.save(faculty, target)
+        except (sqlite3.Error, OSError):
+            logger.exception("BrocaMind.observe_user_feedback: preference save failed")
+
+    def observe_event(self, channel: str, *, t: float | None = None) -> None:
+        """Record an event on the Hawkes layer (used by the conversational loop)."""
+
+        self.hawkes.observe(channel, t=t)
+
+    def encode_triple_vsa(self, subject: str, predicate: str, obj: str) -> torch.Tensor:
+        """Compose a hypervector representation of (subject, predicate, object).
+
+        The VSA bundle is independent of the LLM's tokenizer and lets the
+        substrate do role-filler algebra on facts without round-tripping
+        through subwords.
+        """
+
+        return self.vsa.encode_triple(subject, predicate, obj)
+
+    def vector_for_concept(self, name: str, *, base_sketch: torch.Tensor | None = None) -> torch.Tensor:
+        """Return the substrate's preferred vector for a concept name.
+
+        Routes through the ontology registry so frequent concepts use their
+        promoted orthogonal axis; less-frequent ones still use the hashed
+        sketch. Always observes the access (so the next call can flip
+        promotion).
+        """
+
+        self.ontology.observe(name)
+        sketch = base_sketch if base_sketch is not None else stable_sketch(name, dim=SKETCH_DIM)
+        promoted = self.ontology.maybe_promote(name, sketch)
+        if promoted is not None:
+            return promoted.axis
+        return F.normalize(sketch.detach().to(torch.float32).flatten(), dim=0)
+
+    def start_background(
+        self,
+        *,
+        interval_s: float = 5.0,
+        config: DMNConfig | None = None,
+    ) -> CognitiveBackgroundWorker:
         if self._background_worker is None:
-            self._background_worker = CognitiveBackgroundWorker(self, interval_s=interval_s)
+            self._background_worker = CognitiveBackgroundWorker(self, interval_s=interval_s, config=config)
         else:
             self._background_worker.interval_s = max(0.1, float(interval_s))
+            if config is not None:
+                self._background_worker.config = config
         self._background_worker.start()
         return self._background_worker
 
@@ -1759,6 +2632,27 @@ class BrocaMind:
         self._intrinsic_scan(toks)
         frame = self.router.route(self, utterance, toks)
         out = self._commit_frame(utterance, toks, frame)
+        # Tell the Hawkes layer that this intent fired so its working memory
+        # heats up the relevant channels for the next few seconds.
+        try:
+            self.hawkes.observe(str(out.intent or "unknown"))
+        except Exception:
+            logger.exception("comprehend: hawkes observe failed")
+        # Tell the DMN the user is active so REM doesn't fire mid-conversation.
+        if self._background_worker is not None:
+            self._background_worker.mark_user_active()
+        # Promote frequent concepts to dedicated orthogonal axes.
+        for concept in (out.subject, out.answer):
+            if isinstance(concept, str) and concept and concept != "unknown":
+                self.ontology.observe(concept)
+                base = stable_sketch(concept, dim=SKETCH_DIM)
+                self.ontology.maybe_promote(concept, base)
+        # Bind the triple into the VSA codebook for algebraic recall.
+        if out.subject and out.answer and out.intent in {"memory_write", "memory_lookup"}:
+            try:
+                self.vsa.encode_triple(out.subject, str((out.evidence or {}).get("predicate", out.intent)), out.answer)
+            except Exception:
+                logger.exception("comprehend: vsa encode failed")
         logger.debug(
             "comprehend: intent=%s confidence=%s journal_id=%s",
             out.intent,
@@ -1866,19 +2760,19 @@ class BrocaMind:
 
         broca_features = frame.to_features(self.text_encoder) if frame.intent != "unknown" else None
         logit_bias = self._content_logit_bias(frame)
+        confidence = max(0.0, min(1.0, float(frame.confidence)))
+        eff_temperature = max(
+            1e-3,
+            float(temperature) * self._substrate_temperature_scale(frame, confidence),
+        )
         logger.debug(
-            "chat_reply: intent=%s bias_tokens=%d has_broca_features=%s eff_temp_will_be_scaled=%s",
+            "chat_reply: intent=%s bias_tokens=%d has_broca_features=%s confidence=%.3f eff_temperature=%.3f",
             frame.intent,
             len(logit_bias),
             broca_features is not None,
-            frame.intent != "unknown",
+            confidence,
+            eff_temperature,
         )
-
-        confidence = max(0.0, min(1.0, float(frame.confidence)))
-        if frame.intent == "unknown":
-            eff_temperature = max(1e-3, float(temperature))
-        else:
-            eff_temperature = max(1e-3, float(temperature) * (1.0 - 0.6 * confidence))
 
         text = self._stream_substrate_chat(
             msgs,
@@ -1889,16 +2783,54 @@ class BrocaMind:
             temperature=eff_temperature,
             top_p=float(top_p),
             on_token=on_token,
+            substrate_confidence=confidence,
         )
         return frame, text
 
-    def _content_logit_bias(
-        self,
-        frame: CognitiveFrame,
-        *,
-        bonus: float = 2.5,
-    ) -> dict[int, float]:
-        """Map substrate content (subject / predicate / answer) to subword logit bonuses."""
+    def _substrate_temperature_scale(self, frame: CognitiveFrame, confidence: float) -> float:
+        """Sampling temperature multiplier derived from substrate posterior entropy.
+
+        Couples the LLM's decoding entropy to the active-inference faculty's
+        posterior over policies: when the substrate is confused (high
+        normalized entropy) the LLM is given headroom to explore; when the
+        substrate has collapsed onto a single policy the LLM samples nearly
+        greedily so it cannot drift away from the decided answer.
+        """
+
+        if frame.intent == "unknown":
+            return 1.0
+        try:
+            coupled = self.unified_agent.decide()
+        except (RuntimeError, ValueError, IndexError):
+            logger.debug("_substrate_temperature_scale: unified_agent.decide() unavailable")
+            return max(1e-3, 1.0 - 0.6 * float(confidence))
+        if coupled.faculty == "spatial":
+            posterior = list(coupled.spatial_decision.posterior_over_policies)
+        else:
+            posterior = list(coupled.causal_decision.posterior_over_policies)
+        n = len(posterior)
+        if n < 2:
+            return max(1e-3, 1.0 - 0.6 * float(confidence))
+        h_q = belief_entropy(posterior)
+        h_max = math.log(n)
+        if h_max <= 1e-9:
+            return max(1e-3, 1.0 - 0.6 * float(confidence))
+        normalized_uncertainty = max(0.0, min(1.0, h_q / h_max))
+        # Multiplicatively combine the substrate's posterior entropy with the
+        # frame's own confidence so both signals can pull temperature down.
+        return max(1e-3, normalized_uncertainty * (1.0 - 0.6 * float(confidence)))
+
+    def _content_logit_bias(self, frame: CognitiveFrame) -> dict[int, float]:
+        """Map substrate content (subject / predicate / answer) to subword token ids.
+
+        The numeric value attached to each token is a *base bonus* that the
+        :class:`SubstrateLogitBiasGraft` interprets dynamically: it is scaled
+        per step by the host's current peakedness, the substrate's confidence,
+        and the autoregressive inertia, so callers do not need to guess a
+        magnitude that wins against an arbitrary LLM. A unit base bonus is
+        therefore the right choice — bias importance comes from the substrate
+        frame, not from a hand-tuned scalar.
+        """
 
         if frame.intent == "unknown":
             return {}
@@ -1927,7 +2859,7 @@ class BrocaMind:
             for tid in ids:
                 if tid < 0:
                     continue
-                bias[tid] = max(bias.get(tid, 0.0), float(bonus))
+                bias[tid] = max(bias.get(tid, 0.0), 1.0)
         return bias
 
     def _stream_substrate_chat(
@@ -1941,6 +2873,7 @@ class BrocaMind:
         temperature: float,
         top_p: float,
         on_token: Callable[[str], None] | None,
+        substrate_confidence: float = 1.0,
     ) -> str:
         hf_tok = getattr(self.tokenizer, "inner", None)
         if hf_tok is None or not callable(getattr(hf_tok, "apply_chat_template", None)):
@@ -1959,24 +2892,38 @@ class BrocaMind:
         generated: list[int] = []
         bias_active = bool(logit_bias)
         feature_tensor = broca_features.to(device) if broca_features is not None else None
+        target_token_set = {int(t) for t in logit_bias.keys()} if bias_active else set()
+        target_emitted = False
 
         logger.debug(
-            "_stream_substrate_chat: prompt_len=%d max_new_tokens=%d bias_active=%s feature_active=%s",
+            "_stream_substrate_chat: prompt_len=%d max_new_tokens=%d bias_active=%s feature_active=%s confidence=%.3f",
             int(prompt.shape[1]),
             int(max_new_tokens),
             bias_active,
             feature_tensor is not None,
+            float(substrate_confidence),
         )
         with torch.no_grad():
             for step in range(max(1, int(max_new_tokens))):
                 row_t = torch.tensor([current], device=device, dtype=torch.long)
                 mask_t = torch.ones_like(row_t, dtype=torch.bool)
-                extra: dict[str, Any] = {"tokenizer": self.tokenizer}
+                # Inertia grows with the autoregressive prefix so the bias and
+                # SNR-targeted grafts can shout over a long babbling tail.
+                inertia = math.log1p(float(len(current)))
+                extra: dict[str, Any] = {
+                    "tokenizer": self.tokenizer,
+                    "substrate_confidence": float(substrate_confidence),
+                    "substrate_inertia": float(inertia),
+                }
                 if feature_tensor is not None:
                     extra["broca_features"] = feature_tensor
                 if bias_active:
+                    # Semantic decay: full strength until any target subword is
+                    # emitted, then fall away so the LLM is free to finish the
+                    # reply naturally without being hammered into repeating it.
+                    semantic_decay = 0.15 if target_emitted else 1.0
                     extra["broca_logit_bias"] = logit_bias
-                    extra["broca_logit_bias_decay"] = max(0.0, 1.0 - step / 6.0)
+                    extra["broca_logit_bias_decay"] = semantic_decay
                 logits = self.host(row_t, mask_t, extra_state=extra)
                 last_pos = row_t.shape[1] - 1
                 logits_row = logits[0, last_pos].float()
@@ -1999,6 +2946,8 @@ class BrocaMind:
                     break
                 generated.append(pred)
                 current.append(pred)
+                if bias_active and not target_emitted and pred in target_token_set:
+                    target_emitted = True
                 if on_token is not None:
                     piece = hf_tok.decode([pred], skip_special_tokens=True, clean_up_tokenization_spaces=False)
                     if piece:

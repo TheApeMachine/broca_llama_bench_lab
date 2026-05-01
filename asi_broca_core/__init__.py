@@ -15,6 +15,7 @@ from .broca import (
     BrocaMind,
     CognitiveBackgroundWorker,
     CognitiveFrame,
+    DMNConfig,
     IntrinsicCue,
     PersistentSemanticMemory,
     TrainableBrocaGraft,
@@ -37,6 +38,15 @@ from .continuous_frame import (
     semantic_subword_sketch,
     stable_sketch,
 )
+from .vsa import VSACodebook, bind, unbind, bundle, permute, hypervector, cosine as vsa_cosine, cleanup
+from .hopfield import HopfieldAssociativeMemory, hopfield_update, derived_inverse_temperature
+from .vision import VisionEncoder
+from .conformal import ConformalPredictor, ConformalSet, PersistentConformalCalibration, empirical_coverage
+from .hawkes import MultivariateHawkesProcess, PersistentHawkes, fit_excitation_em
+from .motor_learning import GraftMotorTrainer, MotorLearningConfig
+from .preference_learning import DirichletPreference, PersistentPreference, feedback_polarity_from_text
+from .ontological_expansion import OntologicalRegistry, PersistentOntologicalRegistry, gram_schmidt_orthogonalize
+from .causal_discovery import pc_algorithm, build_scm_from_skeleton, DiscoveredGraph
 
 __all__ = [
     "configure_lab_logging",
@@ -50,6 +60,7 @@ __all__ = [
     "BrocaMind",
     "CognitiveBackgroundWorker",
     "CognitiveFrame",
+    "DMNConfig",
     "IntrinsicCue",
     "PersistentSemanticMemory",
     "WorkspaceJournal",
@@ -79,6 +90,36 @@ __all__ = [
     "pack_cognitive_frame",
     "semantic_subword_sketch",
     "stable_sketch",
+    "VSACodebook",
+    "bind",
+    "unbind",
+    "bundle",
+    "permute",
+    "hypervector",
+    "vsa_cosine",
+    "cleanup",
+    "HopfieldAssociativeMemory",
+    "hopfield_update",
+    "derived_inverse_temperature",
+    "VisionEncoder",
+    "ConformalPredictor",
+    "ConformalSet",
+    "PersistentConformalCalibration",
+    "empirical_coverage",
+    "MultivariateHawkesProcess",
+    "PersistentHawkes",
+    "fit_excitation_em",
+    "GraftMotorTrainer",
+    "MotorLearningConfig",
+    "DirichletPreference",
+    "PersistentPreference",
+    "feedback_polarity_from_text",
+    "OntologicalRegistry",
+    "PersistentOntologicalRegistry",
+    "gram_schmidt_orthogonalize",
+    "pc_algorithm",
+    "build_scm_from_skeleton",
+    "DiscoveredGraph",
 ]
 
 configure_lab_logging()
