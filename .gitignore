@@ -14,3 +14,8 @@ main.log
 main.out
 paper/build/
 .claude/
+paper/main.fdb_latexmk
+paper/main.fls
+paper/include/experiment/hf_native_accuracy_by_task.pdf
+paper/main.pdf
+*.egg-info/

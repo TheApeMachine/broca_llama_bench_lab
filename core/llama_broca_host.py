@@ -1,4 +1,3 @@
-
 """Frozen Llama-family hosts with Broca graft slots.
 
 Loads ``meta-llama/Llama-3.2-1B-Instruct`` through Hugging Face transformers.
@@ -414,7 +413,9 @@ def load_llama_broca_host(
     try:
         from transformers import AutoModelForCausalLM, AutoTokenizer
     except ImportError as e:  # pragma: no cover
-        raise ImportError("Llama backend requires transformers; pip install -r requirements-benchmark.txt") from e
+        raise ImportError(
+            'Llama backend requires transformers; run `uv sync --extra benchmark` or `pip install -e ".[benchmark]"`.'
+        ) from e
 
     dev = device if isinstance(device, torch.device) else pick_torch_device(device)
     tk = resolve_hf_hub_token(token)

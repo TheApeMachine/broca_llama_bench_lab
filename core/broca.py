@@ -628,7 +628,7 @@ class PersistentSemanticMemory:
         """Lazy single connection per memory store (WAL, safe across threads via lock)."""
 
         if self._conn is None:
-            self._conn = sqlite3.connect(str(self.path), check_same_thread=False, timeout=30.0)
+            self._conn = sqlite3.connect(str(self.path), check_same_thread=False, timeout=30.0, isolation_level=None)
             self._conn.execute("PRAGMA journal_mode=WAL")
             try:
                 self._conn.execute("PRAGMA busy_timeout=60000")

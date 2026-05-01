@@ -1,6 +1,34 @@
 \subsection{Standard NLP Benchmarks}
 \label{subsec:exp-hf-native}
 
-\paragraph{Status.}
-This block could not be refreshed automatically: \texttt{skipped (PAPER\_SKIP\_NATIVE)}.
-Run \texttt{make paper-bench} with benchmark extras and \texttt{HF\_TOKEN} if needed.
+\paragraph{Protocol.}
+We evaluate the frozen language organ on publicly available NLP benchmarks using the in-repository HuggingFace \texttt{datasets} harness. Multiple-choice items are scored by length-normalized continuation log-likelihood; generation-style items use deterministic greedy decode with normalized exact matching. The evaluation checkpoint is \texttt{meta-llama/Llama-3.2-1B-Instruct}, run on tasks \texttt{boolq, piqa, arc\_easy, winogrande} with limit $= 50$ items per task and seed $= 0$ (UTC~\texttt{20260501T161127Z}).
+
+\begin{table}[htbp]
+\centering
+\caption{Per-task accuracy for the vanilla causal LM decoder, with macro and micro averages.}
+\label{tab:hf-native-vanilla}
+\input{include/experiment/hf_native_vanilla_table}
+\end{table}
+
+\begin{table}[htbp]
+\centering
+\caption{Paired comparison: vanilla decoder vs.\ LlamaBrocaHost shell (identical weights, same items).}
+\label{tab:hf-native-broca-shell}
+\input{include/experiment/hf_native_comparison_table}
+\end{table}
+
+\begin{figure}[htbp]
+\centering
+\includegraphics[width=0.92\linewidth]{hf_native_accuracy_by_task.pdf}
+\caption{Per-task accuracy bar chart for the standard NLP benchmark suite.}
+\label{fig:hf-native-acc}
+\end{figure}
+
+\paragraph{Results.}
+Table~\ref{tab:hf-native-vanilla} reports per-task accuracy for \texttt{meta-llama/Llama-3.2-1B-Instruct} across 4 standard NLP benchmarks totalling $n = 200$ items. 
+The macro-averaged accuracy is 67.0\% (micro: 67.0\%), placing the frozen decoder in the modest range for its parameter class. 
+Performance varies substantially across tasks: \texttt{boolq} achieves 78.0\%, while \texttt{winogrande} reaches only 60.0\% (a spread of 18.0\%). 
+Table~\ref{tab:hf-native-broca-shell} pairs each task with its \texttt{LlamaBrocaHost}-wrapped score on the same items and checkpoint. The macro-averaged delta is +0.0000, which is negligible: 
+the Broca shell preserves the frozen model's leaderboard scores within measurement noise, confirming that the graft infrastructure does not degrade standard benchmark accuracy when no substrate signal is injected. 
+

@@ -406,5 +406,3 @@ class SQLiteActivationMemory:
             tuple(spread.shape) if spread.numel() else None,
         )
         return len(records)
-
-

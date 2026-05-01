@@ -12,7 +12,7 @@ We evaluate 8 capabilities that are unique to the cognitive substrate and not ca
 \end{table}
 
 \paragraph{Results.}
-The substrate benchmark suite exercises 8 capabilities that are orthogonal to standard NLP benchmarks. Of these, 8 pass their success criteria (pass rate: 100.0\%) in a total wall-clock time of 1.3s. We discuss each benchmark below.
+The substrate benchmark suite exercises 8 capabilities that are orthogonal to standard NLP benchmarks. Of these, 8 pass their success criteria (pass rate: 100.0\%) in a total wall-clock time of 0.5s. We discuss each benchmark below.
 
 \textit{Rule-shift adaptation.} The belief-revision engine is seeded with 5 corroborating claims for ``\texttt{rome}'' and then presented with 8 low-surprise challenger claims for ``\texttt{paris}.''\ 
 The stored belief successfully revises to the challenger value, confirming that the log-odds-based consolidation engine with prediction-gap-weighted trust correctly implements online Bayesian belief revision.
@@ -38,7 +38,7 @@ The monotone increase with dimensionality confirms the theoretical capacity boun
 Retrieval accuracy (cosine $> 0.8$): $N = 10$: 100.0\%; $N = 50$: 72.0\%; $N = 100$: 84.0\%; $N = 500$: 52.0\%. 
 Exponential capacity in $d$ (Ramsauer et al., 2020) is confirmed.
 
-\textit{Active-inference decision quality.} The EFE-driven Tiger POMDP agent is evaluated over 200 episodes (max 3 steps each) against a uniform random baseline. The agent achieves a success rate of 50.0\% vs.\ 42.5\% for random (advantage: +0.0750; mean return: -0.5005 vs.\ -0.6508). 
+\textit{Active-inference decision quality.} The EFE-driven Tiger POMDP agent is evaluated over 200 episodes (max 3 steps each) against a uniform random baseline. The agent achieves a success rate of 87.0\% vs.\ 42.5\% for random (advantage: +0.4450; mean return: 0.6000 vs.\ -0.6508). 
 The positive advantage confirms that Expected Free Energy minimization produces systematically better decisions than random exploration.
 
 

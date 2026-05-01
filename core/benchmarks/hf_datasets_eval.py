@@ -314,7 +314,9 @@ def load_task_examples(
     try:
         from datasets import load_dataset
     except ImportError as exc:  # pragma: no cover - depends on benchmark extra
-        raise ImportError("Native benchmarks require `datasets`; install with `pip install -r requirements-benchmark.txt`.") from exc
+        raise ImportError(
+            "Native benchmarks require `datasets`; run `uv sync --extra benchmark` or `pip install -e \".[benchmark]\"`."
+        ) from exc
 
     spec = TASK_REGISTRY[task_name]
     split_name = split or spec.split
@@ -414,7 +416,9 @@ class HFLocalCausalLM:
             quiet_transformers_benchmark_log_warnings()
             from transformers import AutoModelForCausalLM, AutoTokenizer
         except ImportError as exc:  # pragma: no cover - depends on benchmark extra
-            raise ImportError("Native benchmarks require `transformers`; install with `pip install -r requirements-benchmark.txt`.") from exc
+            raise ImportError(
+                "Native benchmarks require `transformers`; run `uv sync --extra benchmark` or `pip install -e \".[benchmark]\"`."
+            ) from exc
 
         self.device = device if isinstance(device, torch.device) else pick_torch_device(device)
         self.model_id = model_id

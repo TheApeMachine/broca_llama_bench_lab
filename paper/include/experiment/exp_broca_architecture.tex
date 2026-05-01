@@ -1,4 +1,26 @@
 \subsection{Broca Architecture Probes}
 \label{subsec:exp-broca-arch}
-\paragraph{Status.} Architecture probe results are not available.
-Run with a Llama-class checkpoint and \texttt{HF\_TOKEN} to populate this section.
+
+\paragraph{Protocol.}
+We compare the bare frozen language host (\texttt{meta-llama/Llama-3.2-1B-Instruct}) against the full Broca cognitive substrate on scripted evaluation cases. Each case presents a prompt to both conditions and scores the output on two metrics: \emph{speech-exact} (verbatim match against the substrate's reference utterance) and \emph{answer-present} (the correct content word appears anywhere in the output). The baseline arm disables all grafts; the enhanced arm activates the full stack (semantic memory, active-inference agents, causal SCM, and all three graft types).
+
+\begin{table}[htbp]
+\centering
+\caption{Architecture probe metrics: bare frozen LM vs.\ full Broca cognitive substrate.}
+\label{tab:broca-arch-probes}
+\begin{tabular}{lcc}
+\toprule
+Condition & Speech-exact & Answer-present \\
+\midrule
+Baseline (frozen LM) & $0.000$ & $0.000$ \\
+Broca-enhanced & $0.000$ & $0.000$ \\
+$\Delta$ (Broca $-$ baseline) & $0.000$ & $0.000$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\paragraph{Results.}
+Table~\ref{tab:broca-arch-probes} compares the bare frozen language host (\texttt{meta-llama/Llama-3.2-1B-Instruct}) against the full Broca architecture on 2 scripted evaluation cases spanning semantic memory recall, active-inference action selection, and causal intervention queries. 
+Both conditions achieve comparable speech-exact accuracy (baseline: 0.0\%, enhanced: 0.0\%). 
+Answer-present accuracy (a relaxed metric accepting any output that contains the correct content word) shows a similar pattern: baseline 0.0\% vs.\ enhanced 0.0\% ($\Delta = +0.000$). 
+

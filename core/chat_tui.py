@@ -40,7 +40,9 @@ try:
     from textual import work
 except ImportError as exc:  # pragma: no cover
     raise SystemExit(
-        "core.chat_tui requires Textual. Install with:\n\n  pip install -r requirements-tui.txt\n"
+        "core.chat_tui requires Textual. Install with:\n\n"
+        "  uv sync --extra tui\n"
+        "  # or: pip install -e \".[tui]\"\n"
     ) from exc
 
 from .broca import BrocaMind
@@ -539,7 +541,7 @@ def _build_parser() -> argparse.ArgumentParser:
         default=os.environ.get("MODEL_ID", "meta-llama/Llama-3.2-1B-Instruct"),
         help="HF model id (default: MODEL_ID env or Llama-3.2-1B-Instruct).",
     )
-    p.add_argument("--device", default=os.environ.get("ASI_DEVICE"), help="Torch device override (cpu, mps, cuda:0).")
+    p.add_argument("--device", default=os.environ.get("M_DEVICE"), help="Torch device override (cpu, mps, cuda:0).")
     p.add_argument(
         "--token",
         default=None,

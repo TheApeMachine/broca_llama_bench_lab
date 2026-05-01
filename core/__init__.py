@@ -1,4 +1,4 @@
-__version__ = "0.5.0-llama-bench"
+__version__ = "0.6.1-mosaic"
 
 import os
 from typing import Any

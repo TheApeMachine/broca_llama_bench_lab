@@ -60,14 +60,14 @@ memory · active inference · causal substrate · workspace
 ## Quick start
 
 ```bash
-# Tiny tests, demos, no model download:
-pip install -r requirements.txt
+# Bootstrap .venv and install deps (torch, HF stack, Textual, pytest) via uv:
+make install
 
-# Real Llama + HuggingFace datasets:
-pip install -r requirements-benchmark.txt
+# Or manually: python3 -m venv .venv && source .venv/bin/activate &&
+#   uv sync --extra tui --extra test
 
-# Live TUI on top of the full substrate:
-pip install -r requirements-tui.txt
+# Pip-only editable install:
+# pip install -e ".[tui,test]"
 
 # Authenticate for the gated Llama-3.2-1B-Instruct checkpoint:
 huggingface-cli login          # …or…

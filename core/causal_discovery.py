@@ -42,7 +42,7 @@ logger = logging.getLogger(__name__)
 # ``FiniteSCM.probability`` enumerates the full Cartesian product of exogenous
 # domains, so sizes like 10_000^n are intractable for n≳2. Keep this modest so
 # discovered toy graphs (few variables) remain exactly queryable.
-SCM_EXOGENOUS_DOMAIN_SIZE = 256
+SCM_EXOGENOUS_DOMAIN_SIZE = 32
 
 
 @dataclass

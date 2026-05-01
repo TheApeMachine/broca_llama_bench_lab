@@ -264,10 +264,20 @@ class CategoricalPOMDP:
 
 @dataclass
 class ActiveInferenceAgent:
+    """Finite active-inference controller.
+
+    ``learn`` updates the likelihood/transition Dirichlet counts.
+    ``expand_on_surprise`` is deliberately opt-in: true ontological expansion is
+    useful for open-world discovery, but routine low-probability reward/punish
+    observations in a known POMDP should update beliefs rather than invent a new
+    hidden state.
+    """
+
     pomdp: CategoricalPOMDP
     horizon: int = 1
     learn: bool = True
     qs: list[float] | None = None
+    expand_on_surprise: bool = False
     _expand_serial: int = field(default=0, repr=False)
 
     def __post_init__(self) -> None:
@@ -309,7 +319,7 @@ class ActiveInferenceAgent:
         po = self.pomdp.observation_distribution(pred, action)
         expanded = False
         uniform_floor = 1.0 / float(max(1, self.pomdp.n_observations))
-        if po[obs] < uniform_floor:
+        if self.expand_on_surprise and po[obs] < uniform_floor:
             label = f"hyp_{self.pomdp.n_states}_{self._expand_serial}"
             self._expand_serial += 1
             self.qs = self.pomdp.expand_state(label, qs=before, predictive_mass_obs=float(po[obs]))
@@ -777,5 +787,3 @@ class ToolForagingAgent:
         a = self.pomdp.action_names.index(str(action_name))
         o = self.pomdp.observation_names.index(str(observation_name))
         return self.agent.update(a, o, lr=lr)
-
-

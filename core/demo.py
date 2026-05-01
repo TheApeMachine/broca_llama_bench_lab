@@ -1,4 +1,3 @@
-
 from __future__ import annotations
 
 import argparse
@@ -14,7 +13,7 @@ from .experiments import (
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="ASI Broca Lab: make the language model a Broca-style interface over real faculties.")
+    parser = argparse.ArgumentParser(description="Mosaic: make the language model a Broca-style interface over real faculties.")
     parser.add_argument("--mode", choices=["all", "broca", "friston", "pearl"], default="all")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--out-dir", default="runs")

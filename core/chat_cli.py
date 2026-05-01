@@ -46,7 +46,9 @@ def _stream_reply(
     try:
         from transformers import StoppingCriteria, StoppingCriteriaList, TextIteratorStreamer
     except ImportError as e:  # pragma: no cover
-        raise ImportError("Streaming chat requires transformers; pip install -r requirements-benchmark.txt") from e
+        raise ImportError(
+            'Streaming chat requires transformers; run `uv sync --extra benchmark` or `pip install -e ".[benchmark]"`.'
+        ) from e
 
     pad_id = getattr(tokenizer, "pad_token_id", None)
     eos_id = getattr(tokenizer, "eos_token_id", None)
@@ -112,7 +114,7 @@ def _build_parser() -> argparse.ArgumentParser:
         default=os.environ.get("MODEL_ID", "meta-llama/Llama-3.2-1B-Instruct"),
         help="HF model id (default: MODEL_ID or Llama-3.2-1B-Instruct).",
     )
-    p.add_argument("--device", default=os.environ.get("ASI_DEVICE"), help="Torch device override (cpu, mps, cuda:0). Default: auto.")
+    p.add_argument("--device", default=os.environ.get("M_DEVICE"), help="Torch device override (cpu, mps, cuda:0). Default: auto.")
     p.add_argument(
         "--token",
         default=None,

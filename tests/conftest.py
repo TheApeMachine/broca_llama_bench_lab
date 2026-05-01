@@ -1,3 +1,4 @@
+
 from __future__ import annotations
 
 import json
@@ -5,8 +6,22 @@ import os
 import re
 from typing import Callable
 
+# Keep the CPU test suite deterministic and prevent OpenMP/PyTorch worker pools
+# from lingering at interpreter shutdown on constrained CI sandboxes.
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+os.environ.setdefault("MKL_NUM_THREADS", "1")
+os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+
 import pytest
 import torch
+
+try:
+    torch.set_num_threads(1)
+    torch.set_num_interop_threads(1)
+except RuntimeError:
+    # PyTorch may reject interop-thread changes after a backend initialized; the
+    # environment variables above still keep fresh test processes bounded.
+    pass
 
 
 def _hf_token_available() -> bool:

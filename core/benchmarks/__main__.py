@@ -80,7 +80,9 @@ def hf_datasets_smoke(verbose: bool = True) -> None:
     try:
         from datasets import load_dataset
     except ImportError as exc:
-        raise ImportError("Dataset smoke requires `datasets`; install requirements-benchmark.txt") from exc
+        raise ImportError(
+            "Dataset smoke requires `datasets`; run `uv sync --extra benchmark` or `pip install -e \".[benchmark]\"`."
+        ) from exc
 
     smoke_runs: list[tuple[str, Any]] = [
         ("GLUE SST-2 (sentiment)", lambda: load_dataset("glue", "sst2", split="validation[:4]")),
@@ -183,7 +185,7 @@ def resolve_cli_device(device: str | None) -> tuple[str, str]:
     """Return (CLI device string, coarse device type cpu|mps|cuda)."""
 
     if device is None or str(device).strip() == "":
-        dev_cli = str(pick_torch_device(os.environ.get("ASI_DEVICE")))
+        dev_cli = str(pick_torch_device(os.environ.get("M_DEVICE")))
     else:
         dev_cli = str(device).strip()
     coarse = dev_cli.split(":")[0].lower()
@@ -204,7 +206,7 @@ def run_lm_eval_harness(
     try:
         import lm_eval  # noqa: F401
     except ImportError:
-        print("Install benchmark deps: pip install -r requirements-benchmark.txt", file=sys.stderr)
+        print('Install benchmark deps: uv sync --extra benchmark  (or pip install -e ".[benchmark]")', file=sys.stderr)
         return 1, None
 
     cfg = LM_EVAL_PRESETS.get(preset)
@@ -267,7 +269,7 @@ def run_broca_architecture_benchmark(
 ) -> dict[str, Any]:
     """Score bare language host vs the active Broca architecture."""
 
-    dev = device if (device and str(device).strip()) else str(pick_torch_device(os.environ.get("ASI_DEVICE")))
+    dev = device if (device and str(device).strip()) else str(pick_torch_device(os.environ.get("M_DEVICE")))
     path = output_run_dir / "broca_architecture_eval.json"
 
     with tempfile.TemporaryDirectory(prefix="broca_bench_mem_") as tmp:

@@ -4,13 +4,13 @@
   "n_passed": 8,
   "n_failed": 0,
   "pass_rate": 1.0,
-  "total_duration_seconds": 1.3269920349121094,
+  "total_duration_seconds": 0.45946812629699707,
   "per_benchmark": {
     "rule_shift_adaptation": {
       "passed": true,
       "score": 1.0,
       "n_trials": 1,
-      "duration_seconds": 0.02996349334716797,
+      "duration_seconds": 0.0035429000854492188,
       "description": "Belief revision under accumulating low-surprise evidence",
       "details": {
         "initial_value": "rome",
@@ -29,7 +29,7 @@
       "passed": true,
       "score": 1.0,
       "n_trials": 50,
-      "duration_seconds": 0.0010256767272949219,
+      "duration_seconds": 0.00038504600524902344,
       "description": "Hypothesis masking convergence on valid tokens under adversarial rejection",
       "details": {
         "successes": 50,
@@ -48,7 +48,7 @@
       "passed": true,
       "score": 1.0,
       "n_trials": 1,
-      "duration_seconds": 0.5744917392730713,
+      "duration_seconds": 0.21586990356445312,
       "description": "Simpson's paradox: do-calculus recovers correct ATE despite confounding",
       "details": {
         "p_y_given_t1": 0.35,
@@ -71,7 +71,7 @@
       "passed": true,
       "score": 1.0,
       "n_trials": 100,
-      "duration_seconds": 0.03492093086242676,
+      "duration_seconds": 0.01225590705871582,
       "description": "Write/recall fidelity over N random triples",
       "details": {
         "n_triples": 100,
@@ -84,7 +84,7 @@
       "passed": true,
       "score": 0.948,
       "n_trials": 500,
-      "duration_seconds": 0.12775659561157227,
+      "duration_seconds": 0.05566573143005371,
       "description": "Split-conformal coverage >= 0.90 (alpha=0.1)",
       "details": {
         "alpha": 0.1,
@@ -103,7 +103,7 @@
       "passed": true,
       "score": 1.0,
       "n_trials": 150,
-      "duration_seconds": 0.3333308696746826,
+      "duration_seconds": 0.08249497413635254,
       "description": "VSA bind/unbind round-trip accuracy across dimensionalities",
       "details": {
         "per_dimensionality": {
@@ -137,7 +137,7 @@
       "passed": true,
       "score": 0.7125,
       "n_trials": 160,
-      "duration_seconds": 0.15076041221618652,
+      "duration_seconds": 0.04549360275268555,
       "description": "Modern Continuous Hopfield one-step retrieval at varying store sizes",
       "details": {
         "d_model": 256,
@@ -177,15 +177,15 @@
     },
     "active_inference_decision_quality": {
       "passed": true,
-      "score": 0.5,
+      "score": 0.87,
       "n_trials": 200,
-      "duration_seconds": 0.07024884223937988,
+      "duration_seconds": 0.03886914253234863,
       "description": "EFE-driven Tiger POMDP agent vs random baseline",
       "details": {
-        "agent_success_rate": 0.5,
+        "agent_success_rate": 0.87,
         "random_success_rate": 0.425,
-        "advantage_over_random": 0.075,
-        "agent_mean_return": -0.5005,
+        "advantage_over_random": 0.445,
+        "agent_mean_return": 0.6,
         "random_mean_return": -0.6508,
         "n_episodes": 200,
         "max_steps": 3

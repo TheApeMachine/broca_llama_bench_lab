@@ -106,5 +106,3 @@ class HuggingFaceBrocaTokenizer:
             mask = mask.to(device)
             lengths = lengths.to(device)
         return Batch(ids=ids, attention_mask=mask, lengths=lengths)
-
-

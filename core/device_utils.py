@@ -24,11 +24,11 @@ def pick_torch_device(pref: str | None = None, *, preferred_order: tuple[str, ..
 
     ``pref`` is ``None``, ``''``, or ``'auto'`` → use *preferred_order* then fall back sensibly.
 
-    Override with ``ASI_DEVICE`` when ``pref`` is auto-like (useful for CI).
+    Override with ``M_DEVICE`` when ``pref`` is auto-like (useful for CI).
     """
 
     normalized = normalize_device_arg(pref)
-    env = os.environ.get("ASI_DEVICE", "").strip()
+    env = os.environ.get("M_DEVICE", "").strip()
     pick = normalized if normalized is not None else (env or None)
 
     if pick:
@@ -73,5 +73,3 @@ def inference_dtype(device: torch.device) -> torch.dtype:
     if device.type == "mps":
         return torch.float16
     return torch.float32
-
-

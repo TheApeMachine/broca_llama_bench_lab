@@ -353,7 +353,7 @@ class SelfImproveDockerWorker:
     def _plan_patch(self, memory_blob: str) -> dict[str, Any] | None:
         instructions = textwrap.dedent(
             f"""
-            You are an autonomous maintainer for this Python repository (ASI Broca lab).
+            You are an autonomous maintainer for this Python repository (Mosaic).
             Prior runs and outcomes from persistent substrate memory:
             {memory_blob}
 

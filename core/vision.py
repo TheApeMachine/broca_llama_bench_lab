@@ -71,55 +71,51 @@ def _to_tensor(image: Any) -> torch.Tensor:
 
 
 def _phash_sketch(image: torch.Tensor, *, dim: int = SKETCH_DIM) -> torch.Tensor:
-    """Deterministic perceptual + DCT-frequency sketch for the no-deps path.
+    """Deterministic perceptual sketch for the no-deps path.
 
-    Combines:
-      * a spatial luminance histogram (16 buckets) for global appearance,
-      * the low-frequency DCT block (8×8) on a downscaled grayscale copy for
-        compositional structure (this is the classical pHash signal),
-      * a discrete Fourier magnitude profile (8 radii) for texture orientation.
+    The first mosaic version used a hand-rolled DCT plus FFT. That is elegant,
+    but on some CPU/OpenMP combinations it can become pathologically slow when
+    run after many torch-heavy tests. The substrate does not need a perfect
+    pHash here; it needs a stable visual vector. This version keeps the same
+    signals — luminance distribution, low-frequency layout, and texture — but
+    computes them with small pooling/difference operations only.
     """
 
     g = 0.299 * image[0] + 0.587 * image[1] + 0.114 * image[2]
-    dev = g.device
-    dtype = torch.float32
-    target = 64
-    g = F.adaptive_avg_pool2d(g.unsqueeze(0).unsqueeze(0), (target, target)).squeeze()
-    hist = torch.histc(g, bins=16, min=0.0, max=1.0)
+    g = F.adaptive_avg_pool2d(g.unsqueeze(0).unsqueeze(0), (32, 32)).squeeze()
+    bins = torch.clamp((g.flatten() * 16).to(torch.long), 0, 15)
+    hist = torch.bincount(bins, minlength=16).to(torch.float32)
     hist = hist / hist.sum().clamp_min(1e-9)
-    # 2D DCT-II via separable matrices — small enough at 64×64 to be cheap.
-    n = target
-    k = torch.arange(n, dtype=dtype, device=dev)
-    basis = torch.cos(math.pi / n * (k.unsqueeze(1) + 0.5) * k.unsqueeze(0))
-    basis[0] = basis[0] / math.sqrt(2.0)
-    basis = basis * math.sqrt(2.0 / n)
-    dct2 = basis @ g @ basis.t()
-    low_freq = dct2[:8, :8].flatten()
-    fft = torch.fft.rfft2(g)
-    mag = fft.abs()
-    yy, xx = torch.meshgrid(
-        torch.arange(mag.shape[0], dtype=dtype, device=dev),
-        torch.arange(mag.shape[1], dtype=dtype, device=dev),
-        indexing="ij",
+
+    # Low-frequency spatial layout, equivalent in spirit to a tiny pHash block
+    # but without building a DCT basis or invoking FFT kernels.
+    low_freq = F.adaptive_avg_pool2d(g.unsqueeze(0).unsqueeze(0), (8, 8)).flatten()
+    low_freq = low_freq - low_freq.mean()
+
+    dx = (g[:, 1:] - g[:, :-1]).abs()
+    dy = (g[1:, :] - g[:-1, :]).abs()
+    texture = torch.tensor(
+        [
+            float(dx.mean().item()),
+            float(dy.mean().item()),
+            float(dx.std(unbiased=False).item()),
+            float(dy.std(unbiased=False).item()),
+            float(g.mean().item()),
+            float(g.std(unbiased=False).item()),
+            float(g.min().item()),
+            float(g.max().item()),
+        ],
+        dtype=torch.float32,
+        device=g.device,
     )
-    radius = torch.sqrt(yy**2 + xx**2)
-    radial_parts: list[torch.Tensor] = []
-    for r in range(0, 32, 4):
-        mask = (radius >= r) & (radius < r + 4)
-        sel = mag[mask]
-        if sel.numel():
-            radial_parts.append(sel.mean())
-        else:
-            radial_parts.append(torch.zeros((), dtype=mag.dtype, device=mag.device))
-    radial = torch.stack(radial_parts)
-    feature = torch.cat([hist, low_freq, radial.nan_to_num(0.0)])
+
+    feature = torch.cat([hist, low_freq, texture]).nan_to_num(0.0)
     feature = F.normalize(feature, dim=0)
-    # Project the perceptual features into the substrate's hashed sketch space
-    # by mixing with a stable text-sketch derived from the feature digest.
-    digest = " ".join(f"{x:.4f}" for x in feature.tolist())
+    digest = " ".join(f"{x:.4f}" for x in feature.detach().cpu().tolist())
     sketch = stable_sketch(digest, dim=dim)
     pad = torch.zeros(dim, dtype=torch.float32)
-    pad[: min(dim, feature.shape[0])] = feature[: min(dim, feature.shape[0])]
+    cpu_feature = feature.detach().cpu().to(torch.float32)
+    pad[: min(dim, cpu_feature.shape[0])] = cpu_feature[: min(dim, cpu_feature.shape[0])]
     blended = F.normalize(0.6 * pad + 0.4 * sketch, dim=0)
     return blended
 
@@ -263,7 +259,9 @@ class VisionEncoder:
 
         tensor = _to_tensor(image)
         gray = 0.299 * tensor[0] + 0.587 * tensor[1] + 0.114 * tensor[2]
-        hist = torch.histc(gray, bins=int(n_buckets), min=0.0, max=1.0)
+        nb = int(n_buckets)
+        bins = torch.clamp((gray.flatten() * nb).to(torch.long), 0, nb - 1)
+        hist = torch.bincount(bins, minlength=nb).to(torch.float32)
         p = (hist / hist.sum().clamp_min(1e-9)).clamp_min(1e-12)
         h = float(-(p * p.log()).sum().item())
         logger.debug(
