@@ -38,7 +38,31 @@ class _StubMind:
         self.text_encoder = None
 
 
-def _row(jid: int, intent: str, *, subject: str = "subject", answer: str = "answer", confidence: float = 0.7) -> dict:
+class _StubHawkes:
+    baseline = 0.05
+
+    def intensity(self, channel: str) -> float:
+        return 10.0 if channel == "stress_episode" else 0.06
+
+
+class _StubMindSalience(_StubMind):
+    def __init__(self, rows: list[dict]):
+        super().__init__(rows)
+        self.hawkes = _StubHawkes()
+
+
+def _row(
+    jid: int,
+    intent: str,
+    *,
+    subject: str = "subject",
+    answer: str = "answer",
+    confidence: float = 0.7,
+    evidence: dict | None = None,
+) -> dict:
+    ev = {"journal_id": jid}
+    if evidence:
+        ev = {**ev, **evidence}
     return {
         "id": jid,
         "ts": time.time(),
@@ -47,8 +71,36 @@ def _row(jid: int, intent: str, *, subject: str = "subject", answer: str = "answ
         "subject": subject,
         "answer": answer,
         "confidence": confidence,
-        "evidence": {"journal_id": jid},
+        "evidence": ev,
     }
+
+
+def test_compiler_salience_path_compiles_without_frequency_repetition(tmp_path):
+    rows = [
+        _row(1, "stress_episode", evidence={"lexical_surprise_gap": 1.5}),
+        _row(2, "shutdown_loop"),
+    ]
+    db = tmp_path / "broca.sqlite"
+    reg = MacroChunkRegistry(db, namespace="dmn")
+    mind = _StubMindSalience(rows)
+    compiler = DMNChunkingCompiler(
+        mind,
+        registry=reg,
+        config=ChunkingDetectionConfig(
+            window_size=32,
+            min_motif_length=2,
+            max_motif_length=2,
+            min_repetitions=99,
+            salience_oneshot_threshold=8.0,
+            max_macros_per_tick=4,
+        ),
+    )
+    result = compiler.run_once()
+    assert result["compiled"] == 1
+    macro = reg.get("macro_stress_episode__shutdown_loop")
+    assert macro is not None
+    assert macro.pattern == ("stress_episode", "shutdown_loop")
+    assert result["reflections"][0].get("compile_via") == "salience"
 
 
 # --- find_repeated_motifs --------------------------------------------------

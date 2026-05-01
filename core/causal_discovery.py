@@ -39,7 +39,10 @@ from .causal import FiniteSCM
 logger = logging.getLogger(__name__)
 
 # Resolution for inverse-CDF sampling of discrete exogenous U_v in fitted SCMs.
-SCM_EXOGENOUS_DOMAIN_SIZE = 10_000
+# ``FiniteSCM.probability`` enumerates the full Cartesian product of exogenous
+# domains, so sizes like 10_000^n are intractable for n≳2. Keep this modest so
+# discovered toy graphs (few variables) remain exactly queryable.
+SCM_EXOGENOUS_DOMAIN_SIZE = 256
 
 
 @dataclass

@@ -26,7 +26,7 @@ import sqlite3
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Iterable, Sequence
+from typing import Any, Sequence
 
 import numpy as np
 import torch
@@ -341,17 +341,112 @@ class ChunkingDetectionConfig:
     max_motif_length: int = 5             # longest motif to test (limits combinatorial cost)
     min_repetitions: int = 3              # need ≥ N occurrences to compile
     max_macros_per_tick: int = 4          # ceiling so a single tick can't dominate the registry
+    hawkes_salience_cap: float = 24.0     # clamp λ(intent)/baseline when multiplying salience
+    surprise_gap_scale: float = 2.5       # scales lexical_surprise_gap from journal evidence
+    salience_oneshot_threshold: float = 10.0  # Σ row multipliers across the motif window
+    hopfield_weight_min_for_oneshot: float = 0.38  # retrieval concentration floor when memory non-empty
+
+
+def _journal_evidence_dict(row: dict) -> dict:
+    ev = row.get("evidence")
+    return ev if isinstance(ev, dict) else {}
+
+
+def _row_salience_multiplier(mind: Any, row: dict, cfg: ChunkingDetectionConfig) -> float:
+    """Hawkes-normalised intensity × lexical surprise bump for one journal row."""
+
+    mult = 1.0
+    intent = str(row.get("intent", "") or "unknown")
+    hk = getattr(mind, "hawkes", None)
+    if hk is not None:
+        lam = float(hk.intensity(intent))
+        baseline = float(getattr(hk, "baseline", 0.05))
+        mult *= min(cfg.hawkes_salience_cap, max(1.0, lam / max(baseline, 1e-6)))
+    ev = _journal_evidence_dict(row)
+    gap = float(ev.get("lexical_surprise_gap") or 0.0)
+    mult *= 1.0 + cfg.surprise_gap_scale * max(0.0, gap)
+    return float(mult)
+
+
+def _window_salience(
+    mind: Any,
+    rows: list[dict],
+    start: int,
+    length: int,
+    cfg: ChunkingDetectionConfig,
+) -> float:
+    return sum(
+        _row_salience_multiplier(mind, rows[start + k], cfg) for k in range(length)
+    )
+
+
+def _hopfield_concentration_ok(
+    mind: Any,
+    mean_feat: torch.Tensor,
+    cfg: ChunkingDetectionConfig,
+) -> bool:
+    """Reject one-shot macros when Hopfield mass stays diffuse (likely stochastic noise)."""
+
+    hm = getattr(mind, "hopfield_memory", None)
+    if hm is None:
+        return True
+    if len(hm) == 0:
+        return True
+    q = _align_vec_to_dim(mean_feat, hm.d_model).to(device=hm.device, dtype=hm.dtype)
+    _ret, _w = hm.retrieve(q)
+    wmax = float(hm.last_debug.get("weight_max", 0.0))
+    return wmax >= cfg.hopfield_weight_min_for_oneshot
+
+
+def find_salience_forced_motifs(
+    intents: Sequence[str],
+    rows: list[dict],
+    mind: Any,
+    cfg: ChunkingDetectionConfig,
+    *,
+    min_motif_length: int,
+    max_motif_length: int,
+) -> dict[tuple[str, ...], tuple[float, int]]:
+    """Return motif → (salience score, start index) for high-salience windows."""
+
+    best: dict[tuple[str, ...], tuple[float, int]] = {}
+    n = len(intents)
+    for L in range(max_motif_length, min_motif_length - 1, -1):
+        if L > n:
+            continue
+        for s in range(n - L + 1):
+            pat = tuple(intents[s : s + L])
+            if all(p == "unknown" or not p for p in pat):
+                continue
+            sal = _window_salience(mind, rows, s, L, cfg)
+            if sal < cfg.salience_oneshot_threshold:
+                continue
+            feats: list[torch.Tensor] = []
+            for k in range(L):
+                feats.append(
+                    _frame_features_from_row(rows[s + k], text_encoder=getattr(mind, "text_encoder", None))
+                )
+            mean_feat = torch.stack(feats, dim=0).mean(dim=0)
+            if not _hopfield_concentration_ok(mind, mean_feat, cfg):
+                continue
+            prev = best.get(pat)
+            if prev is None or sal > prev[0]:
+                best[pat] = (sal, s)
+    return best
 
 
 class DMNChunkingCompiler:
     """Detects repeated intent motifs in the workspace journal and compiles them into macros.
 
     The compiler is driven by the DMN's idle tick (one call to :meth:`run_once`
-    per tick).  Motif detection is exact: slide every window of length
-    ``L ∈ [min_motif_length, max_motif_length]`` over the last
-    ``window_size`` journal rows, count the disjoint occurrences of each
-    pattern, and compile any pattern that repeats at least
-    ``min_repetitions`` times.
+    per tick).  Motif detection combines (a) exact frequency repetition — slide
+    windows over recent intents and compile patterns meeting ``min_repetitions``
+    — with (b) **salience forcing**, where Hawkes intensity and lexical surprise
+    gaps multiply per-row weight so a rare burst can satisfy the compiler in one
+    shot when Hopfield retrieval concentrates on a stable basin.
+
+    Long patterns are reported before short ones so the registry favors the most
+    specific motif when sub-patterns coincide.
     """
 
     def __init__(
@@ -428,7 +523,7 @@ class DMNChunkingCompiler:
 
         cfg = self.config
         rows, intents = self._gather_recent_intents()
-        if len(intents) < max(cfg.min_motif_length, cfg.min_repetitions):
+        if len(intents) < cfg.min_motif_length:
             return {
                 "scanned": len(intents),
                 "candidates": 0,
@@ -436,18 +531,35 @@ class DMNChunkingCompiler:
                 "reflections": [],
             }
 
-        motifs = self.find_repeated_motifs(
+        motifs_freq = self.find_repeated_motifs(
             intents,
             min_motif_length=cfg.min_motif_length,
             max_motif_length=cfg.max_motif_length,
             min_repetitions=cfg.min_repetitions,
         )
+        salience_best = find_salience_forced_motifs(
+            intents,
+            rows,
+            self.mind,
+            cfg,
+            min_motif_length=cfg.min_motif_length,
+            max_motif_length=cfg.max_motif_length,
+        )
+        freq_patterns = {pat for pat, _ in motifs_freq}
+        work: list[tuple[tuple[str, ...], list[int], str, float]] = [
+            (pat, starts, "frequency", float(len(starts))) for pat, starts in motifs_freq
+        ]
+        for pat, (sal, s) in salience_best.items():
+            if pat in freq_patterns:
+                continue
+            work.append((pat, [s], "salience", float(sal)))
+        work.sort(key=lambda item: (-item[3], item[2] == "salience"))
 
         text_encoder = getattr(self.mind, "text_encoder", None)
 
         compiled: list[CompiledMacro] = []
         reflections: list[dict] = []
-        for pat, starts in motifs[: cfg.max_macros_per_tick]:
+        for pat, starts, compile_via, priority_score in work[: cfg.max_macros_per_tick]:
             # Compute the mean feature vector across all instances of the motif.
             instance_feats: list[torch.Tensor] = []
             instance_ids: list[int] = []
@@ -482,10 +594,11 @@ class DMNChunkingCompiler:
             stacked = torch.stack(instance_feats, dim=0)
             mean_feat = stacked.mean(dim=0)
             avg_conf = sum(confs) / max(1, len(confs))
+            obs_count = len(starts) if compile_via == "frequency" else min(1000, max(1, int(round(priority_score))))
             macro = CompiledMacro(
                 name=_macro_name_for_pattern(pat),
                 pattern=tuple(pat),
-                observation_count=len(starts),
+                observation_count=obs_count,
                 avg_confidence=float(avg_conf),
                 feature_vector=mean_feat,
                 last_seen_at=time.time(),
@@ -496,25 +609,29 @@ class DMNChunkingCompiler:
             reflections.append(
                 {
                     "kind": "chunk_compiled",
+                    "compile_via": compile_via,
                     "macro_name": macro.name,
                     "pattern": list(macro.pattern),
                     "observation_count": macro.observation_count,
                     "avg_confidence": float(macro.avg_confidence),
                     "member_episodes": list(macro.member_episodes),
+                    "salience_score": float(priority_score),
                 }
             )
             logger.info(
-                "DMN.chunking.compiled: name=%s pattern=%s n=%d avg_conf=%.3f",
+                "DMN.chunking.compiled: name=%s pattern=%s via=%s n=%d avg_conf=%.3f salience=%.3f",
                 macro.name,
                 list(macro.pattern),
+                compile_via,
                 macro.observation_count,
                 float(macro.avg_confidence),
+                float(priority_score),
             )
 
         self.iterations += 1
         return {
             "scanned": len(intents),
-            "candidates": len(motifs),
+            "candidates": len(motifs_freq) + len(salience_best),
             "compiled": len(compiled),
             "reflections": reflections,
         }

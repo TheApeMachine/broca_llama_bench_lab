@@ -12,12 +12,14 @@ from __future__ import annotations
 import pytest
 
 from core.causal import FiniteSCM
+from core.conformal import ConformalPredictor
 from core.native_tools import (
     NativeTool,
     NativeToolRegistry,
     SandboxResult,
     ToolSandbox,
     ToolSynthesisError,
+    assert_singleton_conformal_for_tool_outputs,
 )
 
 
@@ -175,6 +177,35 @@ def test_sandbox_verify_requires_at_least_one_sample():
     fn = sandbox.compile("def f(v):\n    return 0\n", function_name="f").fn
     with pytest.raises(ToolSynthesisError):
         ToolSandbox.verify(fn, domain=[0], sample_inputs=[])
+
+
+def test_conformal_tool_gate_skipped_until_calibration_warmed(tmp_path):
+    db = tmp_path / "tools.sqlite"
+    reg = NativeToolRegistry(db, namespace="t")
+    pred = ConformalPredictor(alpha=0.1, method="lac", min_calibration=8)
+    assert len(pred) == 0
+    tool = reg.synthesize(
+        "is_positive",
+        "def is_positive(v):\n    return 1 if v['x'] > 0 else 0\n",
+        parents=("x",),
+        domain=(0, 1),
+        sample_inputs=[{"x": -1}, {"x": 1}],
+        conformal_predictor=pred,
+    )
+    assert tool.verified
+
+
+def test_conformal_tool_gate_rejects_ambiguous_output_histogram():
+    pred = ConformalPredictor(alpha=0.1, method="lac", min_calibration=4)
+    pred.load_scores([1.0, 1.0, 1.0, 1.0])
+    with pytest.raises(ToolSynthesisError, match="epistemically ambiguous"):
+        assert_singleton_conformal_for_tool_outputs(pred, (0, 1), [0, 1])
+
+
+def test_conformal_tool_gate_accepts_singleton_behaviour_when_warm():
+    pred = ConformalPredictor(alpha=0.1, method="lac", min_calibration=4)
+    pred.load_scores([1.0, 1.0, 1.0, 1.0])
+    assert_singleton_conformal_for_tool_outputs(pred, (0, 1), [0, 0])
 
 
 # ---------------------------------------------------------------------------

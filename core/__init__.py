@@ -28,6 +28,7 @@ from .broca import (
     WorkspaceJournal,
     cognitive_frame_from_episode_row,
 )
+from .docker_self_improve_worker import SelfImproveConfig, SelfImproveDockerWorker
 from .causal import FiniteSCM, build_frontdoor_scm, build_simpson_scm
 from .device_utils import pick_torch_device
 from .grafts import ActiveInferenceTokenGraft, CoupledActiveInferenceTokenGraft, CausalEffectTokenGraft, FeatureVectorGraft, KVMemoryGraft
@@ -164,6 +165,8 @@ __all__ = [
     "InterruptionVerdict",
     "IterativeHypothesisSearch",
     "ModalityShiftGraft",
+    "SelfImproveConfig",
+    "SelfImproveDockerWorker",
     "BrocaMind",
     "CognitiveBackgroundWorker",
     "CognitiveFrame",

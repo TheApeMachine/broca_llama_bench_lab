@@ -18,6 +18,10 @@ The pipeline:
     coerced into the declared domain.
 3.  **Verify.**  ``ToolSandbox.verify`` runs the function on
     ``sample_inputs`` and checks every output lies in the declared domain.
+    Optionally a dedicated split-conformal predictor on channel
+    ``native_tool_output`` inspects the empirical label histogram from those
+    runs — when calibration is warm and the conformal prediction set size is
+    not exactly one, synthesis aborts before the tool gains SCM authority.
 4.  **Persist.**  ``NativeToolRegistry`` writes the verified tool to
     SQLite.
 5.  **Attach.**  ``NativeToolRegistry.attach_to_scm`` calls
@@ -41,7 +45,10 @@ import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
+from collections import Counter
 from typing import Any, Callable, Mapping, Sequence
+
+from .conformal import ConformalPredictor
 
 
 logger = logging.getLogger(__name__)
@@ -275,6 +282,69 @@ class ToolSandbox:
         return outputs
 
 
+def native_tool_domain_label(value: Any) -> str:
+    """Stable categorical key for conformal prediction over tool codomains."""
+
+    if isinstance(value, bool):
+        return f"bool:{str(value).lower()}"
+    if value is None:
+        return "none"
+    if isinstance(value, (int, float)):
+        return f"num:{repr(value)}"
+    if isinstance(value, str):
+        return f"str:{value}"
+    try:
+        return json.dumps(value, sort_keys=True, default=str)
+    except TypeError:
+        return repr(value)
+
+
+def full_domain_empirical_distribution(
+    domain: Sequence[Any], outputs: Sequence[Any]
+) -> dict[str, float]:
+    """Map every declared codomain element to its empirical frequency under verifier samples."""
+
+    if not outputs:
+        return {}
+    counts = Counter(native_tool_domain_label(o) for o in outputs)
+    n = float(len(outputs))
+    dist: dict[str, float] = {}
+    for v in domain:
+        lab = native_tool_domain_label(v)
+        dist[lab] = counts.get(lab, 0) / n
+    return dist
+
+
+def assert_singleton_conformal_for_tool_outputs(
+    predictor: ConformalPredictor,
+    domain: Sequence[Any],
+    outputs: Sequence[Any],
+) -> None:
+    """Raise :class:`ToolSynthesisError` when conformal ambiguity is too high for SCM attachment.
+
+    Builds an empirical law over the **full declared domain** — zeros on never-seen
+    values — and requires a singleton conformal prediction set.  Until the
+    predictor's calibration list reaches ``min_calibration`` this is a no-op so
+    cold starts preserve legacy behaviour.
+    """
+
+    if len(predictor) < predictor.min_calibration:
+        return
+    dist = full_domain_empirical_distribution(domain, outputs)
+    active = {k: v for k, v in dist.items() if v > 0.0}
+    if not active:
+        raise ToolSynthesisError(
+            "conformal tool gate: empty verifier histogram after masking zero masses"
+        )
+    cset = predictor.predict_set(active)
+    if cset.set_size != 1:
+        raise ToolSynthesisError(
+            "conformal tool gate: verifier behaviour is epistemically ambiguous "
+            f"(prediction set size {cset.set_size}, labels={cset.labels!r}); "
+            "refusing SCM attachment"
+        )
+
+
 def tool_sandbox_from_env() -> ToolSandbox:
     """Return :class:`DockerToolSandbox` when ``BROCA_USE_DOCKER_TOOLS`` is set, else in-process sandbox."""
 
@@ -400,6 +470,7 @@ class NativeToolRegistry:
         sample_inputs: Sequence[Mapping[str, Any]],
         description: str = "",
         overwrite: bool = False,
+        conformal_predictor: ConformalPredictor | None = None,
     ) -> NativeTool:
         """Compile, sandbox, verify, and persist a native tool in one shot.
 
@@ -418,6 +489,8 @@ class NativeToolRegistry:
         outputs = self.sandbox.verify(
             compiled.fn, domain=domain_t, sample_inputs=list(sample_inputs)
         )
+        if conformal_predictor is not None:
+            assert_singleton_conformal_for_tool_outputs(conformal_predictor, domain_t, outputs)
         tool = NativeTool(
             name=name,
             source=source,
@@ -765,4 +838,7 @@ __all__ = [
     "tool_sandbox_from_env",
     "NativeTool",
     "NativeToolRegistry",
+    "native_tool_domain_label",
+    "full_domain_empirical_distribution",
+    "assert_singleton_conformal_for_tool_outputs",
 ]

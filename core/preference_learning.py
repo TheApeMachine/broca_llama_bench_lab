@@ -137,6 +137,7 @@ class DirichletPreference:
         polarity: float = 1.0,
         weight: float = 1.0,
         reason: str = "",
+        epistemic_alpha_floor: float | None = None,
     ) -> None:
         """Update the Dirichlet given one labeled observation.
 
@@ -144,6 +145,10 @@ class DirichletPreference:
         ``polarity < 0`` shrinks it (multiplicatively, via ``exp(polarity *
         weight)``) so the value stays strictly positive — the conjugate prior
         is only valid on the open simplex.
+
+        ``epistemic_alpha_floor`` clamps the target concentration after a
+        negative update so listening / information-seeking observations retain
+        probability mass when external ambiguity signals demand it.
         """
 
         i = int(observation_index)
@@ -155,6 +160,8 @@ class DirichletPreference:
         else:
             shrink = math.exp(float(polarity) * w)
             self.alpha[i] = max(1e-6, self.alpha[i] * shrink)
+            if epistemic_alpha_floor is not None:
+                self.alpha[i] = max(float(epistemic_alpha_floor), self.alpha[i])
         self.history.append(
             PreferenceEvent(
                 observation_index=i,

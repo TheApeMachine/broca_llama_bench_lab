@@ -139,6 +139,22 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--no-background", action="store_true", help="Disable background memory consolidation in --broca mode.")
     p.add_argument("--background-interval", type=float, default=5.0, help="Seconds between background consolidation passes in --broca mode.")
     p.add_argument(
+        "--self-improve",
+        action="store_true",
+        help="Enable Docker-backed self-improve worker (requires Docker, GITHUB_TOKEN with repo scope; see core.docker_self_improve_worker).",
+    )
+    p.add_argument(
+        "--no-self-improve",
+        action="store_true",
+        help="Disable self-improve even if BROCA_SELF_IMPROVE=1.",
+    )
+    p.add_argument(
+        "--self-improve-interval",
+        type=float,
+        default=None,
+        help="Seconds between self-improve cycles (default: BROCA_SELF_IMPROVE_INTERVAL_S or 3600).",
+    )
+    p.add_argument(
         "--debug-substrate",
         action="store_true",
         help="In --broca mode, print the cognitive frame's intent / answer / confidence after each reply.",
@@ -182,6 +198,16 @@ def main() -> None:
             validated_interval = max(0.1, float(args.background_interval))
             mind.start_background(interval_s=validated_interval)
             print(f"Background consolidation: every {validated_interval:.1f}s", flush=True)
+
+        si_env = os.environ.get("BROCA_SELF_IMPROVE", "").strip().lower() in {"1", "true", "yes", "on"}
+        enable_self_improve = (args.self_improve or si_env) and not args.no_self_improve
+        if enable_self_improve:
+            mind.start_self_improve_worker(interval_s=args.self_improve_interval, enabled=True)
+            print(
+                "Self-improve worker: Docker/GitHub PR loop enabled "
+                "(interval from --self-improve-interval or BROCA_SELF_IMPROVE_INTERVAL_S).",
+                flush=True,
+            )
         print("Substrate biases the LLM via grafts; the LLM still chooses the surface form.", flush=True)
         print("Commands: /quit /exit — leave.", flush=True)
         print(flush=True)
@@ -247,6 +273,7 @@ def main() -> None:
                 messages.append({"role": "assistant", "content": reply.strip() or "[empty reply]"})
         finally:
             mind.stop_background()
+            mind.stop_self_improve_worker()
 
         return
 

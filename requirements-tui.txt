@@ -1,0 +1,2 @@
+-r requirements-benchmark.txt
+textual>=0.79

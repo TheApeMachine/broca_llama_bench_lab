@@ -67,6 +67,43 @@ Real Llama Broca backend:
 HF_TOKEN=... python -m core.demo --mode broca --broca-backend llama --broca-model-id meta-llama/Llama-3.2-1B-Instruct
 ```
 
+## Run the live TUI (chat + substrate dashboard)
+
+A Textual-based TUI gives you the substrate-biased chat in the center plus
+live side panels showing what the substrate is doing — current cognitive
+frame, working memory, intrinsic cues, semantic memory, the DMN background
+worker, the self-improve worker, Hawkes intensities, a confidence
+sparkline, and an activity feed of structured events and log records.
+
+```bash
+pip install -r requirements-tui.txt
+HF_TOKEN=... python -m core.chat_tui --broca-db runs/broca_chat.sqlite
+```
+
+Useful flags:
+
+```text
+--broca-db PATH           SQLite path (default: runs/broca_chat.sqlite)
+--broca-namespace NAME    Semantic-memory namespace (default: chat)
+--no-background           Disable DMN background consolidation
+--background-interval S   DMN tick period (default: 5.0)
+--self-improve            Enable Docker-backed self-improve worker
+--sample / --temperature / --top-p
+--debug-substrate         Show substrate intent + confidence after each reply
+--log-level LEVEL         Activity-feed log level (default: INFO)
+```
+
+`Ctrl+C` quits, `Ctrl+L` clears the chat. The TUI silences the stderr
+log handler so it doesn't fight the UI; the rotating file handler at
+`runs/broca.log` still captures the full event stream.
+
+Programmatic state access is via `BrocaMind.snapshot()` (a JSON-friendly
+dict) and the event bus at `core.event_bus.get_default_bus()`. The bus
+publishes `frame.comprehend`, `intrinsic_cue`, `consolidation`,
+`dmn.tick`, `chat.start`, `chat.complete`, and
+`self_improve.cycle_*` topics; attach `LogToBusHandler` to forward the
+standard logging stream as `log.<level>` events.
+
 ## Run native HuggingFace-datasets benchmarks
 
 Quick run:

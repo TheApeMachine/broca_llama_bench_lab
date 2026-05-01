@@ -86,6 +86,7 @@ from .causal_discovery import (
 )
 from .native_tools import NativeTool, NativeToolRegistry, ToolSandbox, ToolSynthesisError
 from .dynamic_grafts import DynamicGraftSynthesizer, CapturedActivationMode, ACTIVATION_MODE_KIND
+from .event_bus import EventBus, get_default_bus
 from .memory import SQLiteActivationMemory
 
 logger = logging.getLogger(__name__)
@@ -1643,13 +1644,27 @@ class CognitiveBackgroundWorker:
         self.iterations += 1
         self.last_error = None
         self.last_phase_summary = phase_summary
+        duration_ms = int(round((time.time() - tick_started) * 1000))
         logger.debug(
             "CognitiveBackgroundWorker.run_once: iteration=%d total_reflections=%d duration_ms=%d idle=%.1fs",
             self.iterations,
             len(reflections),
-            int(round((time.time() - tick_started) * 1000)),
+            duration_ms,
             idle,
         )
+        try:
+            self.mind.event_bus.publish(
+                "dmn.tick",
+                {
+                    "iteration": int(self.iterations),
+                    "duration_ms": duration_ms,
+                    "reflections": len(reflections),
+                    "idle_seconds": float(idle),
+                    "phase_summary": dict(phase_summary),
+                },
+            )
+        except Exception:
+            logger.exception("DMN tick: event publish failed")
         return reflections
 
     def mark_user_active(self) -> None:
@@ -2807,6 +2822,7 @@ class BrocaMind:
         self.causal_agent = ActiveInferenceAgent(self.causal_pomdp, horizon=1, learn=False)
         self.unified_agent = CoupledEFEAgent(self.active_agent, self.causal_agent)
         self._background_worker: CognitiveBackgroundWorker | None = None
+        self._self_improve_worker: Any | None = None
         self._cognitive_state_lock = threading.Lock()
 
         # New substrates ----------------------------------------------------
@@ -2816,6 +2832,8 @@ class BrocaMind:
         self.conformal_calibration = PersistentConformalCalibration(Path(db_path), namespace=f"{namespace}__conformal")
         self.relation_conformal = ConformalPredictor(alpha=0.1, method="lac", min_calibration=8)
         self.conformal_calibration.hydrate(self.relation_conformal, channel="relation_extraction")
+        self.native_tool_conformal = ConformalPredictor(alpha=0.1, method="lac", min_calibration=8)
+        self.conformal_calibration.hydrate(self.native_tool_conformal, channel="native_tool_output")
         # Hawkes channels are populated lazily by ``observe_event`` so the
         # excitation matrix grows with the user's vocabulary instead of being
         # hardcoded.
@@ -2880,6 +2898,14 @@ class BrocaMind:
             insufficient_prior=0.5,
         )
 
+        # Event bus for live UI / debugger feeds. Defaults to the process-wide
+        # bus so the TUI sees publishes from this mind without explicit wiring.
+        self.event_bus: EventBus = get_default_bus()
+        self._last_chat_meta: dict[str, Any] = {}
+        self._db_path = Path(db_path)
+        self._namespace = namespace
+        self._llama_model_id = mid
+
     @property
     def background_worker(self) -> CognitiveBackgroundWorker | None:
         return self._background_worker
@@ -2887,7 +2913,174 @@ class BrocaMind:
     def consolidate_once(self) -> list[dict]:
         out = self.memory.consolidate_claims_once()
         logger.debug("BrocaMind.consolidate_once: reflections=%d", len(out))
+        try:
+            self.event_bus.publish("consolidation", {"reflections": len(out)})
+        except Exception:
+            logger.exception("BrocaMind.consolidate_once: event publish failed")
         return out
+
+    def snapshot(self) -> dict[str, Any]:
+        """Return a JSON-friendly snapshot of substrate state for live UIs.
+
+        Designed to be cheap (read-only attribute access, no SQL writes) and
+        safe (each subsystem is wrapped so a partial failure cannot break the
+        UI). Callers may invoke this on a tick (the TUI polls at ~5Hz) without
+        bothering with locks; the returned dict is a fresh copy.
+        """
+
+        snap: dict[str, Any] = {"ts": time.time()}
+
+        try:
+            device = next(self.host.parameters()).device
+            device_str = str(device)
+        except (StopIteration, AttributeError):
+            device_str = "unknown"
+        snap["model"] = {
+            "id": self._llama_model_id,
+            "device": device_str,
+            "namespace": self._namespace,
+            "db_path": str(self._db_path),
+        }
+
+        try:
+            recent_claims = self.memory.claims()[-8:]
+            snap["memory"] = {
+                "count": int(self.memory.count()),
+                "subjects": len(self.memory.subjects()),
+                "mean_confidence": (
+                    float(self.memory.mean_confidence()) if self.memory.mean_confidence() is not None else None
+                ),
+                "recent_claims": [
+                    {
+                        "subject": c.get("subject"),
+                        "predicate": c.get("predicate"),
+                        "object": c.get("object"),
+                        "confidence": float(c.get("confidence", 0.0)),
+                        "status": c.get("status"),
+                    }
+                    for c in recent_claims
+                ],
+            }
+        except Exception:
+            logger.exception("snapshot.memory failed")
+            snap["memory"] = {"error": True}
+
+        try:
+            recent_journal = self.journal.recent(8)
+            snap["journal"] = {
+                "count": int(self.journal.count()),
+                "recent": [
+                    {
+                        "id": int(r.get("id", 0)),
+                        "intent": r.get("intent"),
+                        "subject": r.get("subject"),
+                        "answer": r.get("answer"),
+                        "confidence": float(r.get("confidence", 0.0)),
+                        "utterance": (r.get("utterance") or "")[:200],
+                    }
+                    for r in recent_journal
+                ],
+            }
+        except Exception:
+            logger.exception("snapshot.journal failed")
+            snap["journal"] = {"error": True}
+
+        try:
+            latest = self.workspace.latest
+            snap["workspace"] = {
+                "frames_total": len(self.workspace.frames),
+                "working_window": len(self.workspace.working),
+                "intrinsic_cues": [
+                    {
+                        "urgency": float(c.urgency),
+                        "faculty": c.faculty,
+                        "source": c.source,
+                        "evidence": dict(c.evidence) if isinstance(c.evidence, dict) else {},
+                    }
+                    for c in self.workspace.intrinsic_cues
+                ],
+                "latest_frame": (
+                    {
+                        "intent": latest.intent,
+                        "subject": latest.subject,
+                        "answer": latest.answer,
+                        "confidence": float(latest.confidence),
+                    }
+                    if latest is not None
+                    else None
+                ),
+            }
+        except Exception:
+            logger.exception("snapshot.workspace failed")
+            snap["workspace"] = {"error": True}
+
+        try:
+            bg = self._background_worker
+            snap["background"] = (
+                {
+                    "running": bool(bg.running),
+                    "iterations": int(bg.iterations),
+                    "interval_s": float(bg.interval_s),
+                    "last_phase_summary": dict(bg.last_phase_summary),
+                    "last_rem_summary": dict(bg.last_rem_summary),
+                    "last_error": bg.last_error,
+                    "idle_seconds": float(max(0.0, time.time() - bg.last_user_activity_at)),
+                }
+                if bg is not None
+                else {"running": False}
+            )
+        except Exception:
+            logger.exception("snapshot.background failed")
+            snap["background"] = {"error": True}
+
+        try:
+            sw = self._self_improve_worker
+            if sw is None:
+                snap["self_improve"] = {"running": False, "enabled": False}
+            else:
+                snap["self_improve"] = {
+                    "running": bool(sw.running),
+                    "enabled": bool(getattr(sw.config, "enabled", False)),
+                    "iterations": int(sw.iterations),
+                    "interval_s": float(getattr(sw.config, "interval_s", 0.0)),
+                    "last_summary": sw.last_summary,
+                    "last_error": sw.last_error,
+                }
+        except Exception:
+            logger.exception("snapshot.self_improve failed")
+            snap["self_improve"] = {"error": True}
+
+        try:
+            snap["substrate"] = {
+                "vsa_atoms": len(self.vsa),
+                "hopfield_stored": len(self.hopfield_memory),
+                "hopfield_max_items": int(self.hopfield_memory.max_items),
+                "hawkes_channels": len(self.hawkes.channels),
+                "hawkes_intensity": dict(self.hawkes.intensity_vector()),
+                "tools": int(self.tool_registry.count()),
+                "macros": int(self.macro_registry.count()),
+                "ontology_axes": len(self.ontology),
+                "discovered_scm": self.discovered_scm is not None,
+            }
+        except Exception:
+            logger.exception("snapshot.substrate failed")
+            snap["substrate"] = {"error": True}
+
+        try:
+            snap["preferences"] = {
+                "spatial_C": [float(x) for x in self.spatial_preference.expected_C()],
+                "causal_C": [float(x) for x in self.causal_preference.expected_C()],
+            }
+        except Exception:
+            logger.exception("snapshot.preferences failed")
+            snap["preferences"] = {"error": True}
+
+        try:
+            snap["last_chat"] = dict(self._last_chat_meta) if self._last_chat_meta else None
+        except Exception:
+            snap["last_chat"] = None
+
+        return snap
 
     # -- New substrate plumbing -----------------------------------------------
 
@@ -2903,8 +3096,24 @@ class BrocaMind:
         except (AttributeError, TypeError):
             logger.exception("BrocaMind._sync_preference_to_pomdp: causal sync failed")
 
-    def observe_user_feedback(self, *, faculty: str, observation_index: int, polarity: float, weight: float = 1.0, reason: str = "") -> None:
-        """Forward user feedback into the right Dirichlet preference and sync."""
+    def observe_user_feedback(
+        self,
+        *,
+        faculty: str,
+        observation_index: int,
+        polarity: float,
+        weight: float = 1.0,
+        reason: str = "",
+        conformal_set_size: int | None = None,
+        epistemic_ambiguity_floor_strength: float = 0.18,
+    ) -> None:
+        """Forward user feedback into the right Dirichlet preference and sync.
+
+        When ``conformal_set_size`` is strictly greater than one the substrate
+        is in a demonstrably ambiguous regime; negative preference updates
+        then respect an irreducible concentration floor so ``C`` cannot collapse
+        toward silence simply because the user vented frustration.
+        """
 
         if faculty == "spatial":
             target = self.spatial_preference
@@ -2912,7 +3121,16 @@ class BrocaMind:
             target = self.causal_preference
         else:
             raise ValueError(f"BrocaMind.observe_user_feedback: unsupported faculty {faculty!r}; expected 'spatial' or 'causal'")
-        target.update(observation_index, polarity=polarity, weight=weight, reason=reason)
+        floor: float | None = None
+        if polarity < 0 and conformal_set_size is not None and int(conformal_set_size) > 1:
+            floor = float(target.prior_strength * epistemic_ambiguity_floor_strength)
+        target.update(
+            observation_index,
+            polarity=polarity,
+            weight=weight,
+            reason=reason,
+            epistemic_alpha_floor=floor,
+        )
         self._sync_preference_to_pomdp()
         try:
             self.preference_persistence.save(faculty, target)
@@ -3084,6 +3302,7 @@ class BrocaMind:
             sample_inputs=sample_inputs,
             description=description,
             overwrite=overwrite,
+            conformal_predictor=self.native_tool_conformal,
         )
         if attach:
             try:
@@ -3229,6 +3448,36 @@ class BrocaMind:
         if self._background_worker is not None:
             self._background_worker.stop()
 
+    def start_self_improve_worker(
+        self,
+        *,
+        interval_s: float | None = None,
+        enabled: bool | None = None,
+    ) -> Any:
+        """Start Docker-backed self-improve loop (separate from DMN background).
+
+        See :mod:`core.docker_self_improve_worker` for environment variables
+        and prerequisites (``GITHUB_TOKEN``, Docker, and ``repo`` scope).
+        """
+
+        from .docker_self_improve_worker import SelfImproveConfig, SelfImproveDockerWorker
+
+        cfg = SelfImproveConfig()
+        if enabled is not None:
+            cfg.enabled = bool(enabled)
+        if interval_s is not None:
+            cfg.interval_s = max(60.0, float(interval_s))
+        if self._self_improve_worker is None:
+            self._self_improve_worker = SelfImproveDockerWorker(self, config=cfg)
+        else:
+            self._self_improve_worker.config = cfg
+        self._self_improve_worker.start()
+        return self._self_improve_worker
+
+    def stop_self_improve_worker(self, timeout: float = 5.0) -> None:
+        if self._self_improve_worker is not None:
+            self._self_improve_worker.stop(timeout=timeout)
+
     def _intrinsic_scan(self, toks: list[str]) -> None:
         self.workspace.intrinsic_cues.clear()
         mu_pop = self.memory.mean_confidence()
@@ -3257,6 +3506,14 @@ class BrocaMind:
             if max_ent > 1e-9 and h_q > 0.5 * max_ent:
                 self.workspace.intrinsic_cues.append(IntrinsicCue(float(h_q / max_ent), "causal_uncertain", {"entropy": h_q}))
         logger.debug("_intrinsic_scan: cues=%d toks=%d", len(self.workspace.intrinsic_cues), len(toks))
+        try:
+            for cue in self.workspace.intrinsic_cues:
+                self.event_bus.publish(
+                    "intrinsic_cue",
+                    {"urgency": float(cue.urgency), "faculty": cue.faculty, "evidence": dict(cue.evidence) if isinstance(cue.evidence, dict) else {}},
+                )
+        except Exception:
+            logger.exception("_intrinsic_scan: event publish failed")
 
     def comprehend(self, utterance: str) -> CognitiveFrame:
         toks = utterance_words(utterance)
@@ -3299,6 +3556,20 @@ class BrocaMind:
             out.confidence,
             (out.evidence or {}).get("journal_id"),
         )
+        try:
+            self.event_bus.publish(
+                "frame.comprehend",
+                {
+                    "intent": out.intent,
+                    "subject": out.subject,
+                    "answer": out.answer,
+                    "confidence": float(out.confidence),
+                    "journal_id": (out.evidence or {}).get("journal_id"),
+                    "utterance": utterance[:200],
+                },
+            )
+        except Exception:
+            logger.exception("comprehend: event publish failed")
         return out
 
     def _commit_frame(self, utterance: str, toks: Sequence[str], frame: CognitiveFrame) -> CognitiveFrame:
@@ -3415,6 +3686,35 @@ class BrocaMind:
             confidence,
             eff_temperature,
         )
+        bias_top: list[dict[str, Any]] = []
+        try:
+            hf_tok = getattr(self.tokenizer, "inner", None)
+            if hf_tok is not None and logit_bias:
+                ranked = sorted(logit_bias.items(), key=lambda kv: kv[1], reverse=True)[:8]
+                for tid, val in ranked:
+                    try:
+                        piece = hf_tok.decode([int(tid)], skip_special_tokens=True, clean_up_tokenization_spaces=False)
+                    except Exception:
+                        piece = f"<{tid}>"
+                    bias_top.append({"token_id": int(tid), "token": piece, "bias": float(val)})
+        except Exception:
+            logger.exception("chat_reply: bias_top extraction failed")
+
+        self._last_chat_meta = {
+            "intent": frame.intent,
+            "subject": frame.subject,
+            "answer": frame.answer,
+            "confidence": float(confidence),
+            "eff_temperature": float(eff_temperature),
+            "bias_token_count": len(logit_bias),
+            "bias_top": bias_top,
+            "has_broca_features": broca_features is not None,
+            "ts": time.time(),
+        }
+        try:
+            self.event_bus.publish("chat.start", dict(self._last_chat_meta))
+        except Exception:
+            logger.exception("chat_reply: event publish failed")
 
         text = self._stream_substrate_chat(
             msgs,
@@ -3427,6 +3727,18 @@ class BrocaMind:
             on_token=on_token,
             substrate_confidence=confidence,
         )
+        try:
+            self.event_bus.publish(
+                "chat.complete",
+                {
+                    "intent": frame.intent,
+                    "confidence": float(confidence),
+                    "reply_chars": len(text),
+                    "reply_preview": text[:200],
+                },
+            )
+        except Exception:
+            logger.exception("chat_reply: complete-event publish failed")
         return frame, text
 
     def _substrate_temperature_scale(self, frame: CognitiveFrame, confidence: float) -> float:
