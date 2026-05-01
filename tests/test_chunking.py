@@ -21,7 +21,7 @@ from core.chunking import (
     macro_frame_features,
     _macro_name_for_pattern,
 )
-from core.continuous_frame import COGNITIVE_FRAME_DIM
+from core.continuous_frame import BROCA_FEATURE_DIM
 
 
 class _StubJournal:
@@ -373,8 +373,8 @@ def test_compiler_run_once_caps_at_max_macros_per_tick(tmp_path):
     assert reg.count() == 1
 
 
-def test_macro_frame_features_pads_to_cognitive_dim():
-    # A short feature vector should be zero-padded to COGNITIVE_FRAME_DIM.
+def test_macro_frame_features_pads_to_broca_dim():
+    # A short feature vector should be zero-padded to BROCA_FEATURE_DIM.
     short = torch.tensor([1.0, 2.0, 3.0])
     macro = CompiledMacro(
         name="x",
@@ -385,8 +385,8 @@ def test_macro_frame_features_pads_to_cognitive_dim():
         last_seen_at=time.time(),
     )
     feats = macro_frame_features(macro)
-    assert feats.shape == (COGNITIVE_FRAME_DIM,)
+    assert feats.shape == (BROCA_FEATURE_DIM,)
     # First three slots preserved.
     assert torch.allclose(feats[:3], short)
     # Tail is zero-padded.
-    assert torch.allclose(feats[3:], torch.zeros(COGNITIVE_FRAME_DIM - 3))
+    assert torch.allclose(feats[3:], torch.zeros(BROCA_FEATURE_DIM - 3))

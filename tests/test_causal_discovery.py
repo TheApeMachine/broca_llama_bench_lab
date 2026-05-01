@@ -7,7 +7,9 @@ from core.causal_discovery import (
     _chi2_sf,
     _g_squared_independence,
     build_scm_from_skeleton,
+    local_predicate_cluster,
     pc_algorithm,
+    project_rows_to_variables,
 )
 
 
@@ -107,3 +109,27 @@ def test_build_scm_from_skeleton_runs_simulation():
     assert (
         abs(p - p0) > 0.05
     ), f"do(X=1) and do(X=0) gave same Z=1 probability ({p:.3f} vs {p0:.3f})"
+
+
+def test_local_predicate_cluster_trims_wide_schemas():
+    letters = [chr(ord("a") + i) for i in range(12)]
+    rows: list[dict[str, str]] = []
+    for i in range(15):
+        r = {p: f"v_{i}_{p}" for p in letters}
+        rows.append(r)
+    cluster = local_predicate_cluster(rows, max_variables=6, rng=random.Random(2))
+    assert len(cluster) == 6
+    assert len(set(cluster)) == 6
+    projected = project_rows_to_variables(rows, cluster)
+    assert len(projected) == len(rows)
+    assert all(len(r) == 6 for r in projected)
+
+
+def test_project_rows_to_variables_drops_sparse_rows():
+    rows = [
+        {"A": 1, "B": 2},
+        {"A": 0},
+        {"C": 3, "D": 4},
+    ]
+    out = project_rows_to_variables(rows, ["A", "B", "C", "D"])
+    assert len(out) == 2

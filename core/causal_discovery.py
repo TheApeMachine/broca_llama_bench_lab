@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import logging
 import math
+import random
 from collections import Counter
 from dataclasses import dataclass, field
 from itertools import combinations
@@ -463,3 +464,69 @@ def build_scm_from_skeleton(graph: DiscoveredGraph, rows: Sequence[Mapping[str, 
         [tuple(sorted(e)) for e in sorted(graph.undirected_edges, key=lambda e: tuple(sorted(e)))],
     )
     return scm
+
+
+def local_predicate_cluster(
+    rows: Sequence[Mapping[str, object]],
+    *,
+    max_variables: int = 20,
+    rng: random.Random | None = None,
+) -> list[str]:
+    """Grow a densely co-occurring predicate set for tractable local PC.
+
+    When semantic memory spans hundreds of predicates, running PC on the full
+    Cartesian basis is infeasible. This greedy expansion starts from a random
+    seed predicate (or falls through to the full sorted list when small) and
+    repeatedly adds the unused predicate with the strongest co-occurrence mass
+    against the current cluster.
+    """
+
+    rnd = rng if rng is not None else random.Random(0)
+    all_preds = sorted({str(k) for row in rows for k in row})
+    cap = max(3, int(max_variables))
+    if len(all_preds) <= cap:
+        return all_preds
+    co: dict[tuple[str, str], int] = {}
+    for row in rows:
+        keys = sorted({str(k) for k in row})
+        for a, b in combinations(keys, 2):
+            edge = (a, b) if a < b else (b, a)
+            co[edge] = co.get(edge, 0) + 1
+    seed = rnd.choice(all_preds)
+    cluster: list[str] = [seed]
+    while len(cluster) < cap:
+        best_next: str | None = None
+        best_score = -1
+        for cand in all_preds:
+            if cand in cluster:
+                continue
+            score = sum(
+                co[tuple(sorted((cand, c)))] for c in cluster
+            )
+            if score > best_score:
+                best_score = score
+                best_next = cand
+        if best_next is None:
+            break
+        if best_score <= 0:
+            pool = [p for p in all_preds if p not in cluster]
+            if not pool:
+                break
+            best_next = rnd.choice(pool)
+        cluster.append(best_next)
+    return sorted(cluster)
+
+
+def project_rows_to_variables(
+    rows: Sequence[Mapping[str, object]],
+    variables: Sequence[str],
+) -> list[dict[str, object]]:
+    """Project observations onto ``variables``, keeping rows with >=2 populated slots."""
+
+    varset = {str(v) for v in variables}
+    projected: list[dict[str, object]] = []
+    for row in rows:
+        sub = {str(k): row[k] for k in row if str(k) in varset}
+        if len(sub) >= 2:
+            projected.append(sub)
+    return projected

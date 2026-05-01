@@ -38,8 +38,10 @@ from .substrate_graph import EpisodeAssociationGraph, merge_epistemic_evidence_d
 from .tokenizer import SPEECH_BRIDGE_PREFIX, speech_seed_ids, utterance_words
 from .continuous_frame import (
     COGNITIVE_FRAME_DIM,
+    BROCA_FEATURE_DIM,
     FrozenSubwordProjector,
     frozen_subword_projector_from_model,
+    pack_broca_features,
     pack_cognitive_frame,
     semantic_subword_sketch,
     stable_sketch,
@@ -58,6 +60,7 @@ _LAZY_EXPORTS: dict[str, tuple[str, str]] = {
     "NativeToolRegistry": (".native_tools", "NativeToolRegistry"),
     "SandboxResult": (".native_tools", "SandboxResult"),
     "ToolSandbox": (".native_tools", "ToolSandbox"),
+    "tool_sandbox_from_env": (".native_tools", "tool_sandbox_from_env"),
     "ToolSynthesisError": (".native_tools", "ToolSynthesisError"),
     "ACTIVATION_MODE_KIND": (".dynamic_grafts", "ACTIVATION_MODE_KIND"),
     "CapturedActivationMode": (".dynamic_grafts", "CapturedActivationMode"),
@@ -99,6 +102,9 @@ _LAZY_EXPORTS: dict[str, tuple[str, str]] = {
     "pc_algorithm": (".causal_discovery", "pc_algorithm"),
     "build_scm_from_skeleton": (".causal_discovery", "build_scm_from_skeleton"),
     "DiscoveredGraph": (".causal_discovery", "DiscoveredGraph"),
+    "local_predicate_cluster": (".causal_discovery", "local_predicate_cluster"),
+    "project_rows_to_variables": (".causal_discovery", "project_rows_to_variables"),
+    "DockerToolSandbox": (".docker_sandbox", "DockerToolSandbox"),
 }
 
 
@@ -140,6 +146,7 @@ __all__ = [
     "NativeToolRegistry",
     "SandboxResult",
     "ToolSandbox",
+    "tool_sandbox_from_env",
     "ToolSynthesisError",
     "ACTIVATION_MODE_KIND",
     "CapturedActivationMode",
@@ -185,9 +192,11 @@ __all__ = [
     "speech_seed_ids",
     "utterance_words",
     "COGNITIVE_FRAME_DIM",
+    "BROCA_FEATURE_DIM",
     "FrozenSubwordProjector",
     "frozen_subword_projector_from_model",
     "pack_cognitive_frame",
+    "pack_broca_features",
     "semantic_subword_sketch",
     "stable_sketch",
     "VSACodebook",
@@ -220,6 +229,9 @@ __all__ = [
     "pc_algorithm",
     "build_scm_from_skeleton",
     "DiscoveredGraph",
+    "local_predicate_cluster",
+    "project_rows_to_variables",
+    "DockerToolSandbox",
 ]
 
 _auto_log = str(os.environ.get("AUTO_CONFIGURE_LAB_LOGGING", "")).strip().lower()

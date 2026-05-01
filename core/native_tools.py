@@ -24,9 +24,9 @@ The pipeline:
     ``scm.add_endogenous(...)`` for every persisted tool, growing the SCM's
     structural graph at runtime.
 
-The sandbox is intentionally restrictive — no imports, no I/O, no
-attribute access on disallowed objects — because the substrate may
-synthesize tools from inputs (LLM completions) it does not fully trust.
+Optional **Docker** execution (``BROCA_USE_DOCKER_TOOLS``) uses
+:class:`docker_sandbox.DockerToolSandbox`: tools run in ``python:3.11-slim``
+with imports and the standard library available, still without host ``exec``.
 """
 
 from __future__ import annotations
@@ -35,6 +35,7 @@ import ast
 import inspect
 import json
 import logging
+import os
 import sqlite3
 import threading
 import time
@@ -274,6 +275,18 @@ class ToolSandbox:
         return outputs
 
 
+def tool_sandbox_from_env() -> ToolSandbox:
+    """Return :class:`DockerToolSandbox` when ``BROCA_USE_DOCKER_TOOLS`` is set, else in-process sandbox."""
+
+    flag = os.environ.get("BROCA_USE_DOCKER_TOOLS", "").strip().lower()
+    if flag in ("1", "true", "yes", "on"):
+        from .docker_sandbox import DockerToolSandbox
+
+        logger.info("native tools: DockerToolSandbox enabled via BROCA_USE_DOCKER_TOOLS")
+        return DockerToolSandbox()
+    return ToolSandbox()
+
+
 # ---------------------------------------------------------------------------
 # Native tool registry
 # ---------------------------------------------------------------------------
@@ -336,7 +349,7 @@ class NativeToolRegistry:
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.namespace = str(namespace)
-        self.sandbox = sandbox or ToolSandbox()
+        self.sandbox = sandbox if sandbox is not None else tool_sandbox_from_env()
         self._db_lock = threading.RLock()
         self._conn: sqlite3.Connection | None = None
         self._init_schema()
@@ -749,6 +762,7 @@ __all__ = [
     "ToolSynthesisError",
     "ToolSandbox",
     "SandboxResult",
+    "tool_sandbox_from_env",
     "NativeTool",
     "NativeToolRegistry",
 ]

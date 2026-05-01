@@ -56,10 +56,12 @@ from .chunking import (
     macro_frame_features,
 )
 from .continuous_frame import (
+    BROCA_FEATURE_DIM,
     COGNITIVE_FRAME_DIM,
     SKETCH_DIM,
     TextEncoder,
     frozen_subword_projector_from_model,
+    pack_broca_features,
     pack_cognitive_frame,
     stable_sketch,
 )
@@ -70,13 +72,18 @@ from .llama_broca_host import LlamaBrocaHost, load_llama_broca_host
 from .predictive_coding import lexical_surprise_gap
 from .substrate_graph import EpisodeAssociationGraph, merge_epistemic_evidence_dict
 from .tokenizer import speech_seed_ids, utterance_words
-from .vsa import VSACodebook
+from .vsa import VSACodebook, bundle, cosine as vsa_cosine
 from .hopfield import HopfieldAssociativeMemory
 from .conformal import ConformalPredictor, PersistentConformalCalibration
 from .hawkes import MultivariateHawkesProcess, PersistentHawkes, fit_excitation_em
 from .preference_learning import DirichletPreference, PersistentPreference, feedback_polarity_from_text
 from .ontological_expansion import OntologicalRegistry, PersistentOntologicalRegistry
-from .causal_discovery import pc_algorithm, build_scm_from_skeleton
+from .causal_discovery import (
+    build_scm_from_skeleton,
+    local_predicate_cluster,
+    pc_algorithm,
+    project_rows_to_variables,
+)
 from .native_tools import NativeTool, NativeToolRegistry, ToolSandbox, ToolSynthesisError
 from .dynamic_grafts import DynamicGraftSynthesizer, CapturedActivationMode, ACTIVATION_MODE_KIND
 from .memory import SQLiteActivationMemory
@@ -207,12 +214,19 @@ class LLMRelationExtractor(RelationExtractor):
     the remaining faculties (active inference, causal effect) instead of
     fabricating a triple from string-splitting.
 
+    When ``use_ensemble`` is True, a second prompt variant runs and can recover
+    a triple when the primary phrasing fails; substrate-side refinement then
+    disambiguates fillers against memory and VSA context.
+
     The host must expose ``host.llm.generate`` and the tokenizer must expose
     ``tokenizer.inner`` with the standard HuggingFace surface (``__call__``
     returning ``input_ids``/``attention_mask``, plus ``decode``); production
     use is wired up by :class:`BrocaMind`. Tests should provide an HF-shaped
     stub LLM with the desired generation behavior.
     """
+
+    VARIANT_PRIMARY = "primary"
+    VARIANT_ENSEMBLE = "ensemble_alt"
 
     PROMPT_TEMPLATE = (
         "Extract the subject, relation, and object of each sentence as JSON. "
@@ -227,93 +241,135 @@ class LLMRelationExtractor(RelationExtractor):
         "JSON: "
     )
 
-    def __init__(self, host: Any, tokenizer: Any, *, max_new_tokens: int = 64, cache_size: int = 256):
+    PROMPT_TEMPLATE_ENSEMBLE = (
+        "Task: output exactly one JSON object with keys subject, relation, object. "
+        "Lowercase entity strings; relation is the main verb phrase.\n"
+        "Sentence: ada is in rome .\n"
+        'JSON: {"subject":"ada","relation":"is in","object":"rome"}\n'
+        "Sentence: <SENTENCE>\n"
+        "JSON: "
+    )
+
+    def __init__(
+        self,
+        host: Any,
+        tokenizer: Any,
+        *,
+        max_new_tokens: int = 64,
+        cache_size: int = 256,
+        use_ensemble: bool = True,
+    ):
         self.host = host
         self.tokenizer = tokenizer
         self.max_new_tokens = int(max_new_tokens)
-        self._cache: dict[str, tuple[str, str, str] | None] = {}
+        self.use_ensemble = bool(use_ensemble)
+        self._cache: dict[tuple[str, str], tuple[str, str, str] | None] = {}
         self._cache_size = max(0, int(cache_size))
 
     def extract_claim(self, utterance: str, toks: Sequence[str]) -> "ParsedClaim | None":
         if _is_question(toks):
             logger.debug(f"extract_claim: {utterance} {toks} is question")
             return None
-        
+
         words = list(_word_tokens(toks))
-        
+
         if len(words) < 3:
             logger.debug(f"extract_claim: {utterance} {toks} too few words")
             return None
-        
-        triple = self._llm_extract(utterance)
-        
+
+        triple_a = self._llm_extract(utterance, variant=self.VARIANT_PRIMARY)
+        triple_b = (
+            self._llm_extract(utterance, variant=self.VARIANT_ENSEMBLE)
+            if self.use_ensemble
+            else None
+        )
+        if triple_a is None:
+            triple = triple_b
+            ensemble_note = "fallback_alt_prompt"
+        elif triple_b is None or triple_b == triple_a:
+            triple = triple_a
+            ensemble_note = "single_extractor"
+        else:
+            triple = triple_a
+            ensemble_note = "disagreement_primary_kept"
+
         if triple is None:
             logger.debug(f"extract_claim: {utterance} {toks} no triple")
             return None
-        
+
         subject, predicate, obj = triple
-        
+
         logger.debug(f"extract_claim: {utterance} {toks} {triple}")
-        
+
         return ParsedClaim(
             subject=subject.lower(),
             predicate=predicate.lower(),
             obj=obj.lower(),
-            confidence=1.0,
+            confidence=0.92 if ensemble_note == "disagreement_primary_kept" else 1.0,
             evidence={
                 "parser": "llm_relation_extractor",
                 "predicate_surface": predicate,
                 "source_words": words,
                 "utterance": utterance,
+                "ensemble": ensemble_note,
+                "alt_triple": triple_b if triple_b is not None and triple_b != triple_a else None,
             },
         )
 
-    def _llm_extract(self, utterance: str) -> tuple[str, str, str] | None:
-        key = utterance.strip()
-        
+    def _llm_extract(self, utterance: str, *, variant: str) -> tuple[str, str, str] | None:
+        key = (utterance.strip(), variant)
+
         if key in self._cache:
-            logger.debug(f"_llm_extract: {utterance} {key} in cache")
+            logger.debug(f"_llm_extract: cache hit variant=%s", variant)
             return self._cache[key]
-        
-        result = self._llm_extract_uncached(key)
+
+        result = self._llm_extract_uncached(utterance.strip(), variant=variant)
 
         if self._cache_size > 0:
             if len(self._cache) >= self._cache_size:
                 self._cache.pop(next(iter(self._cache)))
-        
+
             self._cache[key] = result
-        
-        logger.debug(f"_llm_extract: {utterance} {key} {result}")
+
+        logger.debug(f"_llm_extract: {utterance} {variant} {result}")
         return result
 
-    def _llm_extract_uncached(self, utterance: str) -> tuple[str, str, str] | None:
+    def _llm_extract_uncached(self, utterance: str, *, variant: str) -> tuple[str, str, str] | None:
         llm = self.host.llm
         hf_tok = self.tokenizer.inner
-        prompt = self.PROMPT_TEMPLATE.replace("<SENTENCE>", utterance)
+        tpl = self.PROMPT_TEMPLATE_ENSEMBLE if variant == self.VARIANT_ENSEMBLE else self.PROMPT_TEMPLATE
+        prompt = tpl.replace("<SENTENCE>", utterance)
         device = next(llm.parameters()).device
         encoded = hf_tok(prompt, return_tensors="pt")
         input_ids = encoded["input_ids"].to(device)
         attention_mask = encoded.get("attention_mask")
-        
+
         if attention_mask is not None:
             attention_mask = attention_mask.to(device)
-        
+
         pad_id = getattr(hf_tok, "pad_token_id", None)
         if pad_id is None:
             pad_id = getattr(hf_tok, "eos_token_id", None)
-        
+
+        do_sample = bool(variant == self.VARIANT_ENSEMBLE)
+        gen_kw: dict[str, Any] = {
+            "input_ids": input_ids,
+            "max_new_tokens": self.max_new_tokens,
+            "do_sample": do_sample,
+            "pad_token_id": pad_id,
+        }
+        if attention_mask is not None:
+            gen_kw["attention_mask"] = attention_mask
+        if do_sample:
+            gen_kw["temperature"] = 0.35
+            gen_kw["top_p"] = 0.95
+
         with torch.no_grad():
-            output = llm.generate(
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                max_new_tokens=self.max_new_tokens,
-                do_sample=False,
-                pad_token_id=pad_id,
-            )
-        generated = output[0, input_ids.shape[1]:]
+            output = llm.generate(**gen_kw)
+        generated = output[0, input_ids.shape[1] :]
         new_text = hf_tok.decode(generated, skip_special_tokens=True)
-        
-        logger.debug("_llm_extract_uncached: utterance=%r raw_json_fragment=%r", utterance, new_text[:512] if len(new_text) > 512 else new_text)
+
+        logger.debug("_llm_extract_uncached: utterance=%r variant=%s raw=%r", utterance, variant, new_text[:512] if len(new_text) > 512 else new_text)
         return self._parse_json_triple(new_text)
 
     @staticmethod
@@ -444,9 +500,15 @@ def _claim_prediction_gap(mind: "BrocaMind", utterance: str, claim: ParsedClaim)
 
     try:
         plan_words = [claim.subject, claim.predicate, claim.obj, "."]
-        broca_features = pack_cognitive_frame(
-            "memory_write", claim.subject, claim.obj, float(claim.confidence), claim.evidence,
+        broca_features = pack_broca_features(
+            "memory_write",
+            claim.subject,
+            claim.obj,
+            float(claim.confidence),
+            claim.evidence,
             text_encoder=mind.text_encoder,
+            vsa_bundle=mind.encode_triple_vsa(claim.subject, claim.predicate, claim.obj),
+            vsa_projection_seed=int(mind.seed),
         )
         _ce_g, _ce_p, gap = lexical_surprise_gap(
             mind.host,
@@ -565,7 +627,7 @@ class PersistentSemanticMemory:
         """Lazy single connection per memory store (WAL, safe across threads via lock)."""
 
         if self._conn is None:
-            self._conn = sqlite3.connect(str(self.path), check_same_thread=False)
+            self._conn = sqlite3.connect(str(self.path), check_same_thread=False, timeout=30.0)
             self._conn.execute("PRAGMA journal_mode=WAL")
         return self._conn
 
@@ -886,6 +948,8 @@ class PersistentSemanticMemory:
                 dedupe = f"belief_revision:{subject}:{predicate}:{current_obj}->{best_obj}:{claim_ids_digest}"
                 with self._sqlite_lock:
                     con = self._ensure_conn()
+                    if con.in_transaction:
+                        con.rollback()
                     con.execute("BEGIN")
                     try:
                         reflection_id = self.record_reflection(
@@ -1211,7 +1275,7 @@ class WorkspaceJournal:
         self._init_schema()
 
     def _connect(self) -> sqlite3.Connection:
-        con = sqlite3.connect(self.path)
+        con = sqlite3.connect(self.path, timeout=30.0)
         con.execute("PRAGMA journal_mode=WAL")
         return con
 
@@ -1446,6 +1510,8 @@ class DMNConfig:
     sleep_max_replay: int = 32
     sleep_min_observations_for_pc: int = 24
     sleep_pc_alpha: float = 0.05
+    sleep_pc_max_variables: int = 20
+    sleep_pc_max_conditioning_size: int = 3
     sleep_hawkes_min_events: int = 6
 
 
@@ -2071,22 +2137,44 @@ class CognitiveBackgroundWorker:
                 reflections.append({"kind": "rem_hawkes_refit", **hawkes_summary})
         summary["hawkes"] = hawkes_summary
 
-        # 3. Causal discovery — re-run PC on observation memory and rebuild SCM.
+        # 3. Causal discovery — local PC on a small predicate cluster, then rebuild SCM.
         cd_summary: dict[str, Any] = {"ran": False}
         try:
-            observations = self._collect_observations_for_pc()
+            full_rows = self._collect_observations_for_pc()
         except Exception:
             logger.exception("REM.causal_discovery: observation collection failed")
-            observations = []
+            full_rows = []
+        observations: list[dict[str, object]] = []
+        pc_variables: list[str] | None = None
+        if len(full_rows) >= cfg.sleep_min_observations_for_pc:
+            all_vars = sorted({str(k) for row in full_rows for k in row})
+            if len(all_vars) > int(cfg.sleep_pc_max_variables):
+                cluster = local_predicate_cluster(
+                    full_rows,
+                    max_variables=int(cfg.sleep_pc_max_variables),
+                    rng=self._rng,
+                )
+                observations = project_rows_to_variables(full_rows, cluster)
+                pc_variables = cluster
+            else:
+                observations = full_rows
+                pc_variables = None
         if len(observations) >= cfg.sleep_min_observations_for_pc:
             try:
-                graph = pc_algorithm(observations, alpha=cfg.sleep_pc_alpha)
+                graph = pc_algorithm(
+                    observations,
+                    pc_variables,
+                    alpha=cfg.sleep_pc_alpha,
+                    max_conditioning_size=int(cfg.sleep_pc_max_conditioning_size),
+                )
                 if graph.directed_edges or graph.undirected_edges:
                     new_scm = build_scm_from_skeleton(graph, observations)
                     self.mind.discovered_scm = new_scm
                     cd_summary = {
                         "ran": True,
                         "n_observations": len(observations),
+                        "n_predicate_columns": len(graph.variables),
+                        "local_pc": pc_variables is not None,
                         "directed_edges": [list(e) for e in sorted(graph.directed_edges)],
                         "undirected_edges": [sorted(list(e)) for e in graph.undirected_edges],
                         "variables": list(graph.variables),
@@ -2450,6 +2538,8 @@ class CognitiveRouter:
     def route(self, mind: "BrocaMind", utterance: str, toks: Sequence[str]) -> CognitiveFrame:
         candidates: list[FacultyCandidate] = []
         claim = self.extractor.extract_claim(utterance, toks)
+        if claim is not None:
+            claim = mind.refine_extracted_claim(utterance, toks, claim)
         query = _query_from_tokens(
             toks,
             utterance=utterance,
@@ -2574,7 +2664,7 @@ class CognitiveRouter:
             return frame
 
         plan_words = frame.speech_plan()
-        broca_features = frame.to_features(mind.text_encoder)
+        broca_features = mind.broca_features_from_frame(frame)
         ce_g, ce_p, gap = lexical_surprise_gap(
             mind.host,
             mind.tokenizer,
@@ -2696,7 +2786,7 @@ class BrocaMind:
         self.lexical_graft = LexicalPlanGraft(target_snr=snr)
         self.host.add_graft("final_hidden", self.lexical_graft)
         self.feature_graft = TrainableBrocaGraft(
-            COGNITIVE_FRAME_DIM,
+            BROCA_FEATURE_DIM,
             int(getattr(self.host.cfg, "d_model", 96)),
             target_snr=snr,
         )
@@ -2844,6 +2934,125 @@ class BrocaMind:
 
         return self.vsa.encode_triple(subject, predicate, obj)
 
+    def _padded_hopfield_sketch(self, sketch: torch.Tensor) -> torch.Tensor:
+        """Embed a lexical sketch in the Hopfield model width (zeros outside the sketch prefix)."""
+
+        d = self.hopfield_memory.d_model
+        out = torch.zeros(d, dtype=torch.float32)
+        s = sketch.detach().float().view(-1)
+        n = min(int(s.numel()), d)
+        if n > 0:
+            out[:n] = s[:n]
+        return out
+
+    def broca_features_from_frame(self, frame: CognitiveFrame) -> torch.Tensor:
+        """Sketch frame + numeric tail + sparse VSA injection for :class:`TrainableBrocaGraft`."""
+
+        vsa_vec: torch.Tensor | None = None
+        if frame.subject and frame.answer and str(frame.answer).lower() not in {"", "unknown"}:
+            pr = str((frame.evidence or {}).get("predicate", frame.intent))
+            try:
+                vsa_vec = self.encode_triple_vsa(str(frame.subject), pr, str(frame.answer))
+            except (RuntimeError, ValueError, TypeError):
+                logger.debug("broca_features_from_frame: VSA encode skipped", exc_info=True)
+        return pack_broca_features(
+            frame.intent,
+            frame.subject,
+            frame.answer,
+            float(frame.confidence),
+            frame.evidence,
+            text_encoder=self.text_encoder,
+            vsa_bundle=vsa_vec,
+            vsa_projection_seed=int(self.seed),
+        )
+
+    def refine_extracted_claim(
+        self, utterance: str, toks: Sequence[str], claim: ParsedClaim
+    ) -> ParsedClaim:
+        """Contextual cleanup of LLM-parsed triples using VSA similarity + optional Hopfield memory."""
+
+        words = [w.lower() for w in _word_tokens(toks)]
+        ctx_words = [w for w in words if len(w) > 1][:28]
+        if len(ctx_words) < 2:
+            return claim
+        try:
+            ctx_bundle = bundle([self.vsa.atom(w) for w in ctx_words])
+        except (RuntimeError, ValueError, TypeError):
+            logger.debug("refine_extracted_claim: context bundle failed", exc_info=True)
+            return claim
+
+        pred = claim.predicate.lower()
+        candidates_obj: set[str] = {claim.obj.lower()}
+        try:
+            candidates_obj |= set(self.memory.distinct_objects_for_predicate(pred))
+        except (sqlite3.Error, OSError, TypeError):
+            logger.debug("refine_extracted_claim: predicate object lookup failed", exc_info=True)
+        try:
+            for _s, _p, o, _c, _e in self.memory.all_facts():
+                ol = str(o).lower()
+                if claim.obj.lower() in ol or ol in claim.obj.lower() or ol in words:
+                    candidates_obj.add(ol)
+        except (sqlite3.Error, OSError, TypeError):
+            logger.debug("refine_extracted_claim: all_facts scan failed", exc_info=True)
+
+        candidates_obj = {c for c in candidates_obj if c}
+        best_obj = claim.obj.lower()
+        try:
+            base_trip = self.vsa.encode_triple(claim.subject.lower(), pred, best_obj)
+            base_sim = vsa_cosine(ctx_bundle, base_trip)
+        except (RuntimeError, ValueError, TypeError):
+            return claim
+
+        for cand in candidates_obj:
+            if cand == best_obj:
+                continue
+            try:
+                trip = self.vsa.encode_triple(claim.subject.lower(), pred, cand)
+                sc = vsa_cosine(ctx_bundle, trip)
+                if sc > base_sim + 0.03:
+                    base_sim = sc
+                    best_obj = cand
+            except (RuntimeError, ValueError, TypeError):
+                continue
+
+        try:
+            q = self._padded_hopfield_sketch(stable_sketch(utterance[:512]))
+            if len(self.hopfield_memory) > 0:
+                ret, w = self.hopfield_memory.retrieve(q)
+                if w.numel() and float(w.max().item()) > 0.2:
+                    hf_best: str | None = None
+                    hf_score = -1.0
+                    u = ret[:SKETCH_DIM]
+                    for cand in candidates_obj:
+                        cc = float(
+                            F.cosine_similarity(
+                                u.view(1, -1),
+                                stable_sketch(cand).view(1, -1),
+                            ).item()
+                        )
+                        if cc > hf_score:
+                            hf_score = cc
+                            hf_best = cand
+                    if hf_best is not None and hf_score > 0.38 and hf_best != best_obj:
+                        trip_h = self.vsa.encode_triple(claim.subject.lower(), pred, hf_best)
+                        if vsa_cosine(ctx_bundle, trip_h) >= base_sim - 0.02:
+                            best_obj = hf_best
+        except (RuntimeError, ValueError, TypeError):
+            logger.debug("refine_extracted_claim: Hopfield assist failed", exc_info=True)
+
+        if best_obj == claim.obj.lower():
+            return claim
+        ev = dict(claim.evidence)
+        ev["wernicke_refine"] = "vsa_hopfield_object"
+        ev["object_before_refine"] = claim.obj
+        return ParsedClaim(
+            subject=claim.subject,
+            predicate=claim.predicate,
+            obj=best_obj,
+            confidence=min(1.0, float(claim.confidence) * 0.95),
+            evidence=ev,
+        )
+
     # -- Native tool synthesis -------------------------------------------------
 
     def synthesize_native_tool(
@@ -2938,7 +3147,7 @@ class BrocaMind:
         return self.macro_registry.find_macro_matching_prefix(recent)
 
     def macro_speech_features(self, macro: CompiledMacro) -> torch.Tensor:
-        """Return the COGNITIVE_FRAME_DIM-shaped features the macro should inject via TrainableBrocaGraft."""
+        """Return the BROCA_FEATURE_DIM-shaped features the macro should inject via TrainableBrocaGraft."""
 
         return macro_frame_features(macro)
 
@@ -3073,9 +3282,17 @@ class BrocaMind:
         # Bind the triple into the VSA codebook for algebraic recall.
         if out.subject and out.answer and out.intent in {"memory_write", "memory_lookup"}:
             try:
-                self.vsa.encode_triple(out.subject, str((out.evidence or {}).get("predicate", out.intent)), out.answer)
+                pr_bind = str((out.evidence or {}).get("predicate", out.intent))
+                self.vsa.encode_triple(out.subject, pr_bind, out.answer)
+                ut_sk = stable_sketch(utterance[:512])
+                trip_sk = stable_sketch(f"{out.subject}|{pr_bind}|{out.answer}")
+                self.hopfield_memory.remember(
+                    self._padded_hopfield_sketch(ut_sk),
+                    self._padded_hopfield_sketch(trip_sk),
+                    metadata={"kind": "declarative_binding", "intent": out.intent},
+                )
             except Exception:
-                logger.exception("comprehend: vsa encode failed")
+                logger.exception("comprehend: vsa/hopfield binding failed")
         logger.debug(
             "comprehend: intent=%s confidence=%s journal_id=%s",
             out.intent,
@@ -3143,7 +3360,7 @@ class BrocaMind:
             self.host,
             self.tokenizer,
             frame.speech_plan(),
-            broca_features=frame.to_features(self.text_encoder),
+            broca_features=self.broca_features_from_frame(frame),
         )
 
     def answer(self, utterance: str, *, max_new_tokens: int | None = None) -> tuple[CognitiveFrame, str]:
@@ -3183,7 +3400,7 @@ class BrocaMind:
         user_text = str(msgs[-1].get("content", "")).strip()
         frame = self.comprehend(user_text)
 
-        broca_features = frame.to_features(self.text_encoder) if frame.intent != "unknown" else None
+        broca_features = self.broca_features_from_frame(frame) if frame.intent != "unknown" else None
         logit_bias = self._content_logit_bias(frame)
         confidence = max(0.0, min(1.0, float(frame.confidence)))
         eff_temperature = max(

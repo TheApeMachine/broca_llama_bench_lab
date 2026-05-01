@@ -92,7 +92,19 @@ class StubGenerationLLM:
     def parameters(self):
         yield torch.zeros(1, device=self.device)
 
-    def generate(self, *, input_ids, attention_mask=None, max_new_tokens=64, do_sample=False, pad_token_id=None):
+    def generate(
+        self,
+        *,
+        input_ids,
+        attention_mask=None,
+        max_new_tokens=64,
+        do_sample=False,
+        pad_token_id=None,
+        temperature=None,
+        top_p=None,
+        **kwargs,
+    ):
+        _ = attention_mask, max_new_tokens, do_sample, pad_token_id, temperature, top_p, kwargs
         return torch.zeros((1, input_ids.shape[1] + 4), dtype=torch.long, device=self.device)
 
 

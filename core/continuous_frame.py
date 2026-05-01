@@ -36,7 +36,41 @@ NUMERIC_FEATURE_FIELDS = (
 
 NUMERIC_TAIL_LEN = len(NUMERIC_FEATURE_FIELDS)
 COGNITIVE_FRAME_DIM = SKETCH_DIM * 3 + NUMERIC_TAIL_LEN
+# Injected holographic triple signal (fixed sparse projection of VSA hypervectors).
+VSA_INJECTION_DIM = 64
+BROCA_FEATURE_DIM = COGNITIVE_FRAME_DIM + VSA_INJECTION_DIM
 TextEncoder = Callable[[str], torch.Tensor]
+
+
+def sparse_project_hypervector(
+    v: torch.Tensor,
+    *,
+    dim_out: int,
+    seed: int,
+    n_nonzero: int = 128,
+) -> torch.Tensor:
+    """Deterministic sparse random projection of a VSA vector into ``dim_out`` dims.
+
+    Uses hashed index/sgn draws so projection is cheap at d=10k and stable
+    across processes for a given ``seed`` (Broca seed / run id).
+    """
+
+    d_in = int(v.numel())
+    out_dim = int(dim_out)
+    if out_dim <= 0:
+        raise ValueError("dim_out must be positive")
+    k = max(1, min(int(n_nonzero), d_in))
+    g = torch.Generator(device="cpu")
+    g.manual_seed(int(seed) & 0x7FFFFFFFFFFFFFFF)
+    out = torch.zeros(out_dim, dtype=torch.float32)
+    v32 = v.detach().float().cpu().view(-1)
+    scale = 1.0 / math.sqrt(float(k))
+    for j in range(out_dim):
+        idx = torch.randint(0, d_in, (k,), generator=g)
+        sgn = torch.randint(0, 2, (k,), generator=g, dtype=torch.float32) * 2.0 - 1.0
+        out[j] = (v32[idx] * sgn).sum() * scale
+    n = out.norm().clamp_min(1e-12)
+    return out / n
 
 
 def _tokens(text: str) -> list[str]:
@@ -235,3 +269,30 @@ def pack_cognitive_frame(
         dim=0,
     )
     return parts
+
+
+def pack_broca_features(
+    intent: str,
+    subject: str,
+    answer: str,
+    confidence: float,
+    evidence: dict[str, Any] | None,
+    *,
+    text_encoder: TextEncoder | None = None,
+    vsa_bundle: torch.Tensor | None = None,
+    vsa_projection_seed: int = 0,
+) -> torch.Tensor:
+    """Full Broca graft input: cognitive frame sketches plus optional VSA injection."""
+
+    base = pack_cognitive_frame(
+        intent, subject, answer, confidence, evidence, text_encoder=text_encoder
+    )
+    if vsa_bundle is None:
+        tail = torch.zeros(VSA_INJECTION_DIM, dtype=torch.float32)
+    else:
+        tail = sparse_project_hypervector(
+            vsa_bundle,
+            dim_out=VSA_INJECTION_DIM,
+            seed=int(vsa_projection_seed),
+        )
+    return torch.cat([base, tail], dim=0)

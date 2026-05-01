@@ -31,7 +31,7 @@ from typing import Iterable, Sequence
 import numpy as np
 import torch
 
-from .continuous_frame import COGNITIVE_FRAME_DIM
+from .continuous_frame import BROCA_FEATURE_DIM
 
 
 logger = logging.getLogger(__name__)
@@ -521,10 +521,11 @@ class DMNChunkingCompiler:
 
 
 def macro_frame_features(macro: CompiledMacro) -> torch.Tensor:
-    """Return the macro's compiled feature vector reshaped to ``COGNITIVE_FRAME_DIM``.
+    """Return the macro's compiled feature vector reshaped to ``BROCA_FEATURE_DIM``.
 
     Pads or truncates as needed so a stale macro persisted under a previous
-    feature dimension still loads cleanly.
+    feature dimension still loads cleanly. VSA injection tail is zero for
+    macros (loaded motifs predate the current utterance's holographic bind).
     """
 
-    return _align_vec_to_dim(macro.feature_vector, COGNITIVE_FRAME_DIM)
+    return _align_vec_to_dim(macro.feature_vector, BROCA_FEATURE_DIM)

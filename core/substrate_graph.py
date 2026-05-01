@@ -24,7 +24,7 @@ class EpisodeAssociationGraph:
         self._init_schema()
 
     def _connect(self) -> sqlite3.Connection:
-        con = sqlite3.connect(self.path)
+        con = sqlite3.connect(self.path, timeout=30.0)
         con.execute("PRAGMA journal_mode=WAL")
         return con
 

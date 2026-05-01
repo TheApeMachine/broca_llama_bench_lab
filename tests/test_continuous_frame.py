@@ -4,7 +4,14 @@ import uuid
 
 import torch
 
-from core.continuous_frame import COGNITIVE_FRAME_DIM, FrozenSubwordProjector, pack_cognitive_frame, stable_sketch
+from core.continuous_frame import (
+    BROCA_FEATURE_DIM,
+    COGNITIVE_FRAME_DIM,
+    FrozenSubwordProjector,
+    pack_broca_features,
+    pack_cognitive_frame,
+    stable_sketch,
+)
 from core.tokenizer import RegexTokenizer, SPEECH_BRIDGE_PREFIX, speech_seed_ids
 
 
@@ -30,6 +37,31 @@ def test_pack_cognitive_frame_shape_stays_fixed_for_open_vocab():
 
     assert feats.shape == (COGNITIVE_FRAME_DIM,)
     assert torch.isfinite(feats).all()
+
+
+def test_pack_broca_features_extends_cognitive_frame_with_vsa_tail():
+    v = torch.nn.functional.normalize(torch.ones(128), dim=0)
+    intent, subject, obj = _symbol("intent"), _symbol("subject"), _symbol("object")
+    full = pack_broca_features(
+        intent,
+        subject,
+        obj,
+        0.8,
+        {"ate": 0.2},
+        vsa_bundle=v,
+        vsa_projection_seed=3,
+    )
+    base = pack_cognitive_frame(
+        intent,
+        subject,
+        obj,
+        0.8,
+        {"ate": 0.2},
+    )
+    assert full.shape == (BROCA_FEATURE_DIM,)
+    assert base.shape == (COGNITIVE_FRAME_DIM,)
+    assert torch.allclose(full[: COGNITIVE_FRAME_DIM], base)
+    assert full[COGNITIVE_FRAME_DIM:].norm() > 1e-6
 
 
 def test_frozen_subword_projector_preserves_embedding_geometry():
