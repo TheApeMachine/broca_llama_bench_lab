@@ -1,0 +1,14 @@
+\section{Methods}
+\label{sec:methods}
+
+\paragraph{Architecture overview.}
+The implementation couples a frozen causal language model (Llama~3.2 class
+checkpoints) to a Broca substrate: workspace frames, semantic memory, and
+graft-based control pathways. See the repository \texttt{README} and module
+\texttt{core.broca} for design detail.
+
+\paragraph{Evaluation protocol.}
+Leaderboard-style accuracy uses the in-repository HuggingFace
+\texttt{datasets} harness with length-normalized multiple-choice scoring and
+greedy generation for math-style tasks. Orthogonal \emph{architecture probes}
+compare bare generation against the full Broca stack on scripted prompts.

@@ -37,6 +37,7 @@ def test_negative_update_shrinks_alpha_strictly_positive():
 
 def test_epistemic_floor_clamps_negative_update():
     pref = DirichletPreference(n_observations=3, prior_strength=10.0)
+    initial_alpha = pref.alpha[0]
     pref.update(
         0,
         polarity=-8.0,
@@ -44,6 +45,7 @@ def test_epistemic_floor_clamps_negative_update():
         epistemic_alpha_floor=2.5,
     )
     assert pref.alpha[0] >= 2.5 - 1e-6
+    assert pref.alpha[0] < initial_alpha
 
 
 def test_kl_to_uniform_grows_with_concentration():

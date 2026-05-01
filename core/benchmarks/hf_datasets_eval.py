@@ -750,6 +750,10 @@ def plot_results(results: Mapping[str, Any], out_dir: Path) -> None:
     plt.setp(ax.get_xticklabels(), rotation=40, ha="right")
     fig.tight_layout()
     fig.savefig(out_dir / "accuracy_by_task.png", dpi=150)
+    try:
+        fig.savefig(out_dir / "accuracy_by_task.pdf", format="pdf")
+    except Exception:  # pragma: no cover - rare backend/font issues
+        pass
     plt.close(fig)
 
 
@@ -1031,6 +1035,7 @@ def run_hf_datasets_benchmark(
             "per_task_csv": "per_task.csv",
             "aggregate_csv": "aggregate.csv",
             "accuracy_plot_png": "accuracy_by_task.png",
+            "accuracy_plot_pdf": "accuracy_by_task.pdf",
             "latex_table": "summary_table.tex",
         },
     }

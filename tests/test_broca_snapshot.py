@@ -35,22 +35,21 @@ class _FakeTok:
 
 @pytest.fixture
 def fake_host_loader(monkeypatch: pytest.MonkeyPatch):
-    def _make() -> _FakeHost:
+    """Return (host, mind) after patching the Llama host loader — no implicit ordering."""
+
+    def _setup(tmp_path: Path) -> tuple[_FakeHost, BrocaMind]:
         host = _FakeHost()
         tok = _FakeTok(host._stub_tokenizer)
         monkeypatch.setattr(broca_mod, "load_llama_broca_host", lambda *a, **k: (host, tok))
-        return host
+        mind = BrocaMind(seed=0, db_path=tmp_path / "snap.sqlite", namespace="snap")
+        return host, mind
 
-    return _make
-
-
-def _new_mind(tmp_path: Path) -> BrocaMind:
-    return BrocaMind(seed=0, db_path=tmp_path / "snap.sqlite", namespace="snap")
+    return _setup
 
 
 def test_snapshot_has_expected_top_level_keys(tmp_path: Path, fake_host_loader):
-    fake_host_loader()
-    mind = _new_mind(tmp_path)
+    _host, mind = fake_host_loader(tmp_path)
+    del _host  # constructed for side effect of loader patch + explicit pairing
     snap = mind.snapshot()
     for key in (
         "ts",
@@ -72,13 +71,12 @@ def test_snapshot_has_expected_top_level_keys(tmp_path: Path, fake_host_loader):
     assert snap["workspace"]["frames_total"] == 0
     assert snap["background"]["running"] is False
     assert snap["self_improve"]["enabled"] is False
-    # The hawkes channels list grows with usage; fresh mind starts at 0.
-    assert isinstance(snap["substrate"]["hawkes_channels"], int)
+    assert snap["substrate"]["hawkes_channels"] == 0
 
 
 def test_snapshot_reflects_workspace_publish(tmp_path: Path, fake_host_loader):
-    fake_host_loader()
-    mind = _new_mind(tmp_path)
+    _host, mind = fake_host_loader(tmp_path)
+    del _host
     # Publish a frame directly to the in-memory workspace (no SQLite involved)
     # so we can verify the snapshot picks it up without going through the
     # journal-write path.
@@ -93,8 +91,8 @@ def test_snapshot_reflects_workspace_publish(tmp_path: Path, fake_host_loader):
 
 
 def test_consolidate_once_publishes_event(tmp_path: Path, fake_host_loader):
-    fake_host_loader()
-    mind = _new_mind(tmp_path)
+    _host, mind = fake_host_loader(tmp_path)
+    del _host
     bus = EventBus()
     mind.event_bus = bus
     sub = bus.subscribe("*")
@@ -107,8 +105,8 @@ def test_consolidate_once_publishes_event(tmp_path: Path, fake_host_loader):
 
 
 def test_snapshot_includes_last_chat_meta_when_set(tmp_path: Path, fake_host_loader):
-    fake_host_loader()
-    mind = _new_mind(tmp_path)
+    _host, mind = fake_host_loader(tmp_path)
+    del _host
     mind._last_chat_meta = {
         "intent": "memory_lookup",
         "confidence": 0.9,
@@ -121,3 +119,4 @@ def test_snapshot_includes_last_chat_meta_when_set(tmp_path: Path, fake_host_loa
     assert snap["last_chat"] is not None
     assert snap["last_chat"]["intent"] == "memory_lookup"
     assert snap["last_chat"]["bias_token_count"] == 3
+

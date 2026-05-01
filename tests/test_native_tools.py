@@ -205,7 +205,9 @@ def test_conformal_tool_gate_rejects_ambiguous_output_histogram():
 def test_conformal_tool_gate_accepts_singleton_behaviour_when_warm():
     pred = ConformalPredictor(alpha=0.1, method="lac", min_calibration=4)
     pred.load_scores([1.0, 1.0, 1.0, 1.0])
+    # Success: assert_singleton_conformal_for_tool_outputs raises if the gate rejects.
     assert_singleton_conformal_for_tool_outputs(pred, (0, 1), [0, 0])
+    assert True
 
 
 # ---------------------------------------------------------------------------

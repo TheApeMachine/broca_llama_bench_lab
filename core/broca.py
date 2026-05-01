@@ -1566,6 +1566,7 @@ class CognitiveBackgroundWorker:
         self.last_user_activity_at: float = time.time()
         self.motor_trainer = motor_trainer
         self.last_rem_summary: dict[str, Any] = {}
+        self._snapshot_lock = threading.Lock()
 
     @property
     def running(self) -> bool:
@@ -1625,6 +1626,7 @@ class CognitiveBackgroundWorker:
 
         # REM sleep — only if the user has been quiet long enough.
         idle = max(0.0, time.time() - self.last_user_activity_at)
+        rem_summary_update: dict[str, Any] | None = None
         if idle >= self.config.sleep_idle_seconds:
             phase_started = time.time()
             try:
@@ -1637,13 +1639,16 @@ class CognitiveBackgroundWorker:
             rem_summary["idle_seconds"] = float(idle)
             rem_summary["reflections"] = len(rem_reflections)
             phase_summary["rem_sleep"] = rem_summary
-            self.last_rem_summary = rem_summary
+            rem_summary_update = rem_summary
             reflections.extend(rem_reflections)
             logger.info("DMN.phase=rem_sleep %s", rem_summary)
 
-        self.iterations += 1
-        self.last_error = None
-        self.last_phase_summary = phase_summary
+        with self._snapshot_lock:
+            if rem_summary_update is not None:
+                self.last_rem_summary = rem_summary_update
+            self.iterations += 1
+            self.last_error = None
+            self.last_phase_summary = phase_summary
         duration_ms = int(round((time.time() - tick_started) * 1000))
         logger.debug(
             "CognitiveBackgroundWorker.run_once: iteration=%d total_reflections=%d duration_ms=%d idle=%.1fs",
@@ -1653,10 +1658,12 @@ class CognitiveBackgroundWorker:
             idle,
         )
         try:
+            with self._snapshot_lock:
+                iteration = int(self.iterations)
             self.mind.event_bus.publish(
                 "dmn.tick",
                 {
-                    "iteration": int(self.iterations),
+                    "iteration": iteration,
                     "duration_ms": duration_ms,
                     "reflections": len(reflections),
                     "idle_seconds": float(idle),
@@ -1667,10 +1674,26 @@ class CognitiveBackgroundWorker:
             logger.exception("DMN tick: event publish failed")
         return reflections
 
+    def state_snapshot(self) -> dict[str, Any]:
+        """Return a consistent view of worker fields for live UIs (thread-safe)."""
+
+        with self._snapshot_lock:
+            last_tau = float(self.last_user_activity_at)
+            return {
+                "running": bool(self.running),
+                "iterations": int(self.iterations),
+                "interval_s": float(self.interval_s),
+                "last_phase_summary": dict(self.last_phase_summary),
+                "last_rem_summary": dict(self.last_rem_summary),
+                "last_error": self.last_error,
+                "idle_seconds": float(max(0.0, time.time() - last_tau)),
+            }
+
     def mark_user_active(self) -> None:
         """Reset the idle clock when the user types something."""
 
-        self.last_user_activity_at = time.time()
+        with self._snapshot_lock:
+            self.last_user_activity_at = time.time()
 
     # ------------------------------------------------------------------ Phase 1
 
@@ -2907,6 +2930,18 @@ class BrocaMind:
         self._llama_model_id = mid
 
     @property
+    def llama_model_id(self) -> str:
+        return self._llama_model_id
+
+    @property
+    def db_path(self) -> Path:
+        return self._db_path
+
+    @property
+    def namespace(self) -> str:
+        return self._namespace
+
+    @property
     def background_worker(self) -> CognitiveBackgroundWorker | None:
         return self._background_worker
 
@@ -2944,12 +2979,11 @@ class BrocaMind:
 
         try:
             recent_claims = self.memory.claims()[-8:]
+            mean_conf = self.memory.mean_confidence()
             snap["memory"] = {
                 "count": int(self.memory.count()),
                 "subjects": len(self.memory.subjects()),
-                "mean_confidence": (
-                    float(self.memory.mean_confidence()) if self.memory.mean_confidence() is not None else None
-                ),
+                "mean_confidence": (float(mean_conf) if mean_conf is not None else None),
                 "recent_claims": [
                     {
                         "subject": c.get("subject"),
@@ -3016,19 +3050,7 @@ class BrocaMind:
 
         try:
             bg = self._background_worker
-            snap["background"] = (
-                {
-                    "running": bool(bg.running),
-                    "iterations": int(bg.iterations),
-                    "interval_s": float(bg.interval_s),
-                    "last_phase_summary": dict(bg.last_phase_summary),
-                    "last_rem_summary": dict(bg.last_rem_summary),
-                    "last_error": bg.last_error,
-                    "idle_seconds": float(max(0.0, time.time() - bg.last_user_activity_at)),
-                }
-                if bg is not None
-                else {"running": False}
-            )
+            snap["background"] = bg.state_snapshot() if bg is not None else {"running": False}
         except Exception:
             logger.exception("snapshot.background failed")
             snap["background"] = {"error": True}
@@ -3041,7 +3063,7 @@ class BrocaMind:
                 snap["self_improve"] = {
                     "running": bool(sw.running),
                     "enabled": bool(getattr(sw.config, "enabled", False)),
-                    "iterations": int(sw.iterations),
+                    "iterations": sw.get_iterations(),
                     "interval_s": float(getattr(sw.config, "interval_s", 0.0)),
                     "last_summary": sw.last_summary,
                     "last_error": sw.last_error,
@@ -3162,6 +3184,21 @@ class BrocaMind:
         if n > 0:
             out[:n] = s[:n]
         return out
+
+    def remember_hopfield(
+        self,
+        a_sketch: torch.Tensor,
+        b_sketch: torch.Tensor,
+        *,
+        metadata: dict[str, Any] | None = None,
+    ) -> None:
+        """Associate two padded sketches in Hopfield memory (public entry for tooling)."""
+
+        self.hopfield_memory.remember(
+            self._padded_hopfield_sketch(a_sketch),
+            self._padded_hopfield_sketch(b_sketch),
+            metadata=dict(metadata or {}),
+        )
 
     def broca_features_from_frame(self, frame: CognitiveFrame) -> torch.Tensor:
         """Sketch frame + numeric tail + sparse VSA injection for :class:`TrainableBrocaGraft`."""
@@ -3460,7 +3497,14 @@ class BrocaMind:
         and prerequisites (``GITHUB_TOKEN``, Docker, and ``repo`` scope).
         """
 
-        from .docker_self_improve_worker import SelfImproveConfig, SelfImproveDockerWorker
+        try:
+            from .docker_self_improve_worker import SelfImproveConfig, SelfImproveDockerWorker
+        except (ImportError, ModuleNotFoundError) as exc:
+            raise RuntimeError(
+                "Could not import core.docker_self_improve_worker (self-improve worker). "
+                "Ensure project dependencies are installed and Docker is available on the host; "
+                "see core.docker_self_improve_worker module docs."
+            ) from exc
 
         cfg = SelfImproveConfig()
         if enabled is not None:
@@ -3543,9 +3587,9 @@ class BrocaMind:
                 self.vsa.encode_triple(out.subject, pr_bind, out.answer)
                 ut_sk = stable_sketch(utterance[:512])
                 trip_sk = stable_sketch(f"{out.subject}|{pr_bind}|{out.answer}")
-                self.hopfield_memory.remember(
-                    self._padded_hopfield_sketch(ut_sk),
-                    self._padded_hopfield_sketch(trip_sk),
+                self.remember_hopfield(
+                    ut_sk,
+                    trip_sk,
                     metadata={"kind": "declarative_binding", "intent": out.intent},
                 )
             except Exception:

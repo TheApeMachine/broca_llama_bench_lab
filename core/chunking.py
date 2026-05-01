@@ -375,6 +375,13 @@ def _window_salience(
     length: int,
     cfg: ChunkingDetectionConfig,
 ) -> float:
+    if start < 0 or length < 0:
+        raise ValueError(f"_window_salience: invalid window start={start!r} length={length!r} (must be non-negative)")
+    end = start + length
+    if end > len(rows):
+        raise ValueError(
+            f"_window_salience: window [{start}, {end}) extends past rows (len(rows)={len(rows)})"
+        )
     return sum(
         _row_salience_multiplier(mind, rows[start + k], cfg) for k in range(length)
     )
@@ -393,8 +400,8 @@ def _hopfield_concentration_ok(
     if len(hm) == 0:
         return True
     q = _align_vec_to_dim(mean_feat, hm.d_model).to(device=hm.device, dtype=hm.dtype)
-    _ret, _w = hm.retrieve(q)
-    wmax = float(hm.last_debug.get("weight_max", 0.0))
+    _, w = hm.retrieve(q)
+    wmax = float(w.max().item()) if w.numel() else 0.0
     return wmax >= cfg.hopfield_weight_min_for_oneshot
 
 
@@ -423,9 +430,19 @@ def find_salience_forced_motifs(
                 continue
             feats: list[torch.Tensor] = []
             for k in range(L):
-                feats.append(
-                    _frame_features_from_row(rows[s + k], text_encoder=getattr(mind, "text_encoder", None))
-                )
+                try:
+                    feats.append(
+                        _frame_features_from_row(rows[s + k], text_encoder=getattr(mind, "text_encoder", None))
+                    )
+                except Exception:
+                    logger.warning(
+                        "find_salience_forced_motifs: skipping frame at row index %s (%s)",
+                        s + k,
+                        rows[s + k].get("id", "?"),
+                        exc_info=True,
+                    )
+            if not feats:
+                continue
             mean_feat = torch.stack(feats, dim=0).mean(dim=0)
             if not _hopfield_concentration_ok(mind, mean_feat, cfg):
                 continue

@@ -62,7 +62,8 @@ def _row(
 ) -> dict:
     ev = {"journal_id": jid}
     if evidence:
-        ev = {**ev, **evidence}
+        ev = {**evidence, **ev}
+    ev["journal_id"] = jid
     return {
         "id": jid,
         "ts": time.time(),
@@ -100,6 +101,8 @@ def test_compiler_salience_path_compiles_without_frequency_repetition(tmp_path):
     macro = reg.get("macro_stress_episode__shutdown_loop")
     assert macro is not None
     assert macro.pattern == ("stress_episode", "shutdown_loop")
+    assert result.get("reflections") is not None
+    assert len(result["reflections"]) > 0
     assert result["reflections"][0].get("compile_via") == "salience"
 
 

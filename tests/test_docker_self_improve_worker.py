@@ -14,6 +14,7 @@ from core.broca import BrocaMind
 from core.docker_self_improve_worker import (
     SelfImproveConfig,
     SelfImproveDockerWorker,
+    _clean_github_repo_url,
     _extract_json_object,
     _resolve_repo_url,
 )
@@ -57,6 +58,21 @@ def test_extract_json_object_fenced() -> None:
 def test_extract_json_object_plain() -> None:
     d = _extract_json_object('{"a": 1}')
     assert d["a"] == 1
+
+
+def test_extract_json_object_braces_inside_string() -> None:
+    raw = '{"task_summary": "hello {world}", "unified_diff": ""}'
+    d = _extract_json_object(raw)
+    assert d["task_summary"] == "hello {world}"
+    assert d["unified_diff"] == ""
+
+
+def test_clean_github_repo_url() -> None:
+    assert _clean_github_repo_url("git@github.com:org/repo.git") == "https://github.com/org/repo.git"
+    assert (
+        _clean_github_repo_url("https://x-access-token:secret@github.com/org/repo.git")
+        == "https://github.com/org/repo.git"
+    )
 
 
 def test_resolve_repo_url_explicit() -> None:

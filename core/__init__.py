@@ -28,7 +28,6 @@ from .broca import (
     WorkspaceJournal,
     cognitive_frame_from_episode_row,
 )
-from .docker_self_improve_worker import SelfImproveConfig, SelfImproveDockerWorker
 from .causal import FiniteSCM, build_frontdoor_scm, build_simpson_scm
 from .device_utils import pick_torch_device
 from .grafts import ActiveInferenceTokenGraft, CoupledActiveInferenceTokenGraft, CausalEffectTokenGraft, FeatureVectorGraft, KVMemoryGraft
@@ -106,6 +105,8 @@ _LAZY_EXPORTS: dict[str, tuple[str, str]] = {
     "local_predicate_cluster": (".causal_discovery", "local_predicate_cluster"),
     "project_rows_to_variables": (".causal_discovery", "project_rows_to_variables"),
     "DockerToolSandbox": (".docker_sandbox", "DockerToolSandbox"),
+    "SelfImproveConfig": (".docker_self_improve_worker", "SelfImproveConfig"),
+    "SelfImproveDockerWorker": (".docker_self_improve_worker", "SelfImproveDockerWorker"),
 }
 
 
@@ -165,8 +166,6 @@ __all__ = [
     "InterruptionVerdict",
     "IterativeHypothesisSearch",
     "ModalityShiftGraft",
-    "SelfImproveConfig",
-    "SelfImproveDockerWorker",
     "BrocaMind",
     "CognitiveBackgroundWorker",
     "CognitiveFrame",
@@ -235,6 +234,8 @@ __all__ = [
     "local_predicate_cluster",
     "project_rows_to_variables",
     "DockerToolSandbox",
+    "SelfImproveConfig",
+    "SelfImproveDockerWorker",
 ]
 
 _auto_log = str(os.environ.get("AUTO_CONFIGURE_LAB_LOGGING", "")).strip().lower()

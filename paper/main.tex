@@ -1,0 +1,28 @@
+% Auto-build: run `make paper` from the repository root (see Makefile).
+\documentclass[11pt]{article}
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{lmodern}
+\usepackage{amsmath,amssymb}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{hyperref}
+\hypersetup{colorlinks=true,linkcolor=blue,urlcolor=blue,citecolor=blue}
+% Figures for experiments live alongside generated stubs under include/experiment/.
+\graphicspath{{./}{include/experiment/}}
+
+\title{Broca--Llama Bench Lab\\Technical Report (Auto-Generated Draft)}
+\author{ASI Broca Llama Bench Lab}
+\date{\today}
+
+\begin{document}
+\maketitle
+
+\input{section/01_abstract}
+\input{section/02_introduction}
+\input{section/03_methods}
+\input{include/section/experiments}
+\input{section/04_discussion}
+\input{section/05_conclusion}
+
+\end{document}

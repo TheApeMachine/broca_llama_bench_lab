@@ -20,14 +20,18 @@ Environment (optional)::
     BROCA_SELF_IMPROVE_DOCKER_CPUS — default ``2``
     BROCA_SELF_IMPROVE_TIMEOUT_S — default ``1800``
     BROCA_SELF_IMPROVE_RUN_DEMO — if ``1``, run ``python -m core.demo --mode broca`` after pytest
+    BROCA_SELF_IMPROVE_RUN_PAPER — if ``1``, run ``python -m core.paper`` (``refresh_paper_experiments``)
+        after a **successful** Docker validation cycle (local benchmark/TeX deps as for ``make paper-bench``)
 """
 
 from __future__ import annotations
 
 import json
 import logging
+import os
 import re
 import shutil
+import stat
 import subprocess
 import tempfile
 import textwrap
@@ -62,24 +66,24 @@ _RUNNER_BASH = textwrap.dedent(
       | tar xz -C /tmp
     mv "/tmp/gh_${GH_VER}_linux_${GH_ARCH}/bin/gh" /usr/local/bin/gh
 
-    inject_token() {
-      local url="$1"
-      if [[ "$url" =~ ^https://github.com/ ]]; then
-        echo "${url/https:\/\/github.com/https://x-access-token:${GITHUB_TOKEN}@github.com}"
-      elif [[ "$url" =~ ^git@github.com: ]]; then
-        local path="${url#git@github.com:}"
-        echo "https://x-access-token:${GITHUB_TOKEN}@github.com/${path}"
-      else
-        echo "$url"
-      fi
-    }
+    {
+      echo '#!/bin/sh'
+      echo 'printf "%s\n" "${GITHUB_TOKEN:-}"'
+    } > /tmp/git-askpass.sh
+    chmod 700 /tmp/git-askpass.sh
+    export GIT_ASKPASS=/tmp/git-askpass.sh
+    export GIT_TERMINAL_PROMPT=0
 
-    AUTH_CLONE_URL=$(inject_token "$REPO_URL")
     rm -rf /work/repo
-    git clone --depth 1 "$AUTH_CLONE_URL" /work/repo
+    if ! git clone --depth 1 --branch "${BASE_BRANCH}" "${REPO_URL}" /work/repo 2>/dev/null; then
+      echo "git clone failed for branch ${BASE_BRANCH} (network, auth, or branch missing)" >&2
+      exit 5
+    fi
     cd /work/repo
-    git fetch origin "${BASE_BRANCH}" --depth 1 2>/dev/null || git fetch origin main --depth 1 2>/dev/null || true
-    git checkout "${BASE_BRANCH}" 2>/dev/null || git checkout main 2>/dev/null || git checkout master 2>/dev/null || true
+    if ! git rev-parse --verify "refs/heads/${BASE_BRANCH}" >/dev/null 2>&1; then
+      echo "git: branch ${BASE_BRANCH} not checked out after clone" >&2
+      exit 5
+    fi
 
     git checkout -b "${BRANCH_NAME}"
     if [[ -s /context/patch.diff ]]; then
@@ -121,15 +125,38 @@ _RUNNER_BASH = textwrap.dedent(
 
 
 def _env_bool(name: str, default: bool = False) -> bool:
-    raw = __import__("os").environ.get(name)
+    raw = os.environ.get(name)
     if raw is None:
         return default
     return raw.strip().lower() in {"1", "true", "yes", "on"}
 
 
-def _resolve_repo_url(explicit: str | None) -> str | None:
-    import os
+def _safe_float(raw: str | None, default: float) -> float:
+    if raw is None or not str(raw).strip():
+        return float(default)
+    try:
+        return float(str(raw).strip())
+    except ValueError:
+        logger.warning("Ignoring invalid float env value %r; using default %s", raw, default)
+        return float(default)
 
+
+def _clean_github_repo_url(url: str) -> str:
+    """Return an https GitHub URL without embedded credentials (GIT_ASKPASS supplies token)."""
+
+    u = url.strip()
+    if not u:
+        return u
+    if u.startswith("git@github.com:"):
+        path = u[len("git@github.com:") :].strip()
+        if not path.endswith(".git"):
+            path = f"{path}.git"
+        return f"https://github.com/{path}"
+    u = re.sub(r"^https://[^/@]+@", "https://", u, count=1)
+    return u
+
+
+def _resolve_repo_url(explicit: str | None) -> str | None:
     if explicit and explicit.strip():
         return explicit.strip()
     env = os.environ.get("BROCA_SELF_IMPROVE_REPO", "").strip()
@@ -157,19 +184,19 @@ def _extract_json_object(text: str) -> dict[str, Any]:
     fence = re.search(r"```(?:json)?\s*(\{[\s\S]*?\})\s*```", s, re.IGNORECASE)
     if fence:
         s = fence.group(1).strip()
-    else:
-        brace = s.find("{")
-        if brace >= 0:
-            depth = 0
-            for i, ch in enumerate(s[brace:], start=brace):
-                if ch == "{":
-                    depth += 1
-                elif ch == "}":
-                    depth -= 1
-                    if depth == 0:
-                        s = s[brace : i + 1]
-                        break
-    return json.loads(s)
+    brace = s.find("{")
+    if brace < 0:
+        return json.loads(s)
+    tail = s[brace:]
+    for i, ch in enumerate(tail):
+        if ch != "}":
+            continue
+        candidate = tail[: i + 1]
+        try:
+            return json.loads(candidate)
+        except json.JSONDecodeError:
+            continue
+    return json.loads(tail)
 
 
 @dataclass
@@ -178,28 +205,32 @@ class SelfImproveConfig:
 
     enabled: bool = field(default_factory=lambda: _env_bool("BROCA_SELF_IMPROVE", False))
     interval_s: float = field(
-        default_factory=lambda: max(60.0, float(__import__("os").environ.get("BROCA_SELF_IMPROVE_INTERVAL_S", "3600")))
+        default_factory=lambda: max(
+            60.0,
+            _safe_float(os.environ.get("BROCA_SELF_IMPROVE_INTERVAL_S"), 3600.0),
+        )
     )
     repo_url: str | None = None
     base_branch: str = field(
-        default_factory=lambda: __import__("os").environ.get("BROCA_SELF_IMPROVE_BASE_BRANCH", "main").strip() or "main"
+        default_factory=lambda: os.environ.get("BROCA_SELF_IMPROVE_BASE_BRANCH", "main").strip() or "main"
     )
     docker_image: str = field(
-        default_factory=lambda: __import__("os").environ.get("BROCA_SELF_IMPROVE_DOCKER_IMAGE", "python:3.11-slim").strip()
+        default_factory=lambda: os.environ.get("BROCA_SELF_IMPROVE_DOCKER_IMAGE", "python:3.11-slim").strip()
     )
     docker_network: str = field(
-        default_factory=lambda: __import__("os").environ.get("BROCA_SELF_IMPROVE_DOCKER_NETWORK", "bridge").strip()
+        default_factory=lambda: os.environ.get("BROCA_SELF_IMPROVE_DOCKER_NETWORK", "bridge").strip()
     )
     docker_memory: str = field(
-        default_factory=lambda: __import__("os").environ.get("BROCA_SELF_IMPROVE_DOCKER_MEMORY", "4g").strip()
+        default_factory=lambda: os.environ.get("BROCA_SELF_IMPROVE_DOCKER_MEMORY", "4g").strip()
     )
     docker_cpus: str = field(
-        default_factory=lambda: __import__("os").environ.get("BROCA_SELF_IMPROVE_DOCKER_CPUS", "2").strip()
+        default_factory=lambda: os.environ.get("BROCA_SELF_IMPROVE_DOCKER_CPUS", "2").strip()
     )
     timeout_s: float = field(
-        default_factory=lambda: float(__import__("os").environ.get("BROCA_SELF_IMPROVE_TIMEOUT_S", "1800"))
+        default_factory=lambda: _safe_float(os.environ.get("BROCA_SELF_IMPROVE_TIMEOUT_S"), 1800.0)
     )
     run_arch_demo: bool = field(default_factory=lambda: _env_bool("BROCA_SELF_IMPROVE_RUN_DEMO", False))
+    run_paper_refresh: bool = field(default_factory=lambda: _env_bool("BROCA_SELF_IMPROVE_RUN_PAPER", False))
     max_new_tokens_plan: int = 1024
 
 
@@ -217,6 +248,7 @@ class SelfImproveDockerWorker:
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         self.iterations = 0
+        self.iterations_lock = threading.Lock()
         self.last_error: str | None = None
         self.last_summary: str | None = None
         self.docker_binary = shutil.which("docker")
@@ -224,6 +256,10 @@ class SelfImproveDockerWorker:
     @property
     def running(self) -> bool:
         return self._thread is not None and self._thread.is_alive()
+
+    def get_iterations(self) -> int:
+        with self.iterations_lock:
+            return int(self.iterations)
 
     def start(self) -> None:
         if self.running:
@@ -306,9 +342,9 @@ class SelfImproveDockerWorker:
         try:
             ut = stable_sketch(f"self_improve:{summary[:256]}")
             trip = stable_sketch(f"outcome:{'ok' if ok else 'fail'}:{branch or 'none'}:{run_id[:8]}")
-            self.mind.hopfield_memory.remember(
-                self.mind._padded_hopfield_sketch(ut),
-                self.mind._padded_hopfield_sketch(trip),
+            self.mind.remember_hopfield(
+                ut,
+                trip,
                 metadata={"kind": "docker_self_improve", "run_id": run_id},
             )
         except Exception:
@@ -362,73 +398,97 @@ class SelfImproveDockerWorker:
         commit_message: str,
     ) -> subprocess.CompletedProcess[str]:
         docker_bin = self.docker_binary
-        assert docker_bin is not None
-        token = __import__("os").environ.get("GITHUB_TOKEN", "").strip()
+        if docker_bin is None:
+            raise RuntimeError("docker_binary is not set (docker CLI not found on PATH)")
+        token = os.environ.get("GITHUB_TOKEN", "").strip()
         if not token:
             raise RuntimeError("GITHUB_TOKEN is not set")
 
-        with tempfile.TemporaryDirectory(prefix="broca_self_improve_") as td:
-            root = Path(td)
-            (root / "patch.diff").write_text(patch_text, encoding="utf-8")
-            (root / "runner.sh").write_text("#!/usr/bin/env bash\n" + _RUNNER_BASH + "\n", encoding="utf-8")
-            (root / "pr_body.md").write_text(pr_body, encoding="utf-8")
-            (root / "outcomes.log").write_text("", encoding="utf-8")
+        safe_repo = _clean_github_repo_url(repo_url)
+        gh_env_path: str | None = None
+        try:
+            with tempfile.TemporaryDirectory(prefix="broca_self_improve_") as td:
+                root = Path(td)
+                (root / "patch.diff").write_text(patch_text, encoding="utf-8")
+                (root / "runner.sh").write_text("#!/usr/bin/env bash\n" + _RUNNER_BASH + "\n", encoding="utf-8")
+                (root / "pr_body.md").write_text(pr_body, encoding="utf-8")
+                (root / "outcomes.log").write_text("", encoding="utf-8")
 
-            env_pairs = [
-                f"REPO_URL={repo_url}",
-                f"GITHUB_TOKEN={token}",
-                f"BRANCH_NAME={branch_name}",
-                f"BASE_BRANCH={self.config.base_branch}",
-                f"PR_TITLE={pr_title}",
-                f"COMMIT_MESSAGE={commit_message}",
-                f"RUN_SELF_IMPROVE_DEMO={'1' if self.config.run_arch_demo else '0'}",
-            ]
-            cmd: list[str] = [
-                docker_bin,
-                "run",
-                "--rm",
-                "--network",
-                self.config.docker_network,
-                "--memory",
-                self.config.docker_memory,
-                "--cpus",
-                self.config.docker_cpus,
-                "-v",
-                f"{root.resolve()}:/context",
-                "-w",
-                "/work",
-            ]
-            for kv in env_pairs:
-                cmd.extend(["-e", kv])
-            cmd.extend(
-                [
-                    self.config.docker_image,
-                    "bash",
-                    "-lc",
-                    "bash /context/runner.sh 2>&1 | tee /context/docker.log; exit ${PIPESTATUS[0]}",
+                with tempfile.NamedTemporaryFile(
+                    mode="w",
+                    prefix="broca_gh_token_",
+                    suffix=".env",
+                    delete=False,
+                    encoding="utf-8",
+                ) as gh_env:
+                    gh_env.write(f"GITHUB_TOKEN={token}\n")
+                    gh_env.flush()
+                    gh_env_path = gh_env.name
+                os.chmod(gh_env_path, stat.S_IRUSR | stat.S_IWUSR)
+
+                env_pairs = [
+                    f"REPO_URL={safe_repo}",
+                    f"BRANCH_NAME={branch_name}",
+                    f"BASE_BRANCH={self.config.base_branch}",
+                    f"PR_TITLE={pr_title}",
+                    f"COMMIT_MESSAGE={commit_message}",
+                    f"RUN_SELF_IMPROVE_DEMO={'1' if self.config.run_arch_demo else '0'}",
                 ]
-            )
-            return subprocess.run(
-                cmd,
-                capture_output=True,
-                text=True,
-                timeout=float(self.config.timeout_s),
-                check=False,
-            )
+                cmd: list[str] = [
+                    docker_bin,
+                    "run",
+                    "--rm",
+                    "--network",
+                    self.config.docker_network,
+                    "--memory",
+                    self.config.docker_memory,
+                    "--cpus",
+                    self.config.docker_cpus,
+                    "--env-file",
+                    gh_env_path,
+                    "-v",
+                    f"{root.resolve()}:/context",
+                    "-w",
+                    "/work",
+                ]
+                for kv in env_pairs:
+                    cmd.extend(["-e", kv])
+                cmd.extend(
+                    [
+                        self.config.docker_image,
+                        "bash",
+                        "-lc",
+                        "bash /context/runner.sh 2>&1 | tee /context/docker.log; exit ${PIPESTATUS[0]}",
+                    ]
+                )
+                return subprocess.run(
+                    cmd,
+                    capture_output=True,
+                    text=True,
+                    timeout=float(self.config.timeout_s),
+                    check=False,
+                )
+        finally:
+            if gh_env_path is not None:
+                try:
+                    os.unlink(gh_env_path)
+                except OSError:
+                    logger.warning("Could not remove temporary GitHub env file %s", gh_env_path)
 
     def _loop(self) -> None:
         while not self._stop.is_set():
+            if self.config.enabled:
+                self._run_once_safe()
             if self._stop.wait(timeout=float(self.config.interval_s)):
                 break
-            if not self.config.enabled:
-                continue
-            self._run_once_safe()
 
     def _run_once_safe(self) -> None:
         run_id = str(uuid.uuid4())
-        self.iterations += 1
+        with self.iterations_lock:
+            self.iterations += 1
+            it = int(self.iterations)
         try:
-            self.mind.event_bus.publish("self_improve.cycle_start", {"run_id": run_id, "iteration": int(self.iterations)})
+            self.mind.event_bus.publish("self_improve.cycle_start", {"run_id": run_id, "iteration": it})
         except Exception:
             logger.exception("self-improve: cycle_start publish failed")
         try:
@@ -436,7 +496,7 @@ class SelfImproveDockerWorker:
             try:
                 self.mind.event_bus.publish(
                     "self_improve.cycle_complete",
-                    {"run_id": run_id, "iteration": int(self.iterations), "summary": self.last_summary, "error": self.last_error},
+                    {"run_id": run_id, "iteration": it, "summary": self.last_summary, "error": self.last_error},
                 )
             except Exception:
                 logger.exception("self-improve: cycle_complete publish failed")
@@ -453,7 +513,7 @@ class SelfImproveDockerWorker:
             try:
                 self.mind.event_bus.publish(
                     "self_improve.cycle_complete",
-                    {"run_id": run_id, "iteration": int(self.iterations), "summary": None, "error": str(exc)},
+                    {"run_id": run_id, "iteration": it, "summary": None, "error": str(exc)},
                 )
             except Exception:
                 logger.exception("self-improve: cycle_complete publish failed")
@@ -463,7 +523,7 @@ class SelfImproveDockerWorker:
         if self.docker_binary is None:
             raise RuntimeError("docker CLI not found on PATH")
 
-        token = __import__("os").environ.get("GITHUB_TOKEN", "").strip()
+        token = os.environ.get("GITHUB_TOKEN", "").strip()
         if not token:
             raise RuntimeError("GITHUB_TOKEN not set (needs repo scope for push and gh pr create)")
 
@@ -543,3 +603,10 @@ class SelfImproveDockerWorker:
             },
             branch=branch_name,
         )
+        if ok and self.config.run_paper_refresh:
+            try:
+                from .paper.harness import refresh_paper_experiments
+
+                refresh_paper_experiments()
+            except Exception:
+                logger.exception("self-improve: refresh_paper_experiments failed after successful Docker cycle")

@@ -43,8 +43,6 @@ except ImportError as exc:  # pragma: no cover
         "core.chat_tui requires Textual. Install with:\n\n  pip install -r requirements-tui.txt\n"
     ) from exc
 
-import torch
-
 from .broca import BrocaMind
 from .device_utils import pick_torch_device
 from .event_bus import EventBus, LogToBusHandler, get_default_bus
@@ -190,6 +188,7 @@ class BrocaChatApp(App):
         self.debug_substrate = bool(debug_substrate)
 
         self._messages: list[dict[str, str]] = []
+        self._reply_buffer: list[str] = []
         self._sub_id = self.bus.subscribe("*")
         self._confidence_trend: deque[float] = deque(maxlen=64)
         self._dmn_duration_trend: deque[float] = deque(maxlen=32)
@@ -225,12 +224,12 @@ class BrocaChatApp(App):
     # ------------------------------------------------------------------ lifecycle
     def on_mount(self) -> None:
         self.title = "Broca substrate chat"
-        self.sub_title = self.mind._llama_model_id
+        self.sub_title = self.mind.llama_model_id
         self.set_interval(0.2, self._tick)
         chatlog = self.query_one("#chatlog", RichLog)
         chatlog.write("[dim]Substrate biases the LLM via grafts; the LLM still chooses surface form.[/dim]")
         chatlog.write(
-            f"[dim]db={self.mind._db_path}  namespace={self.mind._namespace}[/dim]\n"
+            f"[dim]db={self.mind.db_path}  namespace={self.mind.namespace}[/dim]\n"
         )
         self._refresh_status()
         self._refresh_panels()
@@ -447,8 +446,8 @@ class BrocaChatApp(App):
         except Exception:
             device = "?"
         status = (
-            f" model={self.mind._llama_model_id}   device={device}   "
-            f"db={self.mind._db_path}   namespace={self.mind._namespace}"
+            f" model={self.mind.llama_model_id}   device={device}   "
+            f"db={self.mind.db_path}   namespace={self.mind.namespace}"
         )
         self.query_one("#status", Static).update(status)
 
@@ -466,7 +465,7 @@ class BrocaChatApp(App):
         chatlog = self.query_one("#chatlog", RichLog)
         chatlog.write(f"[bold cyan]You[/bold cyan]  {text}")
         self._messages.append({"role": "user", "content": text})
-        self._reply_buffer: list[str] = []
+        self._reply_buffer.clear()
         self.query_one("#streaming", Static).update("[bold magenta]Assistant[/bold magenta]  …")
         self.busy = True
         self._run_chat(text)
@@ -491,15 +490,13 @@ class BrocaChatApp(App):
             self.app.call_from_thread(self._on_reply_error, str(exc))
 
     def _on_token(self, piece: str) -> None:
-        if not hasattr(self, "_reply_buffer"):
-            return
         self._reply_buffer.append(piece)
         running = "".join(self._reply_buffer)
         self.query_one("#streaming", Static).update(f"[bold magenta]Assistant[/bold magenta]  {running}")
 
     def _on_reply_done(self, intent: str, confidence: float, reply: str) -> None:
         self.busy = False
-        text = "".join(getattr(self, "_reply_buffer", [])) or reply
+        text = "".join(self._reply_buffer) or reply
         text = text.strip() or "[empty reply]"
         self._messages.append({"role": "assistant", "content": text})
         chatlog = self.query_one("#chatlog", RichLog)
@@ -507,7 +504,7 @@ class BrocaChatApp(App):
         if self.debug_substrate:
             chatlog.write(f"[dim]substrate: intent={intent} confidence={confidence:.2f}[/dim]")
         self.query_one("#streaming", Static).update("")
-        self._reply_buffer = []
+        self._reply_buffer.clear()
 
     def _on_reply_error(self, err: str) -> None:
         self.busy = False

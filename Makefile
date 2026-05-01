@@ -12,13 +12,15 @@ CHAT_ARGS ?=
 # Append to the default bench invocation (e.g. `make bench BENCH_EXTRA="--skip-smoke"`)
 BENCH_EXTRA ?=
 
-.PHONY: help chat bench install-benchmark
+.PHONY: help chat bench install-benchmark paper paper-bench paper-pdf
 
 help:
 	@echo "Targets:"
 	@echo "  make install-benchmark   pip install editable + benchmark dependencies"
 	@echo "  make chat                streaming terminal chat with Broca substrate (--broca is always passed; extend via CHAT_ARGS)"
 	@echo "  make bench               full harness: native HF datasets + lm-eval + Broca probes"
+	@echo "  make paper               paper-bench then PDF (needs latexmk or pdflatex)"
+	@echo "  make paper-bench         refresh paper/include/experiment/*.tex from benchmarks"
 	@echo ""
 	@echo "SQLite persistence:"
 	@echo "  DB files are created under ./runs/ when you run demos, experiments, BrocaMind, or chat --broca."
@@ -46,3 +48,16 @@ chat:
 # Native (standard task preset) + Eleuther lm-eval (standard preset limits) + architecture eval.
 bench:
 	$(PYTHON) -m core.benchmarks --engine both --preset standard --limit 250 $(BENCH_EXTRA)
+
+# Smaller default preset/limit via env: PAPER_NATIVE_PRESET=quick PAPER_BENCH_LIMIT=50
+paper-bench:
+	$(PYTHON) -m core.paper
+
+paper-pdf:
+	@if command -v latexmk >/dev/null 2>&1; then \
+		cd paper && latexmk -pdf -interaction=nonstopmode -halt-on-error main.tex; \
+	else \
+		cd paper && pdflatex -interaction=nonstopmode -halt-on-error main.tex && pdflatex -interaction=nonstopmode -halt-on-error main.tex; \
+	fi
+
+paper: paper-bench paper-pdf
