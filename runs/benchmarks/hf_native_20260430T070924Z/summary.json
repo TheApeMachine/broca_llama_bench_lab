@@ -1,0 +1,88 @@
+{
+  "kind": "hf_datasets_native_benchmark",
+  "created_at_utc": "20260430T070924Z",
+  "model_id": "meta-llama/Llama-3.2-1B-Instruct",
+  "device": "mps",
+  "tasks": [
+    "boolq",
+    "piqa",
+    "arc_easy",
+    "winogrande"
+  ],
+  "limit_per_task": 50,
+  "split_override": null,
+  "streaming": false,
+  "shuffle": false,
+  "seed": 0,
+  "scoring": {
+    "multiple_choice": "length-normalized continuation log-likelihood",
+    "generation": "deterministic greedy decode with normalized exact matching",
+    "chat_template": false,
+    "max_seq_len": 4096
+  },
+  "per_task": {
+    "boolq": {
+      "n": 50,
+      "correct": 39,
+      "accuracy": 0.78,
+      "task": "boolq",
+      "dataset": "boolq",
+      "config": null,
+      "split": "validation",
+      "mode": "mc",
+      "limit": 50,
+      "seconds": 7.4915452003479
+    },
+    "piqa": {
+      "n": 50,
+      "correct": 35,
+      "accuracy": 0.7,
+      "task": "piqa",
+      "dataset": "lighteval/piqa",
+      "config": null,
+      "split": "validation",
+      "mode": "mc",
+      "limit": 50,
+      "seconds": 5.324370384216309
+    },
+    "arc_easy": {
+      "n": 50,
+      "correct": 30,
+      "accuracy": 0.6,
+      "task": "arc_easy",
+      "dataset": "allenai/ai2_arc",
+      "config": "ARC-Easy",
+      "split": "validation",
+      "mode": "mc",
+      "limit": 50,
+      "seconds": 5.731733083724976
+    },
+    "winogrande": {
+      "n": 50,
+      "correct": 30,
+      "accuracy": 0.6,
+      "task": "winogrande",
+      "dataset": "winogrande",
+      "config": "winogrande_xl",
+      "split": "validation",
+      "mode": "mc",
+      "limit": 50,
+      "seconds": 5.7155866622924805
+    }
+  },
+  "aggregate": {
+    "macro_accuracy": 0.6699999999999999,
+    "micro_accuracy": 0.67,
+    "micro_n": 200,
+    "micro_correct": 134
+  },
+  "artifacts": {
+    "summary": "summary.json",
+    "task_jsonl": [
+      "boolq.jsonl",
+      "piqa.jsonl",
+      "arc_easy.jsonl",
+      "winogrande.jsonl"
+    ]
+  }
+}
