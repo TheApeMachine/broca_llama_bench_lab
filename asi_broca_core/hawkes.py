@@ -33,7 +33,7 @@ import sqlite3
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Iterable, Sequence
+from typing import Sequence
 
 logger = logging.getLogger(__name__)
 
@@ -67,9 +67,25 @@ class MultivariateHawkesProcess:
         self.alpha: list[list[float]] = []
         self._states: list[HawkesState] = []
 
+    def refit(
+        self,
+        channels: Sequence[str],
+        mu: Sequence[float],
+        alpha: Sequence[Sequence[float]],
+    ) -> None:
+        """Replace channel order and intensity parameters; reset per-channel caches."""
+
+        now = time.time()
+        self.channels = list(channels)
+        self.mu = [float(m) for m in mu]
+        self.alpha = [[float(x) for x in row] for row in alpha]
+        self._states = [HawkesState(last_t=now) for _ in self.channels]
+
     # ------------------------------------------------------------------ schema
 
-    def _ensure_channel(self, name: str, *, default_alpha: float = 0.0, default_self_excite: float = 0.6) -> int:
+    def _ensure_channel(
+        self, name: str, *, default_alpha: float = 0.0, default_self_excite: float = 0.6
+    ) -> int:
         if name in self.channels:
             return self.channels.index(name)
         idx = len(self.channels)
@@ -78,11 +94,15 @@ class MultivariateHawkesProcess:
         for row in self.alpha:
             row.append(float(default_alpha))
         new_row = [float(default_alpha)] * (idx + 1)
-        if idx < len(new_row):
-            new_row[idx] = float(default_self_excite)
+        new_row[idx] = float(default_self_excite)
         self.alpha.append(new_row)
         self._states.append(HawkesState(last_t=time.time()))
-        logger.debug("MultivariateHawkesProcess._ensure_channel: name=%r idx=%d total=%d", name, idx, len(self.channels))
+        logger.debug(
+            "MultivariateHawkesProcess._ensure_channel: name=%r idx=%d total=%d",
+            name,
+            idx,
+            len(self.channels),
+        )
         return idx
 
     def couple(self, source: str, target: str, *, weight: float) -> None:
@@ -103,40 +123,63 @@ class MultivariateHawkesProcess:
         st.last_t = float(now)
         return new_cache
 
-    def observe(self, channel: str, *, t: float | None = None) -> None:
-        """Record an arrival on ``channel`` at time ``t`` (default: now)."""
-
-        idx = self._ensure_channel(channel)
-        when = float(t) if t is not None else time.time()
+    def _decay_all(self, when: float) -> None:
         for j in range(len(self.channels)):
-            self._decay(j, when)
-        self._states[idx].cache.append(1.0)
-        logger.debug("MultivariateHawkesProcess.observe: channel=%r at=%.4f cache=%.4f", channel, when, sum(self._states[idx].cache))
+            self._decay(j, float(when))
 
-    def intensity(self, channel: str, *, t: float | None = None) -> float:
-        """Conditional intensity λ_i(t) given the recorded history."""
-
-        if channel not in self.channels:
-            return float(self.baseline)
-        idx = self.channels.index(channel)
-        when = float(t) if t is not None else time.time()
-        for j in range(len(self.channels)):
-            self._decay(j, when)
+    def _intensity_no_decay(self, idx: int) -> float:
         excite = 0.0
         for j in range(len(self.channels)):
             cache = sum(self._states[j].cache)
             excite += float(self.alpha[idx][j]) * cache
         return float(self.mu[idx] + excite)
 
+    def observe(self, channel: str, *, t: float | None = None) -> None:
+        """Record an arrival on ``channel`` at time ``t`` (default: now)."""
+
+        idx = self._ensure_channel(channel)
+        when = float(t) if t is not None else time.time()
+        last_t = self._states[idx].last_t
+        if when < last_t:
+            logger.warning(
+                "MultivariateHawkesProcess.observe: out-of-order event for channel=%r when=%.6f last_t=%.6f; "
+                "events out of chronological order may produce incorrect intensities",
+                channel,
+                when,
+                last_t,
+            )
+        self._decay_all(when)
+        self._states[idx].cache.append(1.0)
+        logger.debug(
+            "MultivariateHawkesProcess.observe: channel=%r at=%.4f cache=%.4f",
+            channel,
+            when,
+            sum(self._states[idx].cache),
+        )
+
+    def intensity(self, channel: str, *, t: float | None = None) -> float:
+        """Conditional intensity λ_i(t) given the recorded history."""
+
+        idx = self._ensure_channel(channel)
+        when = float(t) if t is not None else time.time()
+        self._decay_all(when)
+        return self._intensity_no_decay(idx)
+
     def intensity_vector(self, *, t: float | None = None) -> dict[str, float]:
         """All channel intensities at time ``t``."""
 
         when = float(t) if t is not None else time.time()
-        return {name: self.intensity(name, t=when) for name in self.channels}
+        self._decay_all(when)
+        return {
+            name: self._intensity_no_decay(self.channels.index(name))
+            for name in self.channels
+        }
 
     # ------------------------------------------------------------------ learning
 
-    def negative_log_likelihood(self, events: Sequence[tuple[str, float]], *, horizon: float | None = None) -> float:
+    def negative_log_likelihood(
+        self, events: Sequence[tuple[str, float]], *, horizon: float | None = None
+    ) -> float:
         """NLL of an exponential-kernel multivariate Hawkes process.
 
         Used by the DMN to spot-check whether ``alpha`` is consistent with the
@@ -173,7 +216,12 @@ class MultivariateHawkesProcess:
                 for i in range(len(self.channels)):
                     compensator += float(self.alpha[i][j]) * kernel_int
         nll = compensator - log_intensity_sum
-        logger.debug("MultivariateHawkesProcess.NLL: events=%d horizon=%.3f nll=%.4f", len(sorted_events), T, nll)
+        logger.debug(
+            "MultivariateHawkesProcess.NLL: events=%d horizon=%.3f nll=%.4f",
+            len(sorted_events),
+            T,
+            nll,
+        )
         return float(nll)
 
 
@@ -230,7 +278,12 @@ class PersistentHawkes:
                     json.dumps(process.channels),
                     json.dumps(process.mu),
                     json.dumps(process.alpha),
-                    json.dumps([{"last_t": s.last_t, "cache": s.cache} for s in process._states]),
+                    json.dumps(
+                        [
+                            {"last_t": s.last_t, "cache": s.cache}
+                            for s in process._states
+                        ]
+                    ),
                     time.time(),
                 ),
             )
@@ -247,7 +300,10 @@ class PersistentHawkes:
         proc.channels = list(json.loads(row[2]))
         proc.mu = list(json.loads(row[3]))
         proc.alpha = [list(r) for r in json.loads(row[4])]
-        proc._states = [HawkesState(last_t=float(s["last_t"]), cache=list(s["cache"])) for s in json.loads(row[5])]
+        proc._states = [
+            HawkesState(last_t=float(s["last_t"]), cache=list(s["cache"]))
+            for s in json.loads(row[5])
+        ]
         return proc
 
 
@@ -274,9 +330,19 @@ def fit_excitation_em(
     n = len(sorted_events)
     K = len(chans)
     idx_of = {c: i for i, c in enumerate(chans)}
-    types = [idx_of.get(c, 0) for c, _ in sorted_events]
+    types: list[int] = []
+    for c, _evt_t in sorted_events:
+        if c not in idx_of:
+            raise ValueError(
+                f"fit_excitation_em: unknown event channel {c!r}; expected one of {sorted(idx_of.keys())!r}",
+            )
+        types.append(idx_of[c])
     times = [t for _, t in sorted_events]
-    T = times[-1] - times[0] + 1.0
+    # Horizon width for baseline intensity; avoid the legacy ``+ 1.0`` bias.
+    # Degenerate timeline (single timestamp): use a tiny positive span so divisions stay finite.
+    T = float(times[-1] - times[0])
+    if T <= 0.0:
+        T = 1e-12
 
     mu = [max(smoothing, n / (K * T))] * K
     alpha = [[max(smoothing, 1.0 / (K * K)) for _ in range(K)] for _ in range(K)]
@@ -298,6 +364,19 @@ def fit_excitation_em(
                     sources.append(j)
             total = sum(weights)
             if total <= 0.0:
+                logger.warning(
+                    "fit_excitation_em: non-positive branching total at event_index=%d ki=%d mu[ki]=%s total=%s "
+                    "weights=%s baseline_counts=%s triggered_counts[ki]=%s; attributing unit mass to baseline_counts[%d]",
+                    i,
+                    ki,
+                    mu[ki],
+                    total,
+                    weights,
+                    baseline_counts,
+                    [triggered_counts[ki][j] for j in range(K)],
+                    ki,
+                )
+                baseline_counts[ki] += 1.0
                 continue
             for w, src in zip(weights, sources):
                 p = w / total
@@ -311,11 +390,19 @@ def fit_excitation_em(
         # Per-source normalizer: 1 - exp(-β (T - t_j)) summed across arrivals of type j.
         for j in range(K):
             arrivals_j = [times[idx] for idx in range(n) if types[idx] == j]
-            kernel_sum = sum(1.0 - math.exp(-beta * max(0.0, times[-1] - tt)) for tt in arrivals_j)
+            kernel_sum = sum(
+                1.0 - math.exp(-beta * max(0.0, times[-1] - tt)) for tt in arrivals_j
+            )
             denom = max(kernel_sum / max(beta, 1e-9), smoothing)
             for i in range(K):
                 new_alpha[i][j] = max(smoothing, triggered_counts[i][j] / denom)
         mu = new_mu
         alpha = new_alpha
-    logger.debug("fit_excitation_em: iterations=%d events=%d K=%d mu=%s", int(iterations), n, K, [round(m, 5) for m in mu])
+    logger.debug(
+        "fit_excitation_em: iterations=%d events=%d K=%d mu=%s",
+        int(iterations),
+        n,
+        K,
+        [round(m, 5) for m in mu],
+    )
     return mu, alpha

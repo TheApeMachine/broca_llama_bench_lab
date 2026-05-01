@@ -25,8 +25,8 @@ from __future__ import annotations
 
 import json
 import logging
-import math
 import sqlite3
+import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -47,7 +47,9 @@ class PromotedConcept:
     base_sketch: torch.Tensor
 
 
-def gram_schmidt_orthogonalize(target: torch.Tensor, basis: Sequence[torch.Tensor]) -> torch.Tensor:
+def gram_schmidt_orthogonalize(
+    target: torch.Tensor, basis: Sequence[torch.Tensor]
+) -> torch.Tensor:
     """Subtract every basis vector's projection from ``target`` and renormalize.
 
     Numerically stabilized by re-projecting once after the first pass (so a
@@ -65,15 +67,37 @@ def gram_schmidt_orthogonalize(target: torch.Tensor, basis: Sequence[torch.Tenso
     norm = float(v.norm().item())
     if norm < 1e-9:
         # Original target lay in span(basis); produce a fresh orthogonal vector
-        # by perturbing along a deterministic direction and re-orthogonalizing.
-        rng = torch.Generator()
-        rng.manual_seed(int(target.detach().to(torch.float32).abs().sum().item() * 1e6) % (2**31 - 1) or 1)
-        perturb = torch.empty_like(v).normal_(0.0, 1.0, generator=rng)
-        v = perturb
-        for b in basis:
-            bb = b.detach().to(torch.float32).flatten()
-            v = v - (v @ bb) / (bb @ bb).clamp_min(1e-12) * bb
-        norm = float(v.norm().item())
+        # by perturbing along deterministic directions and re-orthogonalizing.
+        basis_dim_note = len(basis)
+        perturbed_ok = False
+        base_seed = (
+            int(target.detach().to(torch.float32).abs().sum().item() * 1e6)
+            % (2**31 - 1)
+            or 1
+        )
+        for attempt in range(5):
+            rng = torch.Generator()
+            rng.manual_seed(int((base_seed + attempt * 7919) % (2**31 - 1)) or 1)
+            perturb = torch.empty_like(v).normal_(0.0, 1.0, generator=rng)
+            v = perturb
+            for b in basis:
+                bb = b.detach().to(torch.float32).flatten()
+                v = v - (v @ bb) / (bb @ bb).clamp_min(1e-12) * bb
+            norm = float(v.norm().item())
+            if norm >= 1e-9:
+                perturbed_ok = True
+                break
+        if not perturbed_ok:
+            logger.warning(
+                "gram_schmidt_orthogonalize: failed to escape span(basis) after perturb retries "
+                "(norm=%s, len(basis)=%d)",
+                norm,
+                basis_dim_note,
+            )
+            raise ValueError(
+                f"gram_schmidt_orthogonalize: cannot produce orthogonal direction "
+                f"(norm={norm}, len(basis)={basis_dim_note})",
+            )
     return v / max(norm, 1e-12)
 
 
@@ -85,65 +109,125 @@ class OntologicalRegistry:
         self.frequency_threshold = int(frequency_threshold)
         self.access_counts: dict[str, int] = {}
         self.promoted: dict[str, PromotedConcept] = {}
+        self._lock = threading.RLock()
+        self._basis_cache: list[torch.Tensor] | None = None
 
     def __len__(self) -> int:
-        return len(self.promoted)
+        with self._lock:
+            return len(self.promoted)
 
     def observe(self, name: str) -> int:
         """Bump the access count for ``name`` and return the new count."""
 
-        c = self.access_counts.get(name, 0) + 1
-        self.access_counts[name] = c
-        return c
+        with self._lock:
+            c = self.access_counts.get(name, 0) + 1
+            self.access_counts[name] = c
+            return c
 
     def is_promoted(self, name: str) -> bool:
-        return name in self.promoted
+        with self._lock:
+            return name in self.promoted
 
     def basis(self) -> list[torch.Tensor]:
-        return [c.axis for c in self.promoted.values()]
+        with self._lock:
+            if self._basis_cache is None:
+                self._basis_cache = [c.axis for c in self.promoted.values()]
+            return list(self._basis_cache)
 
-    def maybe_promote(self, name: str, base_sketch: torch.Tensor) -> PromotedConcept | None:
-        if name in self.promoted:
-            return self.promoted[name]
-        if self.access_counts.get(name, 0) < self.frequency_threshold:
-            return None
-        sketch = base_sketch.detach().to(torch.float32).flatten()
-        if sketch.numel() != self.dim:
-            raise ValueError(f"sketch dim {sketch.numel()} disagrees with registry dim {self.dim}")
-        axis = gram_schmidt_orthogonalize(sketch, self.basis())
-        promoted = PromotedConcept(
-            name=name,
-            axis=axis,
-            promoted_at=time.time(),
-            access_count=self.access_counts[name],
-            base_sketch=sketch.detach().clone(),
-        )
-        self.promoted[name] = promoted
-        logger.info(
-            "OntologicalRegistry.promote: name=%r access=%d total_promoted=%d residual_norm=%.4f",
-            name,
-            self.access_counts[name],
-            len(self.promoted),
-            float(axis.norm().item()),
-        )
-        return promoted
+    def maybe_promote(
+        self, name: str, base_sketch: torch.Tensor
+    ) -> PromotedConcept | None:
+        with self._lock:
+            if name in self.promoted:
+                return self.promoted[name]
+            if self.access_counts.get(name, 0) < self.frequency_threshold:
+                return None
+            sketch = base_sketch.detach().to(torch.float32).flatten()
+            if sketch.numel() != self.dim:
+                raise ValueError(
+                    f"sketch dim {sketch.numel()} disagrees with registry dim {self.dim}"
+                )
+            axis = gram_schmidt_orthogonalize(sketch, self.basis())
+            promoted = PromotedConcept(
+                name=name,
+                axis=axis,
+                promoted_at=time.time(),
+                access_count=self.access_counts[name],
+                base_sketch=sketch.detach().clone(),
+            )
+            self.promoted[name] = promoted
+            self._basis_cache = None
+            logger.info(
+                "OntologicalRegistry.promote: name=%r access=%d total_promoted=%d residual_norm=%.4f",
+                name,
+                self.access_counts[name],
+                len(self.promoted),
+                float(axis.norm().item()),
+            )
+            return promoted
 
     def vector_for(self, name: str, base_sketch: torch.Tensor) -> torch.Tensor:
         """Return the dedicated axis if promoted; otherwise the base sketch."""
 
-        promoted = self.promoted.get(name)
-        if promoted is None:
-            return F.normalize(base_sketch.detach().to(torch.float32).flatten(), dim=0)
-        return promoted.axis
+        with self._lock:
+            promoted = self.promoted.get(name)
+            if promoted is None:
+                return F.normalize(
+                    base_sketch.detach().to(torch.float32).flatten(), dim=0
+                )
+            return promoted.axis
 
     def cosine_to_basis(self, query: torch.Tensor) -> dict[str, float]:
         """Inspectable diagnostic: cosine of ``query`` against every promoted axis."""
 
         q = F.normalize(query.detach().to(torch.float32).flatten(), dim=0)
+        with self._lock:
+            promoted_items = list(self.promoted.items())
         out: dict[str, float] = {}
-        for name, c in self.promoted.items():
+        for name, c in promoted_items:
             out[name] = float((q @ c.axis).item())
         return out
+
+
+def _promoted_axes_max_off_diagonal_dot(promoted: dict[str, PromotedConcept]) -> float:
+    axes = [c.axis for c in promoted.values()]
+    if len(axes) < 2:
+        return 0.0
+    A = torch.stack([F.normalize(a.flatten(), dim=0) for a in axes])
+    G = A @ A.T
+    K = G.shape[0]
+    mask = ~torch.eye(K, dtype=torch.bool, device=G.device)
+    return float(G.masked_select(mask).abs().max().item())
+
+
+def _repair_loaded_promoted_axes(
+    registry: OntologicalRegistry, *, tol: float = 1e-3
+) -> None:
+    max_od = _promoted_axes_max_off_diagonal_dot(registry.promoted)
+    if max_od <= tol:
+        return
+    logger.warning(
+        "OntologicalRegistry.load: promoted axes exceed orthogonality tolerance "
+        "max_off_diagonal_dot=%.4f (tol=%.2e); applying sequential Gram–Schmidt repair.",
+        max_od,
+        tol,
+    )
+    names = sorted(
+        registry.promoted.keys(), key=lambda n: registry.promoted[n].promoted_at
+    )
+    basis_acc: list[torch.Tensor] = []
+    for name in names:
+        pc = registry.promoted[name]
+        new_axis = gram_schmidt_orthogonalize(pc.axis, basis_acc)
+        basis_acc.append(new_axis)
+        registry.promoted[name] = PromotedConcept(
+            name=pc.name,
+            axis=new_axis,
+            promoted_at=pc.promoted_at,
+            access_count=pc.access_count,
+            base_sketch=pc.base_sketch,
+        )
+    registry._basis_cache = None
 
 
 class PersistentOntologicalRegistry:
@@ -153,12 +237,19 @@ class PersistentOntologicalRegistry:
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.namespace = namespace
+        self._conn: sqlite3.Connection | None = None
         self._init_schema()
 
     def _connect(self) -> sqlite3.Connection:
-        con = sqlite3.connect(self.path)
-        con.execute("PRAGMA journal_mode=WAL")
-        return con
+        if self._conn is None:
+            self._conn = sqlite3.connect(str(self.path), timeout=30.0)
+            self._conn.execute("PRAGMA journal_mode=WAL")
+        return self._conn
+
+    def close(self) -> None:
+        if self._conn is not None:
+            self._conn.close()
+            self._conn = None
 
     def _init_schema(self) -> None:
         with self._connect() as con:
@@ -189,7 +280,31 @@ class PersistentOntologicalRegistry:
 
     def save(self, registry: OntologicalRegistry) -> None:
         now = time.time()
+        promoted_names = set(registry.promoted.keys())
+        access_names = set(registry.access_counts.keys())
         with self._connect() as con:
+            if promoted_names:
+                placeholders = ",".join("?" * len(promoted_names))
+                con.execute(
+                    f"DELETE FROM ontological_registry WHERE namespace=? AND name NOT IN ({placeholders})",
+                    (self.namespace, *promoted_names),
+                )
+            else:
+                con.execute(
+                    "DELETE FROM ontological_registry WHERE namespace=?",
+                    (self.namespace,),
+                )
+            if access_names:
+                placeholders = ",".join("?" * len(access_names))
+                con.execute(
+                    f"DELETE FROM ontological_counts WHERE namespace=? AND name NOT IN ({placeholders})",
+                    (self.namespace, *access_names),
+                )
+            else:
+                con.execute(
+                    "DELETE FROM ontological_counts WHERE namespace=?",
+                    (self.namespace,),
+                )
             for name, c in registry.promoted.items():
                 con.execute(
                     """
@@ -198,9 +313,17 @@ class PersistentOntologicalRegistry:
                     ON CONFLICT(namespace, name) DO UPDATE SET
                         axis_json=excluded.axis_json,
                         base_sketch_json=excluded.base_sketch_json,
+                        promoted_at=excluded.promoted_at,
                         access_count=excluded.access_count
                     """,
-                    (self.namespace, name, json.dumps(c.axis.tolist()), json.dumps(c.base_sketch.tolist()), float(c.promoted_at), int(c.access_count)),
+                    (
+                        self.namespace,
+                        name,
+                        json.dumps(c.axis.tolist()),
+                        json.dumps(c.base_sketch.tolist()),
+                        float(c.promoted_at),
+                        int(c.access_count),
+                    ),
                 )
             for name, count in registry.access_counts.items():
                 con.execute(
@@ -235,4 +358,5 @@ class PersistentOntologicalRegistry:
                 access_count=int(access_count),
                 base_sketch=base,
             )
+        _repair_loaded_promoted_axes(registry)
         return registry

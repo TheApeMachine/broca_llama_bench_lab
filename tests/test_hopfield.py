@@ -10,6 +10,10 @@ from asi_broca_core.hopfield import (
 
 
 def _orthonormal_basis(d: int, n: int, seed: int = 0) -> torch.Tensor:
+    if n > d:
+        raise ValueError(
+            f"_orthonormal_basis requires n <= d for a full QR factorization, got n={n}, d={d}"
+        )
     g = torch.Generator()
     g.manual_seed(seed)
     raw = torch.empty(n, d).normal_(0.0, 1.0, generator=g)
@@ -23,7 +27,9 @@ def test_one_step_update_collapses_onto_nearest_pattern():
     values = keys.clone()  # autoassociative
     target = keys[2].clone()
     noisy = target + 0.05 * torch.randn(d, generator=torch.Generator().manual_seed(7))
-    retrieved, weights, energy = hopfield_update(noisy, keys, values, beta=20.0, iterations=1)
+    retrieved, weights, energy = hopfield_update(
+        noisy, keys, values, beta=20.0, iterations=1
+    )
     cos = float(torch.nn.functional.cosine_similarity(retrieved, target, dim=0).item())
     assert cos > 0.99, f"expected near-perfect recovery, got cos={cos:.4f}"
     # Weight should be sharply concentrated on index 2.
@@ -72,7 +78,7 @@ def test_empty_memory_returns_zeros():
     assert weights.numel() == 0
 
 
-def test_capacity_warning_at_high_load():
+def test_high_load_retrieval_accuracy():
     """Sanity-check Theorem 3: with β well above √d, dense storage still recovers."""
 
     d = 128
@@ -81,7 +87,11 @@ def test_capacity_warning_at_high_load():
     keys = keys / keys.norm(dim=-1, keepdim=True)
     values = keys.clone()
     target_idx = 42
-    query = keys[target_idx].clone() + 0.01 * torch.randn(d, generator=torch.Generator().manual_seed(11))
+    query = keys[target_idx].clone() + 0.01 * torch.randn(
+        d, generator=torch.Generator().manual_seed(11)
+    )
     retrieved, _, _ = hopfield_update(query, keys, values, beta=50.0, iterations=2)
-    cos = float(torch.nn.functional.cosine_similarity(retrieved, keys[target_idx], dim=0).item())
+    cos = float(
+        torch.nn.functional.cosine_similarity(retrieved, keys[target_idx], dim=0).item()
+    )
     assert cos > 0.85, f"high-β retrieval failed at n=200: cos={cos:.4f}"

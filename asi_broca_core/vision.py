@@ -39,12 +39,20 @@ def _to_tensor(image: Any) -> torch.Tensor:
     """Normalize an arbitrary image input to a [3, H, W] float tensor in [0, 1]."""
 
     if isinstance(image, torch.Tensor):
-        t = image
+        t = image.detach()
+        if not torch.is_floating_point(t):
+            t = t.float()
+        else:
+            t = t.float()
+        if t.numel() > 0 and float(t.max().item()) > 1.0:
+            t = t / 255.0
     else:
         try:
             from PIL import Image  # type: ignore
         except ImportError as exc:  # pragma: no cover - PIL is a typical dep
-            raise RuntimeError("PIL/Pillow is required to decode non-tensor images") from exc
+            raise RuntimeError(
+                "PIL/Pillow is required to decode non-tensor images"
+            ) from exc
         if isinstance(image, (str, Path)):
             img = Image.open(image).convert("RGB")
         elif isinstance(image, (bytes, bytearray)):
@@ -54,6 +62,7 @@ def _to_tensor(image: Any) -> torch.Tensor:
         else:
             raise TypeError(f"unsupported image type: {type(image)!r}")
         import numpy as np  # numpy ships with torch
+
         arr = np.asarray(img, dtype="float32") / 255.0
         t = torch.from_numpy(arr).permute(2, 0, 1).contiguous()
     if t.ndim == 2:
@@ -76,13 +85,15 @@ def _phash_sketch(image: torch.Tensor, *, dim: int = SKETCH_DIM) -> torch.Tensor
     """
 
     g = 0.299 * image[0] + 0.587 * image[1] + 0.114 * image[2]
+    dev = g.device
+    dtype = torch.float32
     target = 64
     g = F.adaptive_avg_pool2d(g.unsqueeze(0).unsqueeze(0), (target, target)).squeeze()
     hist = torch.histc(g, bins=16, min=0.0, max=1.0)
     hist = hist / hist.sum().clamp_min(1e-9)
     # 2D DCT-II via separable matrices — small enough at 64×64 to be cheap.
     n = target
-    k = torch.arange(n, dtype=torch.float32)
+    k = torch.arange(n, dtype=dtype, device=dev)
     basis = torch.cos(math.pi / n * (k.unsqueeze(1) + 0.5) * k.unsqueeze(0))
     basis[0] = basis[0] / math.sqrt(2.0)
     basis = basis * math.sqrt(2.0 / n)
@@ -90,9 +101,21 @@ def _phash_sketch(image: torch.Tensor, *, dim: int = SKETCH_DIM) -> torch.Tensor
     low_freq = dct2[:8, :8].flatten()
     fft = torch.fft.rfft2(g)
     mag = fft.abs()
-    yy, xx = torch.meshgrid(torch.arange(mag.shape[0], dtype=torch.float32), torch.arange(mag.shape[1], dtype=torch.float32), indexing="ij")
-    radius = torch.sqrt(yy ** 2 + xx ** 2)
-    radial = torch.stack([mag[(radius >= r) & (radius < r + 4)].mean() if mag[(radius >= r) & (radius < r + 4)].numel() else torch.tensor(0.0) for r in torch.arange(0, 32, 4)])
+    yy, xx = torch.meshgrid(
+        torch.arange(mag.shape[0], dtype=dtype, device=dev),
+        torch.arange(mag.shape[1], dtype=dtype, device=dev),
+        indexing="ij",
+    )
+    radius = torch.sqrt(yy**2 + xx**2)
+    radial_parts: list[torch.Tensor] = []
+    for r in range(0, 32, 4):
+        mask = (radius >= r) & (radius < r + 4)
+        sel = mag[mask]
+        if sel.numel():
+            radial_parts.append(sel.mean())
+        else:
+            radial_parts.append(torch.zeros((), dtype=mag.dtype, device=mag.device))
+    radial = torch.stack(radial_parts)
     feature = torch.cat([hist, low_freq, radial.nan_to_num(0.0)])
     feature = F.normalize(feature, dim=0)
     # Project the perceptual features into the substrate's hashed sketch space
@@ -121,14 +144,23 @@ class VisionEncoder:
         use_real_model: bool = False,
         device: torch.device | str | None = None,
     ) -> None:
-        self.model_id = model_id or os.environ.get("ASI_BROCA_VISION_MODEL", "openai/clip-vit-base-patch32")
-        self.device = torch.device(device) if device is not None else torch.device("cpu")
+        self.model_id = model_id or os.environ.get(
+            "ASI_BROCA_VISION_MODEL", "openai/clip-vit-base-patch32"
+        )
+        self.device = (
+            torch.device(device) if device is not None else torch.device("cpu")
+        )
         self._model = None
         self._processor = None
         self._real = False
         if use_real_model:
             self._try_load_real()
-        logger.info("VisionEncoder.init: model_id=%s real=%s device=%s", self.model_id, self._real, self.device)
+        logger.info(
+            "VisionEncoder.init: model_id=%s real=%s device=%s",
+            self.model_id,
+            self._real,
+            self.device,
+        )
 
     @property
     def is_real(self) -> bool:
@@ -138,15 +170,23 @@ class VisionEncoder:
         try:
             from transformers import AutoModel, AutoProcessor  # type: ignore
         except ImportError:
-            logger.warning("VisionEncoder: transformers not available; falling back to perceptual sketch")
+            logger.warning(
+                "VisionEncoder: transformers not available; falling back to perceptual sketch"
+            )
             self._real = False
             return
         try:
             self._processor = AutoProcessor.from_pretrained(self.model_id)
-            self._model = AutoModel.from_pretrained(self.model_id).to(self.device).eval()
+            self._model = (
+                AutoModel.from_pretrained(self.model_id).to(self.device).eval()
+            )
             self._real = True
         except Exception as exc:  # pragma: no cover - network/model issues
-            logger.warning("VisionEncoder: failed to load %s (%s); using perceptual sketch", self.model_id, exc)
+            logger.warning(
+                "VisionEncoder: failed to load %s (%s); using perceptual sketch",
+                self.model_id,
+                exc,
+            )
             self._real = False
 
     @torch.no_grad()
@@ -160,15 +200,34 @@ class VisionEncoder:
                 self._real = False
             else:
                 pil = image if hasattr(image, "convert") else None
-                if pil is None:
+                inputs = None
+                if isinstance(image, torch.Tensor):
+                    t = image.detach().float()
+                    if t.ndim == 3:
+                        t = t.unsqueeze(0)
+                    if t.numel() > 0 and float(t.max().item()) > 1.0:
+                        t = t / 255.0
+                    t = t.clamp(0.0, 1.0).to(self.device)
+                    inputs = self._processor(images=t, return_tensors="pt")
+                    inputs = {k: v.to(self.device) for k, v in inputs.items()}
+                elif pil is None:
                     if isinstance(image, (str, Path)):
                         pil = Image.open(image).convert("RGB")
                     elif isinstance(image, (bytes, bytearray)):
                         pil = Image.open(BytesIO(image)).convert("RGB")
                 if pil is not None:
-                    inputs = self._processor(images=pil, return_tensors="pt").to(self.device)
-                    feats = self._model.get_image_features(**inputs) if hasattr(self._model, "get_image_features") else self._model(**inputs).pooler_output
-                    embed = F.normalize(feats[0].detach().cpu().to(torch.float32), dim=0)
+                    inputs = self._processor(images=pil, return_tensors="pt").to(
+                        self.device
+                    )
+                if inputs is not None:
+                    feats = (
+                        self._model.get_image_features(**inputs)
+                        if hasattr(self._model, "get_image_features")
+                        else self._model(**inputs).pooler_output
+                    )
+                    embed = F.normalize(
+                        feats[0].detach().cpu().to(torch.float32), dim=0
+                    )
                     return _embed_to_cognitive_frame(embed)
         # No-deps perceptual fallback path.
         tensor = _to_tensor(image)
@@ -187,7 +246,9 @@ class VisionEncoder:
         hist = torch.histc(gray, bins=int(n_buckets), min=0.0, max=1.0)
         p = (hist / hist.sum().clamp_min(1e-9)).clamp_min(1e-12)
         h = float(-(p * p.log()).sum().item())
-        logger.debug("VisionEncoder.ambiguity: H=%.4f nats max=%.4f", h, math.log(int(n_buckets)))
+        logger.debug(
+            "VisionEncoder.ambiguity: H=%.4f nats max=%.4f", h, math.log(int(n_buckets))
+        )
         return h
 
 
@@ -201,6 +262,11 @@ def _embed_to_cognitive_frame(embed: torch.Tensor) -> torch.Tensor:
     intent = stable_sketch("vision", dim=SKETCH_DIM)
     scene = stable_sketch(f"scene:{base[:8].tolist()}", dim=SKETCH_DIM)
     tail_len = COGNITIVE_FRAME_DIM - 3 * SKETCH_DIM
+    if tail_len < 0:
+        raise ValueError(
+            f"COGNITIVE_FRAME_DIM ({COGNITIVE_FRAME_DIM}) must be >= 3 * SKETCH_DIM ({3 * SKETCH_DIM}); "
+            "check continuous_frame layout constants."
+        )
     tail = torch.zeros(tail_len, dtype=torch.float32)
     if tail_len > 0:
         tail[0] = 1.0  # confidence of the visual observation channel

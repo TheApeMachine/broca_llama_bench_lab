@@ -37,6 +37,9 @@ from .causal import FiniteSCM
 
 logger = logging.getLogger(__name__)
 
+# Resolution for inverse-CDF sampling of discrete exogenous U_v in fitted SCMs.
+SCM_EXOGENOUS_DOMAIN_SIZE = 10_000
+
 
 @dataclass
 class DiscoveredGraph:
@@ -270,6 +273,36 @@ def pc_algorithm(
                         break
                 if changed:
                     break
+                # R3: u — v with u — w, u — w'; w -> v, x -> v; w, x not adjacent => u -> v.
+                for w in variables:
+                    if w in (u, v):
+                        continue
+                    if frozenset((u, w)) not in edges:
+                        continue
+                    if (w, v) not in directed:
+                        continue
+                    for x in variables:
+                        if x in (u, v, w):
+                            continue
+                        if frozenset((u, x)) not in edges:
+                            continue
+                        if (x, v) not in directed:
+                            continue
+                        wx_edge = frozenset((w, x)) in edges
+                        wx_dir = (w, x) in directed or (x, w) in directed
+                        if wx_edge or wx_dir:
+                            continue
+                        if (u, v) in directed or (v, u) in directed:
+                            continue
+                        directed.add((u, v))
+                        edges.discard(edge)
+                        changed = True
+                        logger.info("pc_algorithm.orient.R3: %s -> %s (colliders via %s, %s)", u, v, w, x)
+                        break
+                    if changed:
+                        break
+                if changed:
+                    break
             if changed:
                 break
 
@@ -329,7 +362,7 @@ def build_scm_from_skeleton(graph: DiscoveredGraph, rows: Sequence[Mapping[str, 
         ps = parents_of[v]
         u_name = f"U_{v}"
         domain = graph.domains[v]
-        scm.add_exogenous(u_name, list(range(1000)))
+        scm.add_exogenous(u_name, list(range(SCM_EXOGENOUS_DOMAIN_SIZE)))
         cpt = fitted.get(v, {})
 
         def make_fn(var=v, parents=ps, table=cpt, dom=domain, u=u_name):
@@ -337,11 +370,18 @@ def build_scm_from_skeleton(graph: DiscoveredGraph, rows: Sequence[Mapping[str, 
                 key = tuple(values[p] for p in parents)
                 row = table.get(key)
                 if row is None:
+                    logger.debug(
+                        "build_scm_from_skeleton.CPT: missing CPT key=%r for node=%r; using dom[0]=%r as fallback",
+                        key,
+                        var,
+                        dom[0],
+                    )
                     return dom[0]
-                u_val = int(values[u]) % 1000
+                u_val = int(values[u]) % SCM_EXOGENOUS_DOMAIN_SIZE
                 cumulative = 0.0
+                scale = float(SCM_EXOGENOUS_DOMAIN_SIZE)
                 for value, p in row.items():
-                    cumulative += float(p) * 1000.0
+                    cumulative += float(p) * scale
                     if u_val < cumulative:
                         return value
                 return dom[-1]

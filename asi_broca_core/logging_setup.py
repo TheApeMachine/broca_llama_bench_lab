@@ -26,10 +26,13 @@ from __future__ import annotations
 
 import logging
 import os
+import sys
+import threading
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
 _CONFIGURED = False
+_CONFIG_LOCK = threading.Lock()
 _DEFAULT_LOG_FILE = Path("runs") / "broca.log"
 _DEFAULT_MAX_BYTES = 16 * 1024 * 1024
 _DEFAULT_BACKUPS = 4
@@ -79,44 +82,64 @@ def configure_lab_logging() -> None:
     """Attach stderr + rotating-file logging for the ``asi_broca_core`` namespace."""
 
     global _CONFIGURED
-    if _CONFIGURED:
-        return
+    with _CONFIG_LOCK:
+        if _CONFIGURED:
+            return
 
-    silent = _truthy(os.environ.get("ASI_BROCA_LOG_SILENT"))
-    base_level = _resolve_level(os.environ.get("ASI_BROCA_LOG_LEVEL"), logging.DEBUG)
-    file_level = _resolve_level(os.environ.get("ASI_BROCA_LOG_FILE_LEVEL"), base_level)
+        silent = _truthy(os.environ.get("ASI_BROCA_LOG_SILENT"))
+        base_level = _resolve_level(
+            os.environ.get("ASI_BROCA_LOG_LEVEL"), logging.DEBUG
+        )
+        file_level = _resolve_level(
+            os.environ.get("ASI_BROCA_LOG_FILE_LEVEL"), base_level
+        )
 
-    pkg = logging.getLogger("asi_broca_core")
-    # Logger threshold must be the more permissive of the two handlers so each
-    # handler can independently filter without the parent logger swallowing
-    # records below its own level.
-    pkg.setLevel(min(base_level, file_level))
-    pkg.propagate = False
+        pkg = logging.getLogger("asi_broca_core")
+        # Logger threshold must be the more permissive of the two handlers so each
+        # handler can independently filter without the parent logger swallowing
+        # records below its own level.
+        pkg.setLevel(min(base_level, file_level))
+        pkg.propagate = False
 
-    if not silent:
-        stream = logging.StreamHandler()
-        stream.setLevel(base_level)
-        stream.setFormatter(_STREAM_FORMATTER)
-        pkg.addHandler(stream)
+        if not silent:
+            stream = logging.StreamHandler()
+            stream.setLevel(base_level)
+            stream.setFormatter(_STREAM_FORMATTER)
+            pkg.addHandler(stream)
 
-    log_path = _resolve_log_file_path()
-    if log_path is not None:
-        try:
-            log_path.parent.mkdir(parents=True, exist_ok=True)
-            max_bytes = _resolve_int(os.environ.get("ASI_BROCA_LOG_FILE_MAX_BYTES"), _DEFAULT_MAX_BYTES)
-            backups = _resolve_int(os.environ.get("ASI_BROCA_LOG_FILE_BACKUPS"), _DEFAULT_BACKUPS)
-            file_handler = RotatingFileHandler(
-                log_path,
-                maxBytes=max(1024, max_bytes),
-                backupCount=max(0, backups),
-                encoding="utf-8",
-            )
-            file_handler.setLevel(file_level)
-            file_handler.setFormatter(_FILE_FORMATTER)
-            pkg.addHandler(file_handler)
-            pkg.info("logging initialized log_file=%s level=%s file_level=%s", log_path, logging.getLevelName(base_level), logging.getLevelName(file_level))
-        except OSError as exc:
-            # Falling back silently here would hide misconfiguration; surface to stderr handler.
-            pkg.warning("failed to attach file handler at %s: %s", log_path, exc)
+        log_path = _resolve_log_file_path()
+        if log_path is not None:
+            try:
+                log_path.parent.mkdir(parents=True, exist_ok=True)
+                max_bytes = _resolve_int(
+                    os.environ.get("ASI_BROCA_LOG_FILE_MAX_BYTES"), _DEFAULT_MAX_BYTES
+                )
+                backups = _resolve_int(
+                    os.environ.get("ASI_BROCA_LOG_FILE_BACKUPS"), _DEFAULT_BACKUPS
+                )
+                file_handler = RotatingFileHandler(
+                    log_path,
+                    maxBytes=max(1024, max_bytes),
+                    backupCount=max(0, backups),
+                    encoding="utf-8",
+                )
+                file_handler.setLevel(file_level)
+                file_handler.setFormatter(_FILE_FORMATTER)
+                pkg.addHandler(file_handler)
+                pkg.info(
+                    "logging initialized log_file=%s level=%s file_level=%s",
+                    log_path,
+                    logging.getLevelName(base_level),
+                    logging.getLevelName(file_level),
+                )
+            except OSError as exc:
+                # Falling back silently here would hide misconfiguration; surface to stderr handler.
+                pkg.warning("failed to attach file handler at %s: %s", log_path, exc)
+                if silent or not pkg.handlers:
+                    print(
+                        f"[asi_broca_core] WARNING: failed to attach file handler at {log_path}: {exc}",
+                        file=sys.stderr,
+                        flush=True,
+                    )
 
-    _CONFIGURED = True
+        _CONFIGURED = True

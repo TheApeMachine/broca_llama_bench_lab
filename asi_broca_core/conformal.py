@@ -51,11 +51,17 @@ class ConformalSet:
     """Result of a conformal query."""
 
     labels: list[str]
-    p_values: dict[str, float]
+    label_probs: dict[str, float]
     set_size: int
     threshold: float
     alpha: float
     method: str
+
+    @property
+    def p_values(self) -> dict[str, float]:
+        """Backward-compatible alias for :attr:`label_probs` (model probabilities, not conformal p-values)."""
+
+        return self.label_probs
 
     @property
     def confident(self) -> bool:
@@ -82,7 +88,9 @@ class ConformalPredictor:
       difficulty.
     """
 
-    def __init__(self, *, alpha: float = 0.1, method: str = "lac", min_calibration: int = 8):
+    def __init__(
+        self, *, alpha: float = 0.1, method: str = "lac", min_calibration: int = 8
+    ):
         if method not in {"lac", "aps"}:
             raise ValueError(f"unknown conformal method: {method!r}")
         self.alpha = float(alpha)
@@ -90,32 +98,71 @@ class ConformalPredictor:
         self.min_calibration = int(min_calibration)
         self._scores: list[float] = []
 
+    def load_scores(self, scores: Sequence[float]) -> None:
+        """Replace the in-memory calibration score list (e.g. after loading from disk)."""
+
+        self._scores = [float(s) for s in scores]
+
+    @property
+    def scores(self) -> list[float]:
+        """Copy of stored nonconformity scores."""
+
+        return list(self._scores)
+
+    def get_scores(self) -> list[float]:
+        """Public copy of calibration scores (same as :attr:`scores`)."""
+
+        return list(self._scores)
+
     def __len__(self) -> int:
         return len(self._scores)
 
-    def calibrate(self, p_label: float, p_distribution: Mapping[str, float] | None = None) -> None:
-        """Add one (score, label) calibration pair.
+    def calibrate(
+        self,
+        p_label: float | None = None,
+        p_distribution: Mapping[str, float] | None = None,
+        *,
+        true_label: str | None = None,
+    ) -> None:
+        """Append one calibration nonconformity score.
 
-        ``p_label`` is the model's estimated probability of the *true* label.
-        For the APS method ``p_distribution`` (sorted highest-prob first) is
-        used to compute the cumulative-mass score.
+        For ``"lac"``, pass ``p_label`` = model probability of the true class.
+
+        For ``"aps"``, pass the full ``p_distribution`` and ``true_label``; the
+        score is cumulative predicted mass in descending-probability order up
+        to and including the true label (Romano et al., 2020).
         """
 
         if self.method == "lac":
+            if p_label is None:
+                raise ValueError(
+                    "LAC calibration requires p_label (estimated probability of the true label)"
+                )
             score = max(0.0, min(1.0, 1.0 - float(p_label)))
         else:
             if p_distribution is None:
-                raise ValueError("APS calibration requires the full distribution")
-            ranked = sorted(p_distribution.values(), reverse=True)
+                raise ValueError("APS calibration requires p_distribution")
+            if true_label is None:
+                raise ValueError("APS calibration requires true_label")
+            if true_label not in p_distribution:
+                raise ValueError(
+                    f"APS calibration: true_label {true_label!r} not found in p_distribution"
+                )
+            ranked = sorted(p_distribution.items(), key=lambda kv: -float(kv[1]))
             cumulative = 0.0
             score = 1.0
-            for p in ranked:
+            for lab, p in ranked:
                 cumulative += float(p)
-                if cumulative >= float(p_label):
+                if lab == true_label:
                     score = float(cumulative)
                     break
         self._scores.append(score)
-        logger.debug("ConformalPredictor.calibrate: method=%s p=%.4f score=%.4f n=%d", self.method, float(p_label), score, len(self._scores))
+        logger.debug(
+            "ConformalPredictor.calibrate: method=%s score=%.4f n=%d",
+            self.method,
+            score,
+            len(self._scores),
+        )
 
     def threshold(self) -> float:
         return _split_threshold(self._scores, self.alpha)
@@ -125,13 +172,17 @@ class ConformalPredictor:
 
         if not distribution:
             return ConformalSet([], {}, 0, float("inf"), self.alpha, self.method)
-        threshold = self.threshold() if len(self._scores) >= self.min_calibration else float("inf")
-        p_values: dict[str, float] = {}
+        threshold = (
+            self.threshold()
+            if len(self._scores) >= self.min_calibration
+            else float("inf")
+        )
+        label_probs: dict[str, float] = {}
         labels: list[str] = []
         if self.method == "lac":
             for label, p in distribution.items():
                 score = max(0.0, min(1.0, 1.0 - float(p)))
-                p_values[label] = float(p)
+                label_probs[label] = float(p)
                 if score <= threshold or not math.isfinite(threshold):
                     labels.append(label)
         else:
@@ -139,9 +190,9 @@ class ConformalPredictor:
             cumulative = 0.0
             for label, p in ranked:
                 cumulative += float(p)
-                p_values[label] = float(p)
+                label_probs[label] = float(p)
                 labels.append(label)
-                if cumulative >= 1.0 - threshold or not math.isfinite(threshold):
+                if cumulative >= threshold or not math.isfinite(threshold):
                     break
         if not labels:
             # Coverage guarantee requires a non-empty set; fall back to top-1.
@@ -149,7 +200,7 @@ class ConformalPredictor:
             labels = [top]
         result = ConformalSet(
             labels=labels,
-            p_values=p_values,
+            label_probs=label_probs,
             set_size=len(labels),
             threshold=threshold,
             alpha=self.alpha,
@@ -201,13 +252,22 @@ class PersistentConformalCalibration:
                 )
                 """
             )
-            con.execute("CREATE INDEX IF NOT EXISTS idx_conformal_lookup ON conformal_scores(namespace, channel, method)")
+            con.execute(
+                "CREATE INDEX IF NOT EXISTS idx_conformal_lookup ON conformal_scores(namespace, channel, method)"
+            )
 
     def add(self, channel: str, method: str, score: float, label: str = "") -> int:
         with self._connect() as con:
             cur = con.execute(
                 "INSERT INTO conformal_scores(namespace, channel, method, score, label, created_at) VALUES (?,?,?,?,?,?)",
-                (self.namespace, channel, method, float(score), str(label), time.time()),
+                (
+                    self.namespace,
+                    channel,
+                    method,
+                    float(score),
+                    str(label),
+                    time.time(),
+                ),
             )
             return int(cur.lastrowid)
 
@@ -219,28 +279,56 @@ class PersistentConformalCalibration:
             ).fetchall()
         return [float(r[0]) for r in rows]
 
-    def hydrate(self, predictor: ConformalPredictor, channel: str) -> ConformalPredictor:
+    def hydrate(
+        self, predictor: ConformalPredictor, channel: str
+    ) -> ConformalPredictor:
         """Reload a predictor's calibration set from disk."""
 
         scores = self.scores(channel, predictor.method)
-        predictor._scores = list(scores)
+        predictor.load_scores(list(scores))
         return predictor
 
-    def persist(self, predictor: ConformalPredictor, channel: str, *, label: str = "") -> None:
+    def persist(
+        self, predictor: ConformalPredictor, channel: str, *, label: str = ""
+    ) -> None:
         """Append any new in-memory scores to the on-disk store.
 
-        Only the *new* tail of ``predictor._scores`` is written. If the
-        predictor has been fully repopulated from another source the caller
-        should hydrate first.
+        Only the *new* tail of in-memory scores is written when the stored
+        sequence is a prefix of the predictor's scores. If the overlapping
+        prefix disagrees with the database, stored rows for this channel/method
+        are replaced with the predictor's full list.
         """
 
         existing = self.scores(channel, predictor.method)
-        new_tail = predictor._scores[len(existing) :]
+        mem = predictor.scores
+        n_pre = min(len(existing), len(mem))
+        for i in range(n_pre):
+            if not math.isclose(
+                float(existing[i]), float(mem[i]), rel_tol=0.0, abs_tol=1e-12
+            ):
+                logger.warning(
+                    "PersistentConformalCalibration.persist: score prefix mismatch at index %d for channel=%r method=%r; rewriting stored scores",
+                    i,
+                    channel,
+                    predictor.method,
+                )
+                with self._connect() as con:
+                    con.execute(
+                        "DELETE FROM conformal_scores WHERE namespace=? AND channel=? AND method=?",
+                        (self.namespace, channel, predictor.method),
+                    )
+                for s in mem:
+                    self.add(channel, predictor.method, float(s), label)
+                return
+        new_tail = mem[len(existing) :]
         for s in new_tail:
             self.add(channel, predictor.method, float(s), label)
 
 
-def empirical_coverage(predictor: ConformalPredictor, calibration_set: Iterable[tuple[Mapping[str, float], str]]) -> float:
+def empirical_coverage(
+    predictor: ConformalPredictor,
+    calibration_set: Iterable[tuple[Mapping[str, float], str]],
+) -> float:
     """Sanity check: empirical coverage on a held-out calibration sequence."""
 
     n = 0

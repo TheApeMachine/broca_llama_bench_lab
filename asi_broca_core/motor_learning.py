@@ -44,7 +44,9 @@ class MotorLearningConfig:
     target_keys: Sequence[str] = field(default_factory=lambda: ("speech_plan_tokens",))
 
 
-def freeze_all_but(parameters_to_train: Iterable[nn.Parameter], host_root: nn.Module) -> set[int]:
+def freeze_all_but(
+    parameters_to_train: Iterable[nn.Parameter], host_root: nn.Module
+) -> set[int]:
     """Freeze every parameter under ``host_root`` except the ones in ``parameters_to_train``.
 
     Returns the set of object ids that were left trainable so callers can
@@ -65,7 +67,7 @@ class GraftMotorTrainer:
         {
             "messages": [{"role": "user", "content": ...}, ...],
             "broca_features": Tensor [d_features],
-            "speech_plan_tokens": LongTensor [k]    # what the substrate wanted
+            "<target_key>": LongTensor [k]    # plan tokens (keys from ``MotorLearningConfig.target_keys``)
         }
 
     The trainer assembles the host's chat template, forwards through the host
@@ -88,12 +90,8 @@ class GraftMotorTrainer:
         self.tokenizer = tokenizer
         self.grafts = list(graft_modules)
         self.config = config or MotorLearningConfig()
-        params = [p for graft in self.grafts for p in graft.parameters() if p.requires_grad or True]
-        # Force-set: only graft params train.
-        for p in self.host.parameters():
-            p.requires_grad = False
-        for p in params:
-            p.requires_grad = True
+        params = [p for graft in self.grafts for p in graft.parameters()]
+        freeze_all_but(parameters_to_train=params, host_root=self.host)
         self.params = params
         self.optimizer = torch.optim.AdamW(
             params,
@@ -103,12 +101,28 @@ class GraftMotorTrainer:
         self.steps = 0
         self.last_loss: float | None = None
 
-    def _build_inputs(self, messages: Sequence[dict[str, str]], plan_tokens: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    def _plan_tensor_from_item(self, item: dict[str, Any]) -> torch.Tensor | None:
+        for key in self.config.target_keys:
+            plan = item.get(key)
+            if plan is None:
+                continue
+            if isinstance(plan, torch.Tensor):
+                return plan
+            return torch.tensor(plan, dtype=torch.long)
+        return None
+
+    def _build_inputs(
+        self, messages: Sequence[dict[str, str]], plan_tokens: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         hf_tok = getattr(self.tokenizer, "inner", None)
         if hf_tok is None or not callable(getattr(hf_tok, "apply_chat_template", None)):
-            raise RuntimeError("motor learning requires a chat-template tokenizer at .tokenizer.inner")
+            raise RuntimeError(
+                "motor learning requires a chat-template tokenizer at .tokenizer.inner"
+            )
         device = next(self.host.parameters()).device
-        prompt = hf_tok.apply_chat_template(list(messages), add_generation_prompt=True, return_tensors="pt")
+        prompt = hf_tok.apply_chat_template(
+            list(messages), add_generation_prompt=True, return_tensors="pt"
+        )
         if not isinstance(prompt, torch.Tensor):
             prompt = prompt["input_ids"]
         prompt = prompt.to(device)
@@ -116,13 +130,13 @@ class GraftMotorTrainer:
             prompt = prompt.view(1, -1)
         plan = plan_tokens.to(device).long().view(-1)
         if plan.numel() == 0:
-            raise ValueError("speech_plan_tokens must be non-empty for a training step")
+            raise ValueError("plan token tensor must be non-empty for a training step")
         # Sequence: prompt + plan_tokens. We supervise the plan positions.
         full = torch.cat([prompt, plan.view(1, -1)], dim=1)
         return prompt, full
 
     def step(self, replay: Sequence[dict[str, Any]]) -> dict[str, Any]:
-        items = [r for r in replay if r.get("speech_plan_tokens") is not None]
+        items = [r for r in replay if self._plan_tensor_from_item(r) is not None]
         if len(items) < self.config.min_replay_for_step:
             return {"skipped": True, "reason": "insufficient_replay", "n": len(items)}
 
@@ -130,17 +144,22 @@ class GraftMotorTrainer:
         for graft in self.grafts:
             graft.train()
         self.optimizer.zero_grad(set_to_none=True)
-        total_loss = torch.zeros(1, device=next(self.host.parameters()).device, dtype=torch.float32)
+        total_loss = torch.zeros(
+            1, device=next(self.host.parameters()).device, dtype=torch.float32
+        )
         contributions = 0
         for item in items[: self.config.max_replay_per_tick]:
             messages = item["messages"]
-            plan = item["speech_plan_tokens"]
-            if not isinstance(plan, torch.Tensor):
-                plan = torch.tensor(plan, dtype=torch.long)
+            plan = self._plan_tensor_from_item(item)
+            if plan is None:
+                continue
             try:
                 prompt, full = self._build_inputs(messages, plan)
             except (RuntimeError, ValueError):
-                logger.debug("GraftMotorTrainer.step: skipping replay item (build failed)", exc_info=True)
+                logger.debug(
+                    "GraftMotorTrainer.step: skipping replay item (build failed)",
+                    exc_info=True,
+                )
                 continue
             mask = torch.ones_like(full, dtype=torch.bool)
             extra = {"tokenizer": self.tokenizer}
@@ -156,7 +175,9 @@ class GraftMotorTrainer:
             # ``prompt_len + j - 1`` is plan[j].
             prompt_len = prompt.shape[1]
             plan_len = plan.numel()
-            target_positions = torch.arange(prompt_len - 1, prompt_len - 1 + plan_len, device=full.device)
+            target_positions = torch.arange(
+                prompt_len - 1, prompt_len - 1 + plan_len, device=full.device
+            )
             preds = logits[0, target_positions]  # [plan_len, V]
             targets = plan.view(-1).to(full.device)
             loss = F.cross_entropy(preds, targets, reduction="mean")
@@ -169,7 +190,9 @@ class GraftMotorTrainer:
         total_loss = total_loss / float(contributions)
         total_loss.backward()
         if self.config.grad_clip is not None and self.config.grad_clip > 0:
-            torch.nn.utils.clip_grad_norm_(self.params, max_norm=float(self.config.grad_clip))
+            torch.nn.utils.clip_grad_norm_(
+                self.params, max_norm=float(self.config.grad_clip)
+            )
         self.optimizer.step()
         self.steps += 1
         self.last_loss = float(total_loss.detach().item())

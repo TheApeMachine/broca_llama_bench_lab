@@ -7,6 +7,7 @@ counts (no manual affinity knobs).
 from __future__ import annotations
 
 import logging
+import math
 import sqlite3
 import time
 from pathlib import Path
@@ -40,8 +41,12 @@ class EpisodeAssociationGraph:
                 )
                 """
             )
-            con.execute("CREATE INDEX IF NOT EXISTS idx_episode_assoc_lo ON episode_association(lo)")
-            con.execute("CREATE INDEX IF NOT EXISTS idx_episode_assoc_hi ON episode_association(hi)")
+            con.execute(
+                "CREATE INDEX IF NOT EXISTS idx_episode_assoc_lo ON episode_association(lo)"
+            )
+            con.execute(
+                "CREATE INDEX IF NOT EXISTS idx_episode_assoc_hi ON episode_association(hi)"
+            )
 
     def bump(self, episode_id_a: int, episode_id_b: int, *, delta: float = 1.0) -> None:
         ia, ib = int(episode_id_a), int(episode_id_b)
@@ -63,7 +68,9 @@ class EpisodeAssociationGraph:
                 """,
                 (lo, hi, w, now),
             )
-            logger.debug("EpisodeAssociationGraph.bump: lo=%s hi=%s weight=%s", lo, hi, w)
+            logger.debug(
+                "EpisodeAssociationGraph.bump: lo=%s hi=%s weight=%s", lo, hi, w
+            )
 
     def weight(self, episode_id_a: int, episode_id_b: int) -> float:
         ia, ib = int(episode_id_a), int(episode_id_b)
@@ -77,7 +84,9 @@ class EpisodeAssociationGraph:
             ).fetchone()
         return float(row[0]) if row else 0.0
 
-    def decay_all(self, *, gamma: float = 0.99, prune_below: float = 0.01) -> tuple[int, int]:
+    def decay_all(
+        self, *, gamma: float = 0.99, prune_below: float = 0.01
+    ) -> tuple[int, int]:
         """Apply thermodynamic decay to every edge and prune the survivors.
 
         Returns ``(decayed_edges, pruned_edges)`` so the DMN telemetry can
@@ -90,6 +99,10 @@ class EpisodeAssociationGraph:
         floor = float(prune_below)
         if not (0.0 < g <= 1.0):
             raise ValueError("gamma must be in (0, 1]")
+        if not (0.0 <= floor < 1.0) or not math.isfinite(floor):
+            raise ValueError(
+                f"prune_below must be finite and in [0.0, 1.0), got {prune_below!r}"
+            )
         with self._connect() as con:
             decayed_cur = con.execute(
                 "UPDATE episode_association SET weight = weight * ?, updated_at = ?",
@@ -120,7 +133,9 @@ class EpisodeAssociationGraph:
             ).fetchall()
         return [(int(r[0]), int(r[1]), float(r[2])) for r in rows]
 
-    def neighbors(self, episode_id: int, *, limit: int = 16, min_weight: float = 0.0) -> list[tuple[int, float]]:
+    def neighbors(
+        self, episode_id: int, *, limit: int = 16, min_weight: float = 0.0
+    ) -> list[tuple[int, float]]:
         """Top-weighted neighbors of an episode, used for transitive episode closure."""
 
         nid = int(episode_id)
@@ -137,7 +152,9 @@ class EpisodeAssociationGraph:
             ).fetchall()
         return [(int(r[0]), float(r[1])) for r in rows]
 
-    def centrality(self, *, damping: float = 0.85, iterations: int = 20, min_weight: float = 0.0) -> dict[int, float]:
+    def centrality(
+        self, *, damping: float = 0.85, iterations: int = 20, min_weight: float = 0.0
+    ) -> dict[int, float]:
         """PageRank over the surviving episode association graph.
 
         Returns the stationary distribution over episode ids; nodes that the
@@ -162,17 +179,20 @@ class EpisodeAssociationGraph:
         n = len(nodes)
         if n == 0:
             return {}
-        d = float(damping)
+        try:
+            d = float(damping)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"damping must be numeric, got {damping!r}") from exc
+        if not (0.0 <= d <= 1.0) or not math.isfinite(d):
+            raise ValueError(
+                f"damping must be finite and in [0.0, 1.0], got {damping!r}"
+            )
         teleport = (1.0 - d) / n
         rank = {node: 1.0 / n for node in nodes}
         for _ in range(max(1, int(iterations))):
             new_rank = {node: teleport for node in nodes}
             for src, neighbors in adj.items():
-                if not neighbors:
-                    continue
-                total = out_weight.get(src, 0.0)
-                if total <= 0.0:
-                    continue
+                total = out_weight[src]
                 share = d * rank[src] / total
                 for dst, w in neighbors:
                     new_rank[dst] += share * w

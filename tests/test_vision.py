@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+import sys
 
 import torch
 
@@ -49,9 +50,11 @@ def test_distinct_images_produce_distinct_embeddings():
     flat = enc.encode_image(_flat_image())
     cos_gc = float(torch.nn.functional.cosine_similarity(grad, checker, dim=0).item())
     cos_gf = float(torch.nn.functional.cosine_similarity(grad, flat, dim=0).item())
+    cos_cf = float(torch.nn.functional.cosine_similarity(checker, flat, dim=0).item())
     # Distinct images should not map to identical vectors.
     assert cos_gc < 0.999
     assert cos_gf < 0.999
+    assert cos_cf < 0.999
 
 
 def test_ambiguity_separates_uniform_from_textured():
@@ -68,8 +71,10 @@ def test_ambiguity_separates_uniform_from_textured():
 
 
 def test_real_model_falls_back_silently_when_transformers_unavailable():
-    enc = VisionEncoder(use_real_model=True)
-    # Either is_real is True (transformers + network worked) or False (silent fallback).
+    from unittest.mock import patch
+
+    with patch.dict(sys.modules, {"transformers": None}):
+        enc = VisionEncoder(use_real_model=True)
+    assert enc.is_real is False
     out = enc.encode_image(_gradient_image())
     assert out.shape == (COGNITIVE_FRAME_DIM,)
-    assert isinstance(enc.is_real, bool)

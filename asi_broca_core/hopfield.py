@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import logging
 import math
+import threading
 from typing import Optional
 
 import torch
@@ -68,9 +69,17 @@ def hopfield_update(
     """
 
     if keys.shape[0] != values.shape[0]:
-        raise ValueError(f"keys and values disagree on N: {keys.shape[0]} vs {values.shape[0]}")
+        raise ValueError(
+            f"keys and values disagree on N: {keys.shape[0]} vs {values.shape[0]}"
+        )
     if keys.shape[-1] != query.shape[-1]:
-        raise ValueError(f"keys and query disagree on d: {keys.shape[-1]} vs {query.shape[-1]}")
+        raise ValueError(
+            f"keys and query disagree on d: {keys.shape[-1]} vs {query.shape[-1]}"
+        )
+    if values.shape[-1] != query.shape[-1]:
+        raise ValueError(
+            f"values and query disagree on d: {values.shape[-1]} vs {query.shape[-1]}"
+        )
     if beta is None:
         beta = derived_inverse_temperature(keys)
     b = float(beta)
@@ -81,8 +90,12 @@ def hopfield_update(
         weights = F.softmax(scores, dim=-1)
         q = (weights.to(values.dtype) @ values).reshape_as(query)
     # Lyapunov energy E(ξ) = -lse(β X ξ) + 0.5 ‖ξ‖² + 0.5 max‖x‖²
-    lse = torch.logsumexp(b * (keys @ q.flatten().to(keys.dtype)), dim=-1) / max(b, 1e-12)
-    half_q_norm = 0.5 * float((q.flatten().to(torch.float32) @ q.flatten().to(torch.float32)).item())
+    lse = torch.logsumexp(b * (keys @ q.flatten().to(keys.dtype)), dim=-1) / max(
+        b, 1e-12
+    )
+    half_q_norm = 0.5 * float(
+        (q.flatten().to(torch.float32) @ q.flatten().to(torch.float32)).item()
+    )
     energy = float(half_q_norm - float(lse.item()))
     logger.debug(
         "hopfield_update: beta=%.4f iters=%d N=%d d=%d energy=%.4f weight_max=%.4f",
@@ -105,45 +118,127 @@ class HopfieldAssociativeMemory:
     time without distorting the energy basin.
     """
 
-    def __init__(self, d_model: int, *, max_items: int = 65_536, dtype: torch.dtype = torch.float32, device: torch.device | str | None = None):
+    def __init__(
+        self,
+        d_model: int,
+        *,
+        max_items: int = 65_536,
+        dtype: torch.dtype = torch.float32,
+        device: torch.device | str | None = None,
+    ):
         self.d_model = int(d_model)
         self.max_items = int(max_items)
         self.dtype = dtype
-        self.device = torch.device(device) if device is not None else torch.device("cpu")
-        self.keys = torch.empty(0, self.d_model, dtype=dtype, device=self.device)
-        self.values = torch.empty(0, self.d_model, dtype=dtype, device=self.device)
-        self.metadata: list[dict] = []
+        self.device = (
+            torch.device(device) if device is not None else torch.device("cpu")
+        )
+        self._lock = threading.Lock()
+        self._buf_keys = torch.zeros(
+            self.max_items, self.d_model, dtype=dtype, device=self.device
+        )
+        self._buf_values = torch.zeros(
+            self.max_items, self.d_model, dtype=dtype, device=self.device
+        )
+        self._meta_ring: list[dict] = [{} for _ in range(self.max_items)]
+        self._write_pos = 0
+        self._count = 0
         self.last_debug: dict = {}
 
     def __len__(self) -> int:
-        return int(self.keys.shape[0])
+        with self._lock:
+            return int(self._count)
 
-    def remember(self, key: torch.Tensor, value: torch.Tensor, *, metadata: Optional[dict] = None) -> None:
-        k = key.detach().reshape(-1, self.d_model).to(self.keys.device, self.keys.dtype)
-        v = value.detach().reshape(-1, self.d_model).to(self.values.device, self.values.dtype)
+    def _active_kv_unlocked(self) -> tuple[torch.Tensor, torch.Tensor]:
+        """Chronological keys/values; caller must hold ``_lock``."""
+
+        if self._count == 0:
+            z = torch.empty(0, self.d_model, dtype=self.dtype, device=self.device)
+            return z, z
+        if self._count < self.max_items:
+            return self._buf_keys[: self._count], self._buf_values[: self._count]
+        wp = self._write_pos
+        keys = torch.cat([self._buf_keys[wp:], self._buf_keys[:wp]], dim=0)
+        values = torch.cat([self._buf_values[wp:], self._buf_values[:wp]], dim=0)
+        return keys, values
+
+    def _active_metadata_unlocked(self) -> list[dict]:
+        if self._count == 0:
+            return []
+        if self._count < self.max_items:
+            return [dict(self._meta_ring[i]) for i in range(self._count)]
+        wp = self._write_pos
+        front = [dict(self._meta_ring[i]) for i in range(wp, self.max_items)]
+        front.extend(dict(self._meta_ring[i]) for i in range(wp))
+        return front
+
+    @property
+    def keys(self) -> torch.Tensor:
+        with self._lock:
+            k, _ = self._active_kv_unlocked()
+            return k.clone() if k.numel() else k
+
+    @property
+    def values(self) -> torch.Tensor:
+        with self._lock:
+            _, v = self._active_kv_unlocked()
+            return v.clone() if v.numel() else v
+
+    @property
+    def metadata(self) -> list[dict]:
+        with self._lock:
+            return self._active_metadata_unlocked()
+
+    def remember(
+        self, key: torch.Tensor, value: torch.Tensor, *, metadata: Optional[dict] = None
+    ) -> None:
+        k = key.detach().reshape(-1, self.d_model).to(self.device, self.dtype)
+        v = value.detach().reshape(-1, self.d_model).to(self.device, self.dtype)
         if k.shape[0] != v.shape[0]:
             raise ValueError(f"key/value count mismatch: {k.shape[0]} vs {v.shape[0]}")
-        self.keys = torch.cat([self.keys, k], dim=0)[-self.max_items :]
-        self.values = torch.cat([self.values, v], dim=0)[-self.max_items :]
-        for _ in range(k.shape[0]):
-            self.metadata.append(dict(metadata or {}))
-        self.metadata = self.metadata[-self.max_items :]
-        logger.debug("HopfieldAssociativeMemory.remember: rows_added=%d total=%d d=%d", int(k.shape[0]), int(self.keys.shape[0]), self.d_model)
+        b = int(k.shape[0])
+        md = dict(metadata or {})
+        with self._lock:
+            start = self._write_pos
+            for i in range(b):
+                slot = (start + i) % self.max_items
+                self._buf_keys[slot] = k[i].to(self._buf_keys.dtype)
+                self._buf_values[slot] = v[i].to(self._buf_values.dtype)
+                self._meta_ring[slot] = dict(md)
+            self._write_pos = (start + b) % self.max_items
+            self._count = min(self.max_items, self._count + b)
+            total_rows = self._count
+        logger.debug(
+            "HopfieldAssociativeMemory.remember: rows_added=%d total=%d d=%d",
+            b,
+            total_rows,
+            self.d_model,
+        )
 
-    def retrieve(self, query: torch.Tensor, *, beta: float | None = None, iterations: int = 1) -> tuple[torch.Tensor, torch.Tensor]:
-        if self.keys.numel() == 0:
-            zeros = torch.zeros_like(query)
-            return zeros, torch.zeros(0, dtype=query.dtype, device=query.device)
+    def retrieve(
+        self, query: torch.Tensor, *, beta: float | None = None, iterations: int = 1
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        with self._lock:
+            if self._count == 0:
+                zeros = torch.zeros_like(query)
+                return zeros, torch.zeros(0, dtype=query.dtype, device=query.device)
+            keys, values = self._active_kv_unlocked()
+            keys_q = keys.clone()
+            values_q = values.clone()
+            k_dev = keys_q.device
+            k_dtype = keys_q.dtype
+            n_pat = int(self._count)
+
         retrieved, weights, energy = hopfield_update(
-            query.to(self.keys.device, self.keys.dtype),
-            self.keys,
-            self.values,
+            query.to(k_dev, k_dtype),
+            keys_q,
+            values_q,
             beta=beta,
             iterations=iterations,
         )
-        self.last_debug = {
-            "weight_max": float(weights.max().item()) if weights.numel() else 0.0,
-            "energy": float(energy.item()),
-            "n": int(self.keys.shape[0]),
-        }
+        with self._lock:
+            self.last_debug = {
+                "weight_max": float(weights.max().item()) if weights.numel() else 0.0,
+                "energy": float(energy.item()),
+                "n": n_pat,
+            }
         return retrieved.to(query.dtype), weights

@@ -48,10 +48,12 @@ def test_chi2_sf_matches_known_values():
 
 
 def test_independence_test_detects_dependent_pair():
-    rows = [
-        {"X": x, "Y": x ^ (1 if i % 5 == 0 else 0)}
-        for i, x in enumerate([random.Random(0).randint(0, 1) for _ in range(200)])
-    ]
+    rng = random.Random(0)
+    rows = []
+    for _ in range(200):
+        x = rng.randint(0, 1)
+        y = x if rng.random() < 0.85 else 1 - x
+        rows.append({"X": x, "Y": y})
     indep, g, p = _g_squared_independence(rows, "X", "Y", [], alpha=0.05)
     # Highly correlated => not independent.
     assert not indep, f"correlated pair flagged independent (p={p:.4f}, g={g:.3f})"
@@ -69,7 +71,9 @@ def test_pc_recovers_chain_skeleton():
     edges = graph.undirected_edges | {frozenset(e) for e in graph.directed_edges}
     assert frozenset(("X", "Y")) in edges
     assert frozenset(("Y", "Z")) in edges
-    assert frozenset(("X", "Z")) not in edges, f"PC failed to remove X-Z edge; graph={graph}"
+    assert (
+        frozenset(("X", "Z")) not in edges
+    ), f"PC failed to remove X-Z edge; graph={graph}"
 
 
 def test_pc_orients_v_structure():
@@ -77,9 +81,9 @@ def test_pc_orients_v_structure():
     graph = pc_algorithm(rows, ["X", "Y", "Z"], alpha=0.05)
     # The X — Z and Y — Z edges should be directed *into* Z.
     incoming_z = [u for (u, v) in graph.directed_edges if v == "Z"]
-    assert "X" in incoming_z and "Y" in incoming_z, (
-        f"v-structure not oriented: directed={graph.directed_edges} undirected={graph.undirected_edges}"
-    )
+    assert (
+        "X" in incoming_z and "Y" in incoming_z
+    ), f"v-structure not oriented: directed={graph.directed_edges} undirected={graph.undirected_edges}"
 
 
 def test_pc_handles_independent_variables():
@@ -100,4 +104,6 @@ def test_build_scm_from_skeleton_runs_simulation():
     p = scm.probability({"Z": 1}, interventions={"X": 1})
     # Intervening on the chain root should still bias Z because Y depends on X.
     p0 = scm.probability({"Z": 1}, interventions={"X": 0})
-    assert abs(p - p0) > 0.05, f"do(X=1) and do(X=0) gave same Z=1 probability ({p:.3f} vs {p0:.3f})"
+    assert (
+        abs(p - p0) > 0.05
+    ), f"do(X=1) and do(X=0) gave same Z=1 probability ({p:.3f} vs {p0:.3f})"

@@ -1077,6 +1077,7 @@ class PersistentSemanticMemory:
         to pose a disambiguating question on the next turn.
         """
 
+        max_bucket = 256
         threshold = max(1, int(min_shared))
         # Group subjects by the (predicate, object) tuples they share.
         bucket: dict[tuple[str, str], list[str]] = {}
@@ -1098,6 +1099,14 @@ class PersistentSemanticMemory:
             if len(subjects) < 2:
                 continue
             unique = sorted(set(subjects))
+            if len(unique) > max_bucket:
+                logger.info(
+                    "PersistentSemanticMemory.overlapping_subject_pairs: capped bucket key=%r n_unique=%d max=%d",
+                    key,
+                    len(unique),
+                    max_bucket,
+                )
+                unique = unique[:max_bucket]
             for i in range(len(unique)):
                 for j in range(i + 1, len(unique)):
                     pair_overlap.setdefault((unique[i], unique[j]), set()).add(key)
@@ -1532,11 +1541,18 @@ class CognitiveBackgroundWorker:
                     eps = evidence.get("episode_ids") if isinstance(evidence, dict) else None
                     if not isinstance(eps, list):
                         continue
-                    intersection = [int(e) for e in eps if int(e) in top_episodes]
+                    parsed: list[int] = []
+                    for e in eps:
+                        try:
+                            ei = int(e)
+                        except (TypeError, ValueError):
+                            continue
+                        parsed.append(ei)
+                    intersection = [ei for ei in parsed if ei in top_episodes]
                     if not intersection:
                         continue
                     # Scale the boost by the maximum centrality mass that touched this fact.
-                    mass = max(centrality.get(int(e), 0.0) for e in intersection)
+                    mass = max(centrality.get(ei, 0.0) for ei in intersection)
                     factor = 1.0 + (cfg.centrality_boost_factor - 1.0) * min(1.0, mass / max(cfg.centrality_boost_floor, 1e-6))
                     result = memory.boost_confidence(
                         subj,
@@ -1854,15 +1870,7 @@ class CognitiveBackgroundWorker:
                 logger.exception("REM.hawkes: EM fit failed")
                 mu, alpha = None, None
             if mu is not None and alpha is not None:
-                from .hawkes import HawkesState
-
-                self.mind.hawkes.channels = list(channels)
-                self.mind.hawkes.mu = list(mu)
-                self.mind.hawkes.alpha = [list(row) for row in alpha]
-                # Fresh per-channel state caches so the relearned model decays
-                # cleanly from the moment of refit instead of carrying stale
-                # cache values from the prior excitation matrix.
-                self.mind.hawkes._states = [HawkesState(last_t=time.time()) for _ in channels]
+                self.mind.hawkes.refit(channels, mu, alpha)
                 try:
                     self.mind.hawkes_persistence.save(self.mind.hawkes)
                 except Exception:
@@ -2088,8 +2096,8 @@ class SubstrateLogitBiasGraft(BaseGraft):
         confidence = float(_state_confidence(state))
         confidence = max(0.0, min(1.0, confidence))
         inertia = float(_state_inertia(state))
-        if inertia <= 0.0:
-            return x
+        small_inertia = 1e-6
+        inertia = max(inertia, small_inertia)
 
         out = x.clone()
         last = state["last_indices"].to(x.device)
@@ -2540,7 +2548,12 @@ class BrocaMind:
     def observe_user_feedback(self, *, faculty: str, observation_index: int, polarity: float, weight: float = 1.0, reason: str = "") -> None:
         """Forward user feedback into the right Dirichlet preference and sync."""
 
-        target = self.spatial_preference if faculty == "spatial" else self.causal_preference
+        if faculty == "spatial":
+            target = self.spatial_preference
+        elif faculty == "causal":
+            target = self.causal_preference
+        else:
+            raise ValueError(f"BrocaMind.observe_user_feedback: unsupported faculty {faculty!r}; expected 'spatial' or 'causal'")
         target.update(observation_index, polarity=polarity, weight=weight, reason=reason)
         self._sync_preference_to_pomdp()
         try:

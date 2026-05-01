@@ -24,13 +24,19 @@ from __future__ import annotations
 import json
 import logging
 import math
+import re
 import sqlite3
+import threading
 import time
-from dataclasses import dataclass
+from collections import deque
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Sequence
 
 logger = logging.getLogger(__name__)
+
+_HISTORY_MAXLEN = 128
 
 
 @dataclass
@@ -39,6 +45,24 @@ class PreferenceEvent:
     polarity: float
     weight: float
     reason: str
+    timestamp: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+
+
+def _preference_event_from_dict(d: dict) -> PreferenceEvent:
+    ts_raw = d.get("timestamp")
+    if isinstance(ts_raw, str) and ts_raw.strip():
+        ts = datetime.fromisoformat(ts_raw.replace("Z", "+00:00"))
+        if ts.tzinfo is None:
+            ts = ts.replace(tzinfo=timezone.utc)
+    else:
+        ts = datetime.fromtimestamp(0, tz=timezone.utc)
+    return PreferenceEvent(
+        observation_index=int(d["observation_index"]),
+        polarity=float(d["polarity"]),
+        weight=float(d["weight"]),
+        reason=str(d.get("reason", "")),
+        timestamp=ts,
+    )
 
 
 class DirichletPreference:
@@ -51,7 +75,13 @@ class DirichletPreference:
     for online preference learning.
     """
 
-    def __init__(self, n_observations: int, *, prior_strength: float = 1.0, initial_C: Sequence[float] | None = None):
+    def __init__(
+        self,
+        n_observations: int,
+        *,
+        prior_strength: float = 1.0,
+        initial_C: Sequence[float] | None = None,
+    ):
         if n_observations <= 0:
             raise ValueError("n_observations must be positive")
         self.n_observations = int(n_observations)
@@ -59,12 +89,25 @@ class DirichletPreference:
         if initial_C is None:
             self.alpha = [self.prior_strength] * self.n_observations
         else:
-            base = [max(1e-6, float(x)) for x in initial_C]
-            if len(base) != self.n_observations:
+            parsed: list[float] = []
+            for i, x in enumerate(initial_C):
+                try:
+                    v = float(x)
+                except (TypeError, ValueError) as exc:
+                    raise ValueError(f"initial_C[{i}]={x!r} is not numeric") from exc
+                if v < 0:
+                    raise ValueError(
+                        f"initial_C[{i}]={x!r} (value {v}) must be non-negative"
+                    )
+                parsed.append(v)
+            if len(parsed) != self.n_observations:
                 raise ValueError("initial_C length disagrees with n_observations")
+            base = [max(1e-6, v) for v in parsed]
             total = sum(base)
-            self.alpha = [a * self.prior_strength * self.n_observations / total for a in base]
-        self.history: list[PreferenceEvent] = []
+            self.alpha = [
+                a * self.prior_strength * self.n_observations / total for a in base
+            ]
+        self.history: deque[PreferenceEvent] = deque(maxlen=_HISTORY_MAXLEN)
 
     @property
     def mean(self) -> list[float]:
@@ -80,13 +123,21 @@ class DirichletPreference:
         total = sum(self.alpha)
         if total <= 0:
             return [0.0] * self.n_observations
+        safe_total = max(total, max(1e-6 * self.n_observations, 1e-3))
+        denom = safe_total * safe_total * (safe_total + 1.0)
         out = []
-        denom = total * total * (total + 1.0)
         for a in self.alpha:
-            out.append(float(a * (total - a) / max(denom, 1e-12)))
+            out.append(float(a * (total - a) / denom))
         return out
 
-    def update(self, observation_index: int, *, polarity: float = 1.0, weight: float = 1.0, reason: str = "") -> None:
+    def update(
+        self,
+        observation_index: int,
+        *,
+        polarity: float = 1.0,
+        weight: float = 1.0,
+        reason: str = "",
+    ) -> None:
         """Update the Dirichlet given one labeled observation.
 
         ``polarity > 0`` increases the pseudocount on ``observation_index``;
@@ -104,7 +155,14 @@ class DirichletPreference:
         else:
             shrink = math.exp(float(polarity) * w)
             self.alpha[i] = max(1e-6, self.alpha[i] * shrink)
-        self.history.append(PreferenceEvent(observation_index=i, polarity=float(polarity), weight=w, reason=str(reason)))
+        self.history.append(
+            PreferenceEvent(
+                observation_index=i,
+                polarity=float(polarity),
+                weight=w,
+                reason=str(reason),
+            )
+        )
         logger.info(
             "DirichletPreference.update: idx=%d polarity=%+.3f weight=%.3f alpha[i]=%.4f mean=%s reason=%s",
             i,
@@ -128,6 +186,11 @@ class DirichletPreference:
         return float(sum(pi * math.log(pi / u) for pi in p if pi > 0))
 
 
+_NEGATIVE_SENTIMENT = re.compile(
+    r"\b(?:stop|no|worse|bad|wrong|annoying)\b|\btoo many\b",
+)
+
+
 class PersistentPreference:
     """Disk-backed Dirichlet store keyed by ``(namespace, faculty)``."""
 
@@ -135,66 +198,119 @@ class PersistentPreference:
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.namespace = namespace
+        self._conn: sqlite3.Connection | None = None
+        self._conn_lock = threading.Lock()
         self._init_schema()
 
-    def _connect(self) -> sqlite3.Connection:
-        con = sqlite3.connect(self.path)
-        con.execute("PRAGMA journal_mode=WAL")
-        return con
+    def _conn_get(self) -> sqlite3.Connection:
+        if self._conn is None:
+            self._conn = sqlite3.connect(str(self.path), timeout=30.0)
+            self._conn.execute("PRAGMA journal_mode=WAL")
+        return self._conn
+
+    def close(self) -> None:
+        with self._conn_lock:
+            if self._conn is not None:
+                self._conn.close()
+                self._conn = None
+
+    def __del__(self) -> None:  # pragma: no cover - best-effort cleanup
+        try:
+            self.close()
+        except Exception:
+            pass
+
+    def _migrate_schema(self, con: sqlite3.Connection) -> None:
+        cols = {
+            row[1]
+            for row in con.execute("PRAGMA table_info(preference_state)").fetchall()
+        }
+        if "prior_strength" not in cols:
+            con.execute(
+                "ALTER TABLE preference_state ADD COLUMN prior_strength REAL NOT NULL DEFAULT 1.0"
+            )
 
     def _init_schema(self) -> None:
-        with self._connect() as con:
-            con.execute(
-                """
-                CREATE TABLE IF NOT EXISTS preference_state (
-                    namespace TEXT NOT NULL,
-                    faculty TEXT NOT NULL,
-                    n_observations INTEGER NOT NULL,
-                    alpha_json TEXT NOT NULL,
-                    history_json TEXT NOT NULL,
-                    updated_at REAL NOT NULL,
-                    PRIMARY KEY(namespace, faculty)
+        with self._conn_lock:
+            con = self._conn_get()
+            with con:
+                con.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS preference_state (
+                        namespace TEXT NOT NULL,
+                        faculty TEXT NOT NULL,
+                        n_observations INTEGER NOT NULL,
+                        prior_strength REAL NOT NULL DEFAULT 1.0,
+                        alpha_json TEXT NOT NULL,
+                        history_json TEXT NOT NULL,
+                        updated_at REAL NOT NULL,
+                        PRIMARY KEY(namespace, faculty)
+                    )
+                    """
                 )
-                """
-            )
+                self._migrate_schema(con)
 
     def save(self, faculty: str, prior: DirichletPreference) -> None:
-        with self._connect() as con:
-            con.execute(
-                """
-                INSERT INTO preference_state(namespace, faculty, n_observations, alpha_json, history_json, updated_at)
-                VALUES (?,?,?,?,?,?)
-                ON CONFLICT(namespace, faculty) DO UPDATE SET
-                    alpha_json=excluded.alpha_json,
-                    history_json=excluded.history_json,
-                    updated_at=excluded.updated_at
-                """,
-                (
-                    self.namespace,
-                    faculty,
-                    int(prior.n_observations),
-                    json.dumps(list(prior.alpha)),
-                    json.dumps([{
-                        "observation_index": int(h.observation_index),
-                        "polarity": float(h.polarity),
-                        "weight": float(h.weight),
-                        "reason": h.reason,
-                    } for h in prior.history[-128:]]),
-                    time.time(),
-                ),
-            )
+        with self._conn_lock:
+            con = self._conn_get()
+            with con:
+                self._migrate_schema(con)
+                con.execute(
+                    """
+                    INSERT INTO preference_state(
+                        namespace, faculty, n_observations, prior_strength,
+                        alpha_json, history_json, updated_at
+                    )
+                    VALUES (?,?,?,?,?,?,?)
+                    ON CONFLICT(namespace, faculty) DO UPDATE SET
+                        n_observations=excluded.n_observations,
+                        prior_strength=excluded.prior_strength,
+                        alpha_json=excluded.alpha_json,
+                        history_json=excluded.history_json,
+                        updated_at=excluded.updated_at
+                    """,
+                    (
+                        self.namespace,
+                        faculty,
+                        int(prior.n_observations),
+                        float(prior.prior_strength),
+                        json.dumps(list(prior.alpha)),
+                        json.dumps(
+                            [
+                                {
+                                    "observation_index": int(h.observation_index),
+                                    "polarity": float(h.polarity),
+                                    "weight": float(h.weight),
+                                    "reason": h.reason,
+                                    "timestamp": h.timestamp.isoformat(),
+                                }
+                                for h in prior.history
+                            ]
+                        ),
+                        time.time(),
+                    ),
+                )
 
     def load(self, faculty: str) -> DirichletPreference | None:
-        with self._connect() as con:
-            row = con.execute(
-                "SELECT n_observations, alpha_json, history_json FROM preference_state WHERE namespace=? AND faculty=?",
-                (self.namespace, faculty),
-            ).fetchone()
+        with self._conn_lock:
+            con = self._conn_get()
+            with con:
+                self._migrate_schema(con)
+                row = con.execute(
+                    "SELECT n_observations, prior_strength, alpha_json, history_json "
+                    "FROM preference_state WHERE namespace=? AND faculty=?",
+                    (self.namespace, faculty),
+                ).fetchone()
         if row is None:
             return None
-        prior = DirichletPreference(int(row[0]))
-        prior.alpha = list(json.loads(row[1]))
-        prior.history = [PreferenceEvent(**e) for e in json.loads(row[2])]
+        n_obs, prior_strength, alpha_js, hist_js = row
+        ps = float(prior_strength) if prior_strength is not None else 1.0
+        prior = DirichletPreference(int(n_obs), prior_strength=ps)
+        prior.alpha = list(json.loads(alpha_js))
+        prior.history = deque(
+            (_preference_event_from_dict(e) for e in json.loads(hist_js)),
+            maxlen=_HISTORY_MAXLEN,
+        )
         return prior
 
 
@@ -209,9 +325,10 @@ def feedback_polarity_from_text(text: str) -> tuple[float, float]:
     s = text.lower()
     weight = min(1.0, 0.2 + 0.05 * len(s.split()))
     positives = ("thanks", "great", "perfect", "good", "concise", "love", "helpful")
-    negatives = ("stop", "no ", "worse", "bad", "wrong", "annoying", "too many")
-    if any(p in s for p in positives) and not any(n in s for n in negatives):
+    negative_hit = bool(_NEGATIVE_SENTIMENT.search(s))
+    positive_hit = any(p in s for p in positives)
+    if positive_hit and not negative_hit:
         return 1.0, float(weight)
-    if any(n in s for n in negatives):
+    if negative_hit:
         return -1.0, float(weight)
     return 0.0, float(weight) * 0.1

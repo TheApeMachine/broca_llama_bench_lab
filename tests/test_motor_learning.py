@@ -11,14 +11,22 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 
-from asi_broca_core.motor_learning import GraftMotorTrainer, MotorLearningConfig, freeze_all_but
+import pytest
+
+from asi_broca_core.motor_learning import (
+    GraftMotorTrainer,
+    MotorLearningConfig,
+    freeze_all_but,
+)
 
 
 class _StubHFTokenizer:
     def __init__(self, vocab: int = 50):
         self.vocab = vocab
 
-    def apply_chat_template(self, messages, add_generation_prompt: bool = True, return_tensors: str = "pt"):
+    def apply_chat_template(
+        self, messages, add_generation_prompt: bool = True, return_tensors: str = "pt"
+    ):
         # Encode each message naively as the index of its content[0] mod vocab.
         ids = []
         for m in messages:
@@ -70,7 +78,12 @@ def test_freeze_all_but_keeps_only_listed_params_trainable():
 def test_motor_trainer_only_updates_graft_params():
     host = _StubHost()
     tokenizer = _Tokenizer(_StubHFTokenizer(vocab=50))
-    trainer = GraftMotorTrainer(host, tokenizer, [host.graft_module], config=MotorLearningConfig(min_replay_for_step=1, max_replay_per_tick=4))
+    trainer = GraftMotorTrainer(
+        host,
+        tokenizer,
+        [host.graft_module],
+        config=MotorLearningConfig(min_replay_for_step=1, max_replay_per_tick=4),
+    )
     embed_before = host.embed.weight.detach().clone()
     proj_before = host.proj.weight.detach().clone()
     graft_before = host.graft_module.weight.detach().clone()
@@ -78,9 +91,10 @@ def test_motor_trainer_only_updates_graft_params():
     replay = [
         {
             "messages": [{"role": "user", "content": "hello world"}],
-            "speech_plan_tokens": torch.tensor([3, 7, 11], dtype=torch.long),
+            "speech_plan_tokens": torch.tensor([3, 7, 11], dtype=torch.long).clone(),
         }
-    ] * 4
+        for _ in range(4)
+    ]
 
     result = trainer.step(replay)
     assert not result.get("skipped", False), result
@@ -96,8 +110,18 @@ def test_motor_trainer_only_updates_graft_params():
 def test_motor_trainer_skips_when_replay_below_threshold():
     host = _StubHost()
     tokenizer = _Tokenizer(_StubHFTokenizer())
-    trainer = GraftMotorTrainer(host, tokenizer, [host.graft_module], config=MotorLearningConfig(min_replay_for_step=4))
-    replay = [{"messages": [{"role": "user", "content": "hi"}], "speech_plan_tokens": torch.tensor([1])}]
+    trainer = GraftMotorTrainer(
+        host,
+        tokenizer,
+        [host.graft_module],
+        config=MotorLearningConfig(min_replay_for_step=4),
+    )
+    replay = [
+        {
+            "messages": [{"role": "user", "content": "hi"}],
+            "speech_plan_tokens": torch.tensor([1]),
+        }
+    ]
     out = trainer.step(replay)
     assert out["skipped"] is True
 
@@ -105,7 +129,12 @@ def test_motor_trainer_skips_when_replay_below_threshold():
 def test_motor_trainer_loss_is_finite_and_steps_increment():
     host = _StubHost()
     tokenizer = _Tokenizer(_StubHFTokenizer())
-    trainer = GraftMotorTrainer(host, tokenizer, [host.graft_module], config=MotorLearningConfig(min_replay_for_step=2, max_replay_per_tick=4))
+    trainer = GraftMotorTrainer(
+        host,
+        tokenizer,
+        [host.graft_module],
+        config=MotorLearningConfig(min_replay_for_step=2, max_replay_per_tick=4),
+    )
     replay = [
         {
             "messages": [{"role": "user", "content": "hello"}],
@@ -118,5 +147,7 @@ def test_motor_trainer_loss_is_finite_and_steps_increment():
     ]
     out1 = trainer.step(replay)
     out2 = trainer.step(replay)
-    assert out1["steps"] == 1 and out2["steps"] == 2
+    assert out1["steps"] == 1
+    assert out2["steps"] == 2
+    assert torch.isfinite(torch.tensor(out1["loss"]))
     assert torch.isfinite(torch.tensor(out2["loss"]))

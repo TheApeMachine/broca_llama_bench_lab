@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import logging
 import math
+import threading
 from typing import Iterable, Mapping, Sequence
 
 import torch
@@ -40,7 +41,9 @@ DEFAULT_VSA_DIM = 10_000
 def _atom_seed(name: str, *, base_seed: int) -> int:
     """Deterministic 64-bit seed for an atom name, salted by ``base_seed``."""
 
-    h = (0xCBF29CE484222325 ^ ((int(base_seed) + 1) * 0x9E3779B185EBCA87)) & 0xFFFFFFFFFFFFFFFF
+    h = (
+        0xCBF29CE484222325 ^ ((int(base_seed) + 1) * 0x9E3779B185EBCA87)
+    ) & 0xFFFFFFFFFFFFFFFF
     for byte in str(name).encode("utf-8", errors="replace"):
         h ^= int(byte)
         h = (h * 0x100000001B3) & 0xFFFFFFFFFFFFFFFF
@@ -48,7 +51,14 @@ def _atom_seed(name: str, *, base_seed: int) -> int:
     return int(h & 0x7FFFFFFFFFFFFFFF)
 
 
-def hypervector(name: str, *, dim: int = DEFAULT_VSA_DIM, base_seed: int = 0, dtype: torch.dtype = torch.float32, device: torch.device | str | None = None) -> torch.Tensor:
+def hypervector(
+    name: str,
+    *,
+    dim: int = DEFAULT_VSA_DIM,
+    base_seed: int = 0,
+    dtype: torch.dtype = torch.float32,
+    device: torch.device | str | None = None,
+) -> torch.Tensor:
     """Generate a unit-norm Gaussian hypervector deterministically from ``name``.
 
     Two calls with the same ``(name, dim, base_seed)`` triple return identical
@@ -71,7 +81,9 @@ def bind(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
     """Circular convolution binding (commutative, associative, exactly invertible)."""
 
     if a.shape != b.shape:
-        raise ValueError(f"VSA bind requires matching shapes, got {a.shape} vs {b.shape}")
+        raise ValueError(
+            f"VSA bind requires matching shapes, got {a.shape} vs {b.shape}"
+        )
     fa = torch.fft.rfft(a.to(torch.float32))
     fb = torch.fft.rfft(b.to(torch.float32))
     out = torch.fft.irfft(fa * fb, n=a.shape[-1])
@@ -88,7 +100,9 @@ def unbind(c: torch.Tensor, a: torch.Tensor) -> torch.Tensor:
     """
 
     if c.shape != a.shape:
-        raise ValueError(f"VSA unbind requires matching shapes, got {c.shape} vs {a.shape}")
+        raise ValueError(
+            f"VSA unbind requires matching shapes, got {c.shape} vs {a.shape}"
+        )
     fc = torch.fft.rfft(c.to(torch.float32))
     fa = torch.fft.rfft(a.to(torch.float32))
     out = torch.fft.irfft(fc * fa.conj(), n=c.shape[-1])
@@ -106,10 +120,13 @@ def bundle(vectors: Iterable[torch.Tensor], *, normalize: bool = True) -> torch.
     items = list(vectors)
     if not items:
         raise ValueError("bundle expects at least one vector")
+    common_dtype = items[0].dtype
+    for i, v in enumerate(items[1:], start=1):
+        common_dtype = torch.promote_types(common_dtype, v.dtype)
     out = torch.stack([v.to(torch.float32) for v in items], dim=0).sum(dim=0)
     if normalize:
         out = out / out.norm().clamp_min(1e-12)
-    return out.to(dtype=items[0].dtype)
+    return out.to(dtype=common_dtype)
 
 
 def permute(v: torch.Tensor, *, shift: int = 1) -> torch.Tensor:
@@ -121,26 +138,33 @@ def permute(v: torch.Tensor, *, shift: int = 1) -> torch.Tensor:
 def cosine(a: torch.Tensor, b: torch.Tensor) -> float:
     """Cosine similarity, clamped to a Python float."""
 
-    return float(F.cosine_similarity(a.view(-1).to(torch.float32), b.view(-1).to(torch.float32), dim=0).item())
+    return float(
+        F.cosine_similarity(
+            a.view(-1).to(torch.float32), b.view(-1).to(torch.float32), dim=0
+        ).item()
+    )
 
 
-def cleanup(query: torch.Tensor, codebook: Mapping[str, torch.Tensor]) -> tuple[str, float]:
+def cleanup(
+    query: torch.Tensor, codebook: Mapping[str, torch.Tensor]
+) -> tuple[str, float]:
     """Snap a noisy hypervector back to the nearest codebook atom by cosine."""
 
     if not codebook:
         raise ValueError("cleanup requires a non-empty codebook")
-    best_name = ""
-    best_cos = -float("inf")
+    keys = list(codebook.keys())
     q = query.view(-1).to(torch.float32)
+    device = q.device
+    atoms = torch.stack(
+        [codebook[k].view(-1).to(device=device, dtype=torch.float32) for k in keys],
+        dim=0,
+    )
     qn = q.norm().clamp_min(1e-12)
-    for name, atom in codebook.items():
-        a = atom.view(-1).to(torch.float32)
-        an = a.norm().clamp_min(1e-12)
-        cos = float(((q @ a) / (qn * an)).item())
-        if cos > best_cos:
-            best_cos = cos
-            best_name = name
-    return best_name, best_cos
+    atoms_norm = atoms.norm(dim=1).clamp_min(1e-12)
+    dots = torch.matmul(atoms, q)
+    cos_sims = dots / (atoms_norm * qn)
+    best_i = int(torch.argmax(cos_sims).item())
+    return keys[best_i], float(cos_sims[best_i].item())
 
 
 class VSACodebook:
@@ -152,12 +176,20 @@ class VSACodebook:
     which is what makes long-lived semantic algebra coherent.
     """
 
-    def __init__(self, *, dim: int = DEFAULT_VSA_DIM, base_seed: int = 0, device: torch.device | str | None = None, dtype: torch.dtype = torch.float32):
+    def __init__(
+        self,
+        *,
+        dim: int = DEFAULT_VSA_DIM,
+        base_seed: int = 0,
+        device: torch.device | str | None = None,
+        dtype: torch.dtype = torch.float32,
+    ):
         self.dim = int(dim)
         self.base_seed = int(base_seed)
         self.device = device
         self.dtype = dtype
         self._atoms: dict[str, torch.Tensor] = {}
+        self._lock = threading.Lock()
 
     def __len__(self) -> int:
         return len(self._atoms)
@@ -168,12 +200,35 @@ class VSACodebook:
     def atom(self, name: str) -> torch.Tensor:
         v = self._atoms.get(name)
         if v is None:
-            v = hypervector(name, dim=self.dim, base_seed=self.base_seed, dtype=self.dtype, device=self.device)
-            self._atoms[name] = v
-            logger.debug("VSACodebook.atom: registered name=%r dim=%d total=%d", name, self.dim, len(self._atoms))
+            with self._lock:
+                v = self._atoms.get(name)
+                if v is None:
+                    v = hypervector(
+                        name,
+                        dim=self.dim,
+                        base_seed=self.base_seed,
+                        dtype=self.dtype,
+                        device=self.device,
+                    )
+                    self._atoms[name] = v
+                    logger.debug(
+                        "VSACodebook.atom: registered name=%r dim=%d total=%d",
+                        name,
+                        self.dim,
+                        len(self._atoms),
+                    )
         return v
 
-    def encode_triple(self, subject: str, predicate: str, obj: str, *, role_subject: str = "ROLE_SUBJECT", role_predicate: str = "ROLE_PREDICATE", role_object: str = "ROLE_OBJECT") -> torch.Tensor:
+    def encode_triple(
+        self,
+        subject: str,
+        predicate: str,
+        obj: str,
+        *,
+        role_subject: str = "ROLE_SUBJECT",
+        role_predicate: str = "ROLE_PREDICATE",
+        role_object: str = "ROLE_OBJECT",
+    ) -> torch.Tensor:
         """Encode (subject, predicate, object) as a single bundle of role/filler bindings.
 
         The returned hypervector contains all three bindings in superposition.
@@ -189,7 +244,13 @@ class VSACodebook:
             ]
         )
 
-    def decode_role(self, encoded: torch.Tensor, role: str, *, candidates: Sequence[str] | None = None) -> tuple[str, float]:
+    def decode_role(
+        self,
+        encoded: torch.Tensor,
+        role: str,
+        *,
+        candidates: Sequence[str] | None = None,
+    ) -> tuple[str, float]:
         """Unbind a role from an encoded triple and clean up against the codebook.
 
         ``candidates`` lets callers restrict the cleanup to a subset (e.g. only
@@ -201,7 +262,24 @@ class VSACodebook:
         if candidates is None:
             books = self._atoms
         else:
-            books = {name: self.atom(name) for name in candidates}
+            books = {
+                name: self._atoms[name] for name in candidates if name in self._atoms
+            }
+            unknown = sorted(set(candidates) - set(books))
+            if unknown:
+                logger.debug(
+                    "VSACodebook.decode_role: ignoring unknown candidates=%s", unknown
+                )
+            if not books:
+                raise ValueError(
+                    "decode_role: none of the requested candidates exist in the codebook — refusing cleanup over an empty book",
+                )
         name, cos = cleanup(unbound, books)
-        logger.debug("VSACodebook.decode_role: role=%s -> name=%r cos=%.4f candidates=%s", role, name, cos, len(books))
+        logger.debug(
+            "VSACodebook.decode_role: role=%s -> name=%r cos=%.4f candidates=%s",
+            role,
+            name,
+            cos,
+            len(books),
+        )
         return name, cos

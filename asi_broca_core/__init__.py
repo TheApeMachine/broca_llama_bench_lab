@@ -1,5 +1,7 @@
 __version__ = "0.5.0-llama-bench"
 
+from typing import Any
+
 from .logging_setup import configure_lab_logging
 
 from .active_inference import (
@@ -38,15 +40,56 @@ from .continuous_frame import (
     semantic_subword_sketch,
     stable_sketch,
 )
-from .vsa import VSACodebook, bind, unbind, bundle, permute, hypervector, cosine as vsa_cosine, cleanup
-from .hopfield import HopfieldAssociativeMemory, hopfield_update, derived_inverse_temperature
-from .vision import VisionEncoder
-from .conformal import ConformalPredictor, ConformalSet, PersistentConformalCalibration, empirical_coverage
-from .hawkes import MultivariateHawkesProcess, PersistentHawkes, fit_excitation_em
-from .motor_learning import GraftMotorTrainer, MotorLearningConfig
-from .preference_learning import DirichletPreference, PersistentPreference, feedback_polarity_from_text
-from .ontological_expansion import OntologicalRegistry, PersistentOntologicalRegistry, gram_schmidt_orthogonalize
-from .causal_discovery import pc_algorithm, build_scm_from_skeleton, DiscoveredGraph
+from .vsa import bind, unbind, bundle, permute, hypervector, cleanup
+
+# Heavy / optional: load on first attribute access (PEP 562).
+_LAZY_EXPORTS: dict[str, tuple[str, str]] = {
+    "VSACodebook": (".vsa", "VSACodebook"),
+    "vsa_cosine": (".vsa", "cosine"),
+    "HopfieldAssociativeMemory": (".hopfield", "HopfieldAssociativeMemory"),
+    "hopfield_update": (".hopfield", "hopfield_update"),
+    "derived_inverse_temperature": (".hopfield", "derived_inverse_temperature"),
+    "VisionEncoder": (".vision", "VisionEncoder"),
+    "ConformalPredictor": (".conformal", "ConformalPredictor"),
+    "ConformalSet": (".conformal", "ConformalSet"),
+    "PersistentConformalCalibration": (".conformal", "PersistentConformalCalibration"),
+    "empirical_coverage": (".conformal", "empirical_coverage"),
+    "MultivariateHawkesProcess": (".hawkes", "MultivariateHawkesProcess"),
+    "PersistentHawkes": (".hawkes", "PersistentHawkes"),
+    "fit_excitation_em": (".hawkes", "fit_excitation_em"),
+    "GraftMotorTrainer": (".motor_learning", "GraftMotorTrainer"),
+    "MotorLearningConfig": (".motor_learning", "MotorLearningConfig"),
+    "DirichletPreference": (".preference_learning", "DirichletPreference"),
+    "PersistentPreference": (".preference_learning", "PersistentPreference"),
+    "feedback_polarity_from_text": (".preference_learning", "feedback_polarity_from_text"),
+    "OntologicalRegistry": (".ontological_expansion", "OntologicalRegistry"),
+    "PersistentOntologicalRegistry": (".ontological_expansion", "PersistentOntologicalRegistry"),
+    "gram_schmidt_orthogonalize": (".ontological_expansion", "gram_schmidt_orthogonalize"),
+    "pc_algorithm": (".causal_discovery", "pc_algorithm"),
+    "build_scm_from_skeleton": (".causal_discovery", "build_scm_from_skeleton"),
+    "DiscoveredGraph": (".causal_discovery", "DiscoveredGraph"),
+}
+
+
+def __getattr__(name: str) -> Any:
+    spec = _LAZY_EXPORTS.get(name)
+    if spec is None:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    module_name, attr = spec
+    import importlib
+
+    mod = importlib.import_module(module_name, __package__)
+    val = getattr(mod, attr)
+    if name == "vsa_cosine":
+        globals()["vsa_cosine"] = val
+    else:
+        globals()[name] = val
+    return val
+
+
+def __dir__() -> list[str]:
+    return sorted(set(globals()) | set(__all__))
+
 
 __all__ = [
     "configure_lab_logging",

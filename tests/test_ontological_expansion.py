@@ -13,8 +13,8 @@ from asi_broca_core.ontological_expansion import (
 
 
 def test_gram_schmidt_produces_orthogonal_axes():
-    a = torch.randn(64, generator=torch.Generator().manual_seed(0))
-    b = torch.randn(64, generator=torch.Generator().manual_seed(1))
+    a = torch.randn(SKETCH_DIM, generator=torch.Generator().manual_seed(0))
+    b = torch.randn(SKETCH_DIM, generator=torch.Generator().manual_seed(1))
     a = a / a.norm()
     b_o = gram_schmidt_orthogonalize(b, [a])
     assert abs(float(torch.dot(a, b_o).item())) < 1e-5
@@ -45,7 +45,9 @@ def test_promoted_axes_are_mutually_orthogonal():
     for i in range(len(axes)):
         for j in range(i + 1, len(axes)):
             cos = float(torch.dot(axes[i].axis, axes[j].axis).item())
-            assert abs(cos) < 1e-4, f"axes {axes[i].name} and {axes[j].name} not orthogonal: cos={cos}"
+            assert (
+                abs(cos) < 1e-4
+            ), f"axes {axes[i].name} and {axes[j].name} not orthogonal: cos={cos}"
 
 
 def test_vector_for_returns_promoted_axis_after_promotion():
@@ -72,4 +74,6 @@ def test_persistence_round_trip(tmp_path: Path):
 
     loaded = store.load(dim=SKETCH_DIM, frequency_threshold=1)
     assert "ada" in loaded.promoted
-    assert torch.allclose(loaded.promoted["ada"].axis, registry.promoted["ada"].axis, atol=1e-6)
+    assert torch.allclose(
+        loaded.promoted["ada"].axis, registry.promoted["ada"].axis, atol=1e-6
+    )

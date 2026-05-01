@@ -8,11 +8,8 @@ sleep-cycle plumbing from the heavy substrate stack.
 from __future__ import annotations
 
 import random
-import time
 import types
 from pathlib import Path
-
-import torch
 
 from asi_broca_core.broca import (
     CognitiveBackgroundWorker,
@@ -47,7 +44,7 @@ def _build_synthetic_mind(tmp: Path) -> types.SimpleNamespace:
         memory.upsert(f"row_{i}", "Z", str(z))
 
     # Seed a journal with a clustered intent stream so Hawkes EM has signal.
-    base_t = time.time() - 120.0
+    # (``WorkspaceJournal.append`` timestamps rows with ``time.time()``; no per-row override API.)
     f = CognitiveFrame("memory_write", subject="row_a", answer="value")
     for i in range(20):
         journal.append(f"utterance {i}", f)
@@ -93,6 +90,8 @@ def test_rem_phase_runs_when_idle_threshold_exceeded(tmp_path: Path):
     )
     worker = CognitiveBackgroundWorker(mind, interval_s=999.0, config=cfg, rng=random.Random(7))
     reflections = worker.run_once()
+    assert isinstance(reflections, list)
+    assert all(isinstance(r, dict) for r in reflections)
     summary = worker.last_phase_summary.get("rem_sleep", {})
     assert summary, f"REM did not run; full summary={worker.last_phase_summary}"
     assert summary.get("hawkes", {}).get("ran"), summary
@@ -115,7 +114,7 @@ def test_rem_phase_persists_preferences(tmp_path: Path):
     mind = _build_synthetic_mind(tmp_path)
     mind.spatial_preference.update(2, polarity=1.0, weight=2.0, reason="positive")
     cfg = DMNConfig(sleep_idle_seconds=0.0, sleep_min_observations_for_pc=999, sleep_hawkes_min_events=999)
-    worker = CognitiveBackgroundWorker(mind, interval_s=999.0, config=cfg)
+    worker = CognitiveBackgroundWorker(mind, interval_s=999.0, config=cfg, rng=random.Random(7))
     worker.run_once()
     loaded = mind.preference_persistence.load("spatial")
     assert loaded is not None

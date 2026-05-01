@@ -38,7 +38,9 @@ def host_rms(x: torch.Tensor) -> torch.Tensor:
     return x.detach().float().pow(2).mean(dim=-1, keepdim=True).sqrt().to(dtype=x.dtype)
 
 
-def snr_magnitude(x: torch.Tensor, *, target_snr: float, confidence: float = 1.0, inertia: float = 1.0) -> torch.Tensor:
+def snr_magnitude(
+    x: torch.Tensor, *, target_snr: float, confidence: float = 1.0, inertia: float = 1.0
+) -> torch.Tensor:
     """Magnitude that injects a unit direction at ``target_snr`` × host RMS.
 
     Confidence and context-inertia are multiplicative on top: high-confidence
@@ -47,7 +49,8 @@ def snr_magnitude(x: torch.Tensor, *, target_snr: float, confidence: float = 1.0
     up momentum on a competing surface form.
     """
 
-    return host_rms(x) * float(target_snr) * float(max(0.0, confidence)) * float(max(0.0, inertia))
+    ts = max(0.0, float(target_snr))
+    return host_rms(x) * ts * float(max(0.0, confidence)) * float(max(0.0, inertia))
 
 
 def _state_confidence(state: dict) -> float:
@@ -82,11 +85,15 @@ def _last_indices(state: dict, x: torch.Tensor) -> torch.Tensor:
         return state["last_indices"].to(x.device)
     mask = state.get("attention_mask")
     if mask is None:
-        return torch.full((x.shape[0],), x.shape[1] - 1, device=x.device, dtype=torch.long)
+        return torch.full(
+            (x.shape[0],), x.shape[1] - 1, device=x.device, dtype=torch.long
+        )
     return mask.long().sum(dim=1).clamp_min(1).to(x.device) - 1
 
 
-def _trigger_mask(token_ids: torch.Tensor, trigger_ids: Sequence[int] | None) -> torch.Tensor:
+def _trigger_mask(
+    token_ids: torch.Tensor, trigger_ids: Sequence[int] | None
+) -> torch.Tensor:
     if not trigger_ids:
         return torch.ones(token_ids.shape[0], device=token_ids.device, dtype=torch.bool)
     mask = torch.zeros(token_ids.shape[0], device=token_ids.device, dtype=torch.bool)
@@ -144,19 +151,23 @@ class KVMemoryGraft(BaseGraft):
             logger.debug("KVMemoryGraft.set_spread_matrix: cleared")
             return
         self.spread_matrix = mat.detach().float().clone()
-        logger.debug("KVMemoryGraft.set_spread_matrix: shape=%s", tuple(self.spread_matrix.shape))
+        logger.debug(
+            "KVMemoryGraft.set_spread_matrix: shape=%s", tuple(self.spread_matrix.shape)
+        )
 
     @torch.no_grad()
-    def remember(self, key: torch.Tensor, value: torch.Tensor, metadata: dict | None = None) -> None:
+    def remember(
+        self, key: torch.Tensor, value: torch.Tensor, metadata: dict | None = None
+    ) -> None:
         key = key.detach().reshape(-1, self.d_model).to(self.keys.device)
         value = value.detach().reshape(-1, self.d_model).to(self.values.device)
         if key.shape[0] != value.shape[0]:
             raise ValueError("key and value must contain the same number of rows")
-        self.keys = torch.cat([self.keys, key], dim=0)[-self.max_items:]
-        self.values = torch.cat([self.values, value], dim=0)[-self.max_items:]
+        self.keys = torch.cat([self.keys, key], dim=0)[-self.max_items :]
+        self.values = torch.cat([self.values, value], dim=0)[-self.max_items :]
         for _ in range(key.shape[0]):
             self.metadata.append(dict(metadata or {}))
-        self.metadata = self.metadata[-self.max_items:]
+        self.metadata = self.metadata[-self.max_items :]
         logger.debug(
             "KVMemoryGraft.remember: added_rows=%d store_size=%d d_model=%d",
             int(key.shape[0]),
@@ -198,11 +209,15 @@ class KVMemoryGraft(BaseGraft):
                 "sigma_key_manifold": float(sigma.detach().cpu()),
             }
         else:
-            gate_manifold = torch.ones(raw_sims.shape[0], device=x.device, dtype=raw_sims.dtype)
+            gate_manifold = torch.ones(
+                raw_sims.shape[0], device=x.device, dtype=raw_sims.dtype
+            )
             manifold_dbg = {"tau_key_manifold": 0.0, "sigma_key_manifold": 1.0}
 
         sims = raw_sims.clone()
-        eff_k = min(nk, max(2, int(math.ceil(math.sqrt(float(nk)) * math.log1p(float(nk))))))
+        eff_k = min(
+            nk, max(2, int(math.ceil(math.sqrt(float(nk)) * math.log1p(float(nk)))))
+        )
         if eff_k < nk:
             vals, idx = sims.topk(eff_k, dim=-1)
             masked_row = torch.full_like(sims, torch.finfo(sims.dtype).min)
@@ -215,8 +230,17 @@ class KVMemoryGraft(BaseGraft):
             weights = weights / weights.sum(dim=-1, keepdim=True).clamp_min(1e-9)
         retrieved = weights @ self.values.to(x.device)
         gate = (gate_peak * gate_manifold).unsqueeze(-1)
-        direction = F.normalize(retrieved, dim=-1)
-        magnitude = snr_magnitude(host_at_query, target_snr=self.target_snr, confidence=confidence, inertia=inertia)
+        eps = 1e-12
+        rnorm = torch.norm(retrieved, dim=-1, keepdim=True)
+        direction = torch.where(
+            rnorm < eps, torch.zeros_like(retrieved), retrieved / rnorm.clamp_min(eps)
+        )
+        magnitude = snr_magnitude(
+            host_at_query,
+            target_snr=self.target_snr,
+            confidence=confidence,
+            inertia=inertia,
+        )
         delta = direction * magnitude * gate
         return delta, weights, gate.squeeze(-1), manifold_dbg
 
@@ -239,7 +263,11 @@ class KVMemoryGraft(BaseGraft):
                 confidence=confidence,
                 inertia=inertia,
             )
-            self.last_debug = {"weights": weights.detach().cpu(), "gate": gate.detach().cpu(), **manifold_dbg}
+            self.last_debug = {
+                "weights": weights.detach().cpu(),
+                "gate": gate.detach().cpu(),
+                **manifold_dbg,
+            }
             delta_view = delta.reshape(bsz, seq_len, d_model)
             gmax = float(gate.detach().max().item()) if gate.numel() else 0.0
             wmax = float(weights.detach().max().item()) if weights.numel() else 0.0
@@ -250,7 +278,10 @@ class KVMemoryGraft(BaseGraft):
                 nk,
                 gmax,
                 wmax,
-                {k: (float(v) if hasattr(v, "item") else v) for k, v in manifold_dbg.items()},
+                {
+                    k: (float(v) if hasattr(v, "item") else v)
+                    for k, v in manifold_dbg.items()
+                },
             )
             return x + delta_view
 
@@ -268,7 +299,11 @@ class KVMemoryGraft(BaseGraft):
         )
         out = x.clone()
         out[torch.arange(bsz, device=x.device), last] += delta
-        self.last_debug = {"weights": weights.detach().cpu(), "gate": gate.detach().cpu(), **manifold_dbg}
+        self.last_debug = {
+            "weights": weights.detach().cpu(),
+            "gate": gate.detach().cpu(),
+            **manifold_dbg,
+        }
         gmax = float(gate.detach().max().item()) if gate.numel() else 0.0
         wmax = float(weights.detach().max().item()) if weights.numel() else 0.0
         logger.debug(
@@ -279,7 +314,10 @@ class KVMemoryGraft(BaseGraft):
             gmax,
             wmax,
             None if self.spread_matrix is None else tuple(self.spread_matrix.shape),
-            {k: (float(v) if hasattr(v, "item") else v) for k, v in manifold_dbg.items()},
+            {
+                k: (float(v) if hasattr(v, "item") else v)
+                for k, v in manifold_dbg.items()
+            },
         )
         return out
 
@@ -319,7 +357,7 @@ class LoRALinear(nn.Module):
         self.scaling = self.alpha / self.r
         self.A = nn.Parameter(torch.empty(self.r, base.in_features))
         self.B = nn.Parameter(torch.zeros(base.out_features, self.r))
-        nn.init.kaiming_uniform_(self.A, a=5 ** 0.5)
+        nn.init.kaiming_uniform_(self.A, a=5**0.5)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.base(x) + F.linear(F.linear(x, self.A), self.B) * self.scaling
@@ -342,13 +380,15 @@ def inject_lora(
 ) -> list[str]:
     replaced: list[str] = []
     for name, module in list(model.named_modules()):
-        if name and isinstance(module, nn.Linear) and any(s in name for s in target_substrings):
+        if (
+            name
+            and isinstance(module, nn.Linear)
+            and any(s in name for s in target_substrings)
+        ):
             parent, child = _get_parent(model, name)
             setattr(parent, child, LoRALinear(module, r=r, alpha=alpha))
             replaced.append(name)
     return replaced
-
-
 
 
 class FeatureVectorGraft(BaseGraft):
@@ -359,11 +399,20 @@ class FeatureVectorGraft(BaseGraft):
     can remain frozen.
     """
 
-    def __init__(self, d_features: int, d_model: int, *, trigger_ids: Sequence[int] | None = None, target_snr: float = DEFAULT_GRAFT_TARGET_SNR):
+    def __init__(
+        self,
+        d_features: int,
+        d_model: int,
+        *,
+        trigger_ids: Sequence[int] | None = None,
+        target_snr: float = DEFAULT_GRAFT_TARGET_SNR,
+    ):
         super().__init__()
         self.d_features = int(d_features)
         self.d_model = int(d_model)
-        self.trigger_ids = tuple(int(x) for x in trigger_ids) if trigger_ids else tuple()
+        self.trigger_ids = (
+            tuple(int(x) for x in trigger_ids) if trigger_ids else tuple()
+        )
         self.target_snr = float(target_snr)
         self.norm = nn.LayerNorm(self.d_features)
         self.project = nn.Linear(self.d_features, self.d_model)
@@ -380,7 +429,9 @@ class FeatureVectorGraft(BaseGraft):
         if feats.ndim == 1:
             feats = feats.view(1, -1).expand(x.shape[0], -1)
         if feats.shape[-1] != self.d_features:
-            raise ValueError(f"expected faculty_features dim {self.d_features}, got {feats.shape[-1]}")
+            raise ValueError(
+                f"expected faculty_features dim {self.d_features}, got {feats.shape[-1]}"
+            )
         applies = _trigger_mask(state["token_ids"], self.trigger_ids)
         if not bool(applies.any()):
             return x
@@ -391,10 +442,16 @@ class FeatureVectorGraft(BaseGraft):
         last_apply = last[applies]
         host_at_last = x[rows, last_apply]
         direction = F.normalize(self.project(self.norm(feats[applies])), dim=-1)
-        magnitude = snr_magnitude(host_at_last, target_snr=self.target_snr, confidence=confidence, inertia=inertia)
+        magnitude = snr_magnitude(
+            host_at_last,
+            target_snr=self.target_snr,
+            confidence=confidence,
+            inertia=inertia,
+        )
         out = x.clone()
         out[rows, last_apply] += direction * magnitude
         return out
+
 
 class TriggeredTokenDirectionGraft(BaseGraft):
     """Injects a selected token's embedding direction into the final hidden state.
@@ -404,10 +461,18 @@ class TriggeredTokenDirectionGraft(BaseGraft):
     corresponding token direction into the residual stream.
     """
 
-    def __init__(self, token_by_name: Mapping[str, int], *, trigger_ids: Sequence[int] | None = None, target_snr: float = DEFAULT_GRAFT_TARGET_SNR):
+    def __init__(
+        self,
+        token_by_name: Mapping[str, int],
+        *,
+        trigger_ids: Sequence[int] | None = None,
+        target_snr: float = DEFAULT_GRAFT_TARGET_SNR,
+    ):
         super().__init__()
         self.token_by_name = {str(k): int(v) for k, v in token_by_name.items()}
-        self.trigger_ids = tuple(int(x) for x in trigger_ids) if trigger_ids else tuple()
+        self.trigger_ids = (
+            tuple(int(x) for x in trigger_ids) if trigger_ids else tuple()
+        )
         self.target_snr = float(target_snr)
         self.last_name: str | None = None
         self.last_token_id: int | None = None
@@ -430,12 +495,19 @@ class TriggeredTokenDirectionGraft(BaseGraft):
         out = x.clone()
         model = state["model"]
         tok_id = self.token_by_name[name]
-        direction = F.normalize(model.lm_head.weight[tok_id].detach().to(x.device, x.dtype), dim=0)
+        direction = F.normalize(
+            model.lm_head.weight[tok_id].detach().to(x.device, x.dtype), dim=0
+        )
         last = _last_indices(state, x)
         rows = torch.arange(x.shape[0], device=x.device)[applies]
         last_apply = last[applies]
         host_at_last = x[rows, last_apply]
-        magnitude = snr_magnitude(host_at_last, target_snr=self.target_snr, confidence=confidence, inertia=inertia)
+        magnitude = snr_magnitude(
+            host_at_last,
+            target_snr=self.target_snr,
+            confidence=confidence,
+            inertia=inertia,
+        )
         out[rows, last_apply] += direction.unsqueeze(0) * magnitude
         self.last_name = name
         self.last_token_id = tok_id
@@ -445,8 +517,19 @@ class TriggeredTokenDirectionGraft(BaseGraft):
 class ActiveInferenceTokenGraft(TriggeredTokenDirectionGraft):
     """Projects an active-inference policy decision into the residual stream."""
 
-    def __init__(self, agent, token_by_action: Mapping[str, int], *, trigger_ids: Sequence[int] | None = None, target_snr: float = DEFAULT_GRAFT_TARGET_SNR):
-        super().__init__(token_by_action, trigger_ids=trigger_ids, target_snr=target_snr)
+    def __init__(
+        self,
+        agent,
+        token_by_action: Mapping[str, int],
+        *,
+        trigger_ids: Sequence[int] | None = None,
+        target_snr: float = DEFAULT_GRAFT_TARGET_SNR,
+    ):
+        super().__init__(
+            token_by_action,
+            trigger_ids=trigger_ids,
+            target_snr=target_snr,
+        )
         self.agent = agent
         self.last_decision = None
 
@@ -459,8 +542,19 @@ class ActiveInferenceTokenGraft(TriggeredTokenDirectionGraft):
 class CoupledActiveInferenceTokenGraft(TriggeredTokenDirectionGraft):
     """Arbitrates spatial vs causal active-inference faculties in one forward pass."""
 
-    def __init__(self, coupled: CoupledEFEAgent, token_by_action: Mapping[str, int], *, trigger_ids: Sequence[int] | None = None, target_snr: float = DEFAULT_GRAFT_TARGET_SNR):
-        super().__init__(token_by_action, trigger_ids=trigger_ids, target_snr=target_snr)
+    def __init__(
+        self,
+        coupled: CoupledEFEAgent,
+        token_by_action: Mapping[str, int],
+        *,
+        trigger_ids: Sequence[int] | None = None,
+        target_snr: float = DEFAULT_GRAFT_TARGET_SNR,
+    ):
+        super().__init__(
+            token_by_action,
+            trigger_ids=trigger_ids,
+            target_snr=target_snr,
+        )
         self.coupled = coupled
         self.last_coupled: CoupledDecision | None = None
 
@@ -486,7 +580,11 @@ class CausalEffectTokenGraft(TriggeredTokenDirectionGraft):
         trigger_ids: Sequence[int] | None = None,
         target_snr: float = DEFAULT_GRAFT_TARGET_SNR,
     ):
-        super().__init__({"helps": int(positive_token), "hurts": int(negative_token)}, trigger_ids=trigger_ids, target_snr=target_snr)
+        super().__init__(
+            {"helps": int(positive_token), "hurts": int(negative_token)},
+            trigger_ids=trigger_ids,
+            target_snr=target_snr,
+        )
         self.scm = scm
         self.treatment = treatment
         self.outcome = outcome
@@ -496,9 +594,17 @@ class CausalEffectTokenGraft(TriggeredTokenDirectionGraft):
 
     def choose_name(self, state: dict) -> str:
         t_pos, t_neg = self.treatment_values
-        p_pos = self.scm.probability({self.outcome: self.outcome_value}, interventions={self.treatment: t_pos})
-        p_neg = self.scm.probability({self.outcome: self.outcome_value}, interventions={self.treatment: t_neg})
-        self.last_effects = {"p_do_positive": p_pos, "p_do_negative": p_neg, "ate": p_pos - p_neg}
+        p_pos = self.scm.probability(
+            {self.outcome: self.outcome_value}, interventions={self.treatment: t_pos}
+        )
+        p_neg = self.scm.probability(
+            {self.outcome: self.outcome_value}, interventions={self.treatment: t_neg}
+        )
+        self.last_effects = {
+            "p_do_positive": p_pos,
+            "p_do_negative": p_neg,
+            "ate": p_pos - p_neg,
+        }
         return "helps" if p_pos >= p_neg else "hurts"
 
 
@@ -531,12 +637,26 @@ def extract_next_token_memory(
         raise ValueError("query_mode must be 'token' or 'sequence_mean'")
     target_id = tokenizer.token_to_id[target_token]
     value = F.normalize(model.lm_head.weight[target_id].detach(), dim=0) * value_scale
-    metadata = {"prompt": prompt, "target": target_token, "slot": slot, "query_mode": query_mode}
+    metadata = {
+        "prompt": prompt,
+        "target": target_token,
+        "slot": slot,
+        "query_mode": query_mode,
+    }
     return key.detach().cpu(), value.detach().cpu(), metadata
 
 
 @torch.no_grad()
-def memorize_next_token(model, tokenizer, graft: KVMemoryGraft, prompt: str, target_token: str, *, slot: str = "final_hidden", value_scale: float = 1.0) -> None:
+def memorize_next_token(
+    model,
+    tokenizer,
+    graft: KVMemoryGraft,
+    prompt: str,
+    target_token: str,
+    *,
+    slot: str = "final_hidden",
+    value_scale: float = 1.0,
+) -> None:
     key, value, metadata = extract_next_token_memory(
         model,
         tokenizer,
@@ -550,7 +670,19 @@ def memorize_next_token(model, tokenizer, graft: KVMemoryGraft, prompt: str, tar
 
 
 @torch.no_grad()
-def memorize_persistent_next_token(store, model, tokenizer, prompt: str, target_token: str, *, namespace: str | None = None, kind: str = "fact", slot: str = "final_hidden", query_mode: str = "sequence_mean", value_scale: float = 1.0) -> int:
+def memorize_persistent_next_token(
+    store,
+    model,
+    tokenizer,
+    prompt: str,
+    target_token: str,
+    *,
+    namespace: str | None = None,
+    kind: str = "fact",
+    slot: str = "final_hidden",
+    query_mode: str = "sequence_mean",
+    value_scale: float = 1.0,
+) -> int:
     key, value, metadata = extract_next_token_memory(
         model,
         tokenizer,
@@ -561,5 +693,3 @@ def memorize_persistent_next_token(store, model, tokenizer, prompt: str, target_
         value_scale=value_scale,
     )
     return store.write(key, value, metadata=metadata, namespace=namespace, kind=kind)
-
-
