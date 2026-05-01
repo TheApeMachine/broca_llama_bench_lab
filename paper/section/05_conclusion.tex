@@ -1,5 +1,39 @@
 \section{Conclusion}
 \label{sec:conclusion}
 
-Summarize takeaways and future work. Rebuild figures and tables with
-\texttt{make paper-bench} after code or benchmark changes.
+We have presented \textsc{Mosaic}, an architecture that decouples language
+generation from cognitive control by treating a frozen LLM as a language organ
+biased through grafts by a persistent, mathematically grounded substrate.  The
+three-tier evaluation framework---standard NLP benchmarks, architecture probes,
+and substrate-specific benchmarks---provides complementary evidence that:
+
+\begin{enumerate}[nosep]
+  \item The graft infrastructure preserves the frozen model's leaderboard
+    accuracy when no substrate signal is injected.
+  \item The full substrate can steer the frozen decoder toward correct
+    verbalisation of computed answers with high fidelity.
+  \item Each algebraic component (belief revision, causal reasoning, VSA
+    algebra, Hopfield retrieval, conformal prediction, active inference)
+    satisfies its published mathematical guarantees.
+\end{enumerate}
+
+\paragraph{Future work.}
+Several directions are open:
+\begin{itemize}[nosep]
+  \item Scaling the graft protocol to larger checkpoints (7B, 70B) and
+    measuring whether SNR calibration transfers.
+  \item Replacing the finite SCM with a learned causal model discovered from
+    real conversation data (the PC-algorithm path already exists in the DMN's
+    REM-sleep phase).
+  \item Benchmarking on open-ended generation tasks with human evaluation of
+    substrate-steered outputs.
+  \item Integrating the self-improvement loop (Docker-based patch $\to$ test
+    $\to$ PR $\to$ paper refresh) into a continuous evaluation pipeline.
+  \item Extending the conformal predictor to a sliding-window variant for
+    non-stationary conversational settings.
+\end{itemize}
+
+All code, benchmarks, and this paper are available at
+\texttt{https://huggingface.co/theapemachine/mosaic}.  The benchmark-to-paper
+pipeline ensures that every table, figure, and result paragraph in
+Section~\ref{sec:experiments} reflects the most recent benchmark run.

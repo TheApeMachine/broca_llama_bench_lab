@@ -1,6 +1,80 @@
 \section{Discussion}
 \label{sec:discussion}
 
-Interpret the quantitative blocks in Section~\ref{sec:experiments}: dataset
-coverage, compute budget (\texttt{-{}-limit} per task), and the distinction
-between leaderboard accuracy and probe style scores.
+\subsection{Interpretation of Results}
+
+The three evaluation tiers serve complementary purposes.  Standard NLP
+benchmarks (Section~\ref{subsec:exp-hf-native}) establish that the graft
+infrastructure does not degrade the frozen model's leaderboard accuracy---a
+necessary sanity check before claiming any benefit from the substrate.  The
+architecture probes (Section~\ref{subsec:exp-broca-arch}) demonstrate that the
+grafts can steer the LLM toward the substrate's computed answers with high
+fidelity, even when the bare model has no access to the relevant information.
+The substrate benchmarks (Section~\ref{subsec:exp-substrate}) verify the
+mathematical guarantees of each component in isolation.
+
+\subsection{Why Grafts Instead of Prompts?}
+
+The graft-based communication protocol has several advantages over
+prompt-stuffing:
+
+\begin{itemize}[nosep]
+  \item \textbf{Constant token cost.}  Grafts do not consume context-window
+    tokens.  The substrate can maintain arbitrarily large state (memory, world
+    model, policies) without truncating the user's conversation.
+  \item \textbf{Per-step influence.}  A prompt is read once at encoding time.
+    A graft is applied at every decoding step, giving the substrate continuous
+    influence over the generation trajectory.
+  \item \textbf{Direct residual access.}  Grafts operate in the model's hidden
+    geometry rather than in token space, enabling finer-grained control (e.g.\
+    modality shifts, SNR-calibrated biasing).
+  \item \textbf{Confidence modulation.}  Graft magnitude is annealed by
+    substrate confidence, so the LLM retains autonomy when the substrate is
+    uncertain.
+\end{itemize}
+
+\subsection{Limitations}
+
+\paragraph{Scale.}
+All experiments use Llama~3.2 1B Instruct.  Whether the graft protocol scales
+to larger checkpoints (7B, 70B) without retuning the target SNR is an open
+question.  The algebraic substrate components (VSA, Hopfield, SCM) are
+model-size-agnostic, but the graft's residual-stream injection may need
+recalibration for higher-dimensional hidden states.
+
+\paragraph{Graft fidelity on open-ended tasks.}
+Architecture probes use scripted, short-answer prompts where the expected output
+is unambiguous.  On open-ended generation tasks (summarisation, creative
+writing), the graft's influence is a soft bias, not a hard constraint.
+Measuring graft effectiveness on such tasks requires evaluation metrics beyond
+exact match.
+
+\paragraph{SCM scalability.}
+The finite SCM uses exact enumeration over exogenous worlds, which is
+tractable only for toy cardinalities.  Real-world causal models will require
+the Monte Carlo paths (\texttt{probability\_monte\_carlo},
+\texttt{counterfactual\_probability\_monte\_carlo}) or approximate inference.
+
+\paragraph{Conformal calibration in non-stationary settings.}
+The conformal coverage guarantee holds under exchangeability of calibration
+and test data.  In a conversational agent where the distribution shifts as the
+user explores new topics, online recalibration (or a sliding-window conformal
+predictor) is needed.
+
+\subsection{Relationship to Prior Work}
+
+The separation of language generation from cognitive control echoes classical
+symbolic AI's division between a knowledge base and a natural-language
+interface, but with a critical difference: here the ``interface'' is a full
+transformer decoder, and the communication channel is continuous (residual
+biasing) rather than symbolic (template filling).
+
+The graft mechanism is related to activation engineering, representation
+engineering, and steering vectors, but differs in that the bias is
+\emph{per-step}, \emph{confidence-modulated}, and \emph{derived from a
+structured world model} rather than from a contrastive pair of prompts.
+
+Active inference over POMDPs for LLM control has been explored in the agent
+literature, but typically as an outer loop that selects between prompt variants.
+Our approach embeds the POMDP decision directly into the decoding loop via
+graft biasing, avoiding the latency and token cost of re-prompting.

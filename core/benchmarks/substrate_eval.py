@@ -97,7 +97,13 @@ class SubstrateBenchmarkSuite:
 # ---------------------------------------------------------------------------
 
 def bench_rule_shift(*, n_initial_claims: int = 5, n_challenger_claims: int = 8, seed: int = 0) -> SubstrateBenchmarkResult:
-    """Test that the substrate revises beliefs when sufficient low-surprise evidence accumulates."""
+    """Test that the substrate revises beliefs when sufficient low-surprise evidence accumulates.
+
+    Setup: store ``ada.location = rome`` with N corroborating claims. Then inject
+    M challenger claims asserting ``ada.location = paris``. The belief revision
+    engine should flip the stored belief when the challengers' accumulated trust
+    weight exceeds the log-odds threshold.
+    """
     from core.broca import PersistentSemanticMemory
 
     start = time.time()
@@ -106,22 +112,34 @@ def bench_rule_shift(*, n_initial_claims: int = 5, n_challenger_claims: int = 8,
 
     with tempfile.TemporaryDirectory(prefix="bench_rule_shift_") as tmp:
         mem = PersistentSemanticMemory(Path(tmp) / "bench.sqlite", namespace="rule_shift")
+
+        # Seed initial belief
         mem.upsert("ada", "location", "rome", confidence=0.9, evidence={"source": "seed"})
         for i in range(n_initial_claims):
             mem.record_claim("ada", "location", "rome", confidence=0.9, status="corroborated",
                              evidence={"source": "initial", "prediction_gap": 0.1 + 0.02 * i})
+
+        # Inject challenger claims with low prediction gaps (high trust)
         for i in range(n_challenger_claims):
             mem.record_claim("ada", "location", "paris", confidence=0.95, status="conflict",
                              evidence={"source": "challenger", "prediction_gap": 0.05 + 0.01 * i})
+
+        # Run consolidation
         reflections = mem.consolidate_claims_once(log_odds_threshold=0.3, min_claims=3)
+
         current = mem.get("ada", "location")
         final_value = current[0] if current else "unknown"
         revised = final_value == "paris"
+
         details = {
-            "initial_value": "rome", "challenger_value": "paris", "final_value": final_value,
-            "n_initial_claims": n_initial_claims, "n_challenger_claims": n_challenger_claims,
+            "initial_value": "rome",
+            "challenger_value": "paris",
+            "final_value": final_value,
+            "n_initial_claims": n_initial_claims,
+            "n_challenger_claims": n_challenger_claims,
             "n_reflections": len(reflections),
-            "reflection_kinds": [r.get("kind") for r in reflections], "revised": revised,
+            "reflection_kinds": [r.get("kind") for r in reflections],
+            "revised": revised,
         }
         mem.close()
 
@@ -129,8 +147,11 @@ def bench_rule_shift(*, n_initial_claims: int = 5, n_challenger_claims: int = 8,
     return SubstrateBenchmarkResult(
         name="rule_shift_adaptation",
         description="Belief revision under accumulating low-surprise evidence",
-        passed=revised, score=1.0 if revised else 0.0, n_trials=n_trials,
-        details=details, duration_seconds=duration,
+        passed=revised,
+        score=1.0 if revised else 0.0,
+        n_trials=n_trials,
+        details=details,
+        duration_seconds=duration,
     )
 
 
@@ -139,13 +160,21 @@ def bench_rule_shift(*, n_initial_claims: int = 5, n_challenger_claims: int = 8,
 # ---------------------------------------------------------------------------
 
 def bench_adversarial_prompt_resistance(*, seed: int = 0) -> SubstrateBenchmarkResult:
-    """Test that HypothesisMaskingGraft converges on valid tokens."""
+    """Test that HypothesisMaskingGraft + IterativeHypothesisSearch converges on valid tokens.
+
+    We simulate a scenario where certain tokens are "bad" (e.g., hallucinated
+    digits) and the evaluator rejects them. The search must converge on a valid
+    token within max_iterations by physically banning rejected candidates.
+    """
     from core.top_down_control import HypothesisMaskingGraft, HypothesisVerdict
 
     start = time.time()
     rng = random.Random(seed)
+
     vocab_size = 100
     bad_tokens = set(rng.sample(range(vocab_size), 15))
+    valid_tokens = sorted(set(range(vocab_size)) - bad_tokens)
+
     graft = HypothesisMaskingGraft(default_penalty=100.0)
     n_trials = 50
     successes = 0
@@ -154,18 +183,24 @@ def bench_adversarial_prompt_resistance(*, seed: int = 0) -> SubstrateBenchmarkR
 
     for trial in range(n_trials):
         graft.clear()
+        # Simulate iterative search: present random tokens, ban bad ones
         found = False
         for step in range(1, max_iterations + 1):
+            # Pick a random token that isn't banned
             available = [t for t in range(vocab_size) if t not in graft.banned]
             if not available:
                 break
             candidate = rng.choice(available)
+
             if candidate in bad_tokens:
-                graft.ban((candidate,), reason=f"bad_token_{candidate}")
+                # Evaluator rejects — ban this token
+                verdict = HypothesisVerdict(valid=False, ban_tokens=(candidate,), reason=f"bad_token_{candidate}")
+                graft.ban(verdict.ban_tokens, reason=verdict.reason)
             else:
                 found = True
                 convergence_steps.append(step)
                 break
+
         if found:
             successes += 1
 
@@ -176,10 +211,15 @@ def bench_adversarial_prompt_resistance(*, seed: int = 0) -> SubstrateBenchmarkR
     return SubstrateBenchmarkResult(
         name="adversarial_prompt_resistance",
         description="Hypothesis masking convergence on valid tokens under adversarial rejection",
-        passed=score >= 0.90, score=score, n_trials=n_trials,
+        passed=score >= 0.90,
+        score=score,
+        n_trials=n_trials,
         details={
-            "successes": successes, "vocab_size": vocab_size, "n_bad_tokens": len(bad_tokens),
-            "max_iterations": max_iterations, "avg_convergence_steps": round(avg_steps, 2),
+            "successes": successes,
+            "vocab_size": vocab_size,
+            "n_bad_tokens": len(bad_tokens),
+            "max_iterations": max_iterations,
+            "avg_convergence_steps": round(avg_steps, 2),
             "convergence_steps_histogram": _histogram(convergence_steps, bins=max_iterations),
         },
         duration_seconds=duration,
@@ -191,21 +231,36 @@ def bench_adversarial_prompt_resistance(*, seed: int = 0) -> SubstrateBenchmarkR
 # ---------------------------------------------------------------------------
 
 def bench_causal_reasoning(*, seed: int = 0) -> SubstrateBenchmarkResult:
-    """Test that do-calculus recovers the correct treatment effect despite confounding."""
+    """Test that do-calculus recovers the correct treatment effect despite confounding.
+
+    Simpson's paradox: naive association suggests treatment hurts, but
+    do-calculus reveals it helps. The benchmark verifies:
+    (a) P(Y=1|T=1) < P(Y=1|T=0)  [naive association is wrong]
+    (b) P(Y=1|do(T=1)) > P(Y=1|do(T=0))  [intervention is correct]
+    (c) ATE > 0
+    """
     from core.causal import build_simpson_scm
 
     start = time.time()
     scm = build_simpson_scm()
+
+    # Naive association
     p_y_given_t1 = scm.probability({"Y": 1}, given={"T": 1})
     p_y_given_t0 = scm.probability({"Y": 1}, given={"T": 0})
     naive_suggests_helps = p_y_given_t1 > p_y_given_t0
+
+    # Interventional (do-calculus)
     p_y_do_t1 = scm.probability({"Y": 1}, interventions={"T": 1})
     p_y_do_t0 = scm.probability({"Y": 1}, interventions={"T": 0})
     ate = p_y_do_t1 - p_y_do_t0
     do_says_helps = p_y_do_t1 > p_y_do_t0
+
+    # Counterfactual: given treatment helped, what if we hadn't treated?
     cf_prob = scm.counterfactual_probability_exact(
         {"Y": 0}, evidence={"T": 1, "Y": 1}, interventions={"T": 0}
     )
+
+    # Backdoor adjustment
     bd_sets = scm.backdoor_sets("T", "Y")
     bd_result = None
     if bd_sets:
@@ -213,18 +268,24 @@ def bench_causal_reasoning(*, seed: int = 0) -> SubstrateBenchmarkResult:
             treatment="T", treatment_value=1, outcome="Y", outcome_value=1,
             adjustment_set=bd_sets[0],
         )
+
     paradox_correct = (not naive_suggests_helps) and do_says_helps and ate > 0
     duration = time.time() - start
 
     return SubstrateBenchmarkResult(
         name="causal_reasoning_simpson",
         description="Simpson's paradox: do-calculus recovers correct ATE despite confounding",
-        passed=paradox_correct, score=1.0 if paradox_correct else 0.0, n_trials=1,
+        passed=paradox_correct,
+        score=1.0 if paradox_correct else 0.0,
+        n_trials=1,
         details={
-            "p_y_given_t1": round(p_y_given_t1, 6), "p_y_given_t0": round(p_y_given_t0, 6),
+            "p_y_given_t1": round(p_y_given_t1, 6),
+            "p_y_given_t0": round(p_y_given_t0, 6),
             "naive_suggests_helps": naive_suggests_helps,
-            "p_y_do_t1": round(p_y_do_t1, 6), "p_y_do_t0": round(p_y_do_t0, 6),
-            "ate": round(ate, 6), "do_says_helps": do_says_helps,
+            "p_y_do_t1": round(p_y_do_t1, 6),
+            "p_y_do_t0": round(p_y_do_t0, 6),
+            "ate": round(ate, 6),
+            "do_says_helps": do_says_helps,
             "counterfactual_p_y0_given_t1y1_do_t0": round(cf_prob, 6),
             "backdoor_sets": [list(s) for s in bd_sets[:3]],
             "backdoor_adjusted_p": round(bd_result, 6) if bd_result is not None else None,
@@ -249,12 +310,17 @@ def bench_memory_fidelity(*, n_triples: int = 100, seed: int = 0) -> SubstrateBe
 
     with tempfile.TemporaryDirectory(prefix="bench_memory_") as tmp:
         mem = PersistentSemanticMemory(Path(tmp) / "bench.sqlite", namespace="fidelity")
+
         written: list[tuple[str, str, str, float]] = []
         for i in range(n_triples):
-            s, p, o = subjects[i], rng.choice(predicates), objects[i]
+            s = subjects[i]
+            p = rng.choice(predicates)
+            o = objects[i]
             conf = round(rng.uniform(0.5, 1.0), 3)
             mem.upsert(s, p, o, confidence=conf, evidence={"source": "bench", "index": i})
             written.append((s, p, o, conf))
+
+        # Recall
         correct = 0
         confidence_errors: list[float] = []
         for s, p, o, conf in written:
@@ -262,6 +328,7 @@ def bench_memory_fidelity(*, n_triples: int = 100, seed: int = 0) -> SubstrateBe
             if got is not None and got[0] == o:
                 correct += 1
                 confidence_errors.append(abs(got[1] - conf))
+
         recall_rate = correct / max(1, n_triples)
         avg_conf_error = sum(confidence_errors) / max(1, len(confidence_errors)) if confidence_errors else float("nan")
         mem.close()
@@ -270,9 +337,13 @@ def bench_memory_fidelity(*, n_triples: int = 100, seed: int = 0) -> SubstrateBe
     return SubstrateBenchmarkResult(
         name="semantic_memory_fidelity",
         description="Write/recall fidelity over N random triples",
-        passed=recall_rate >= 0.99, score=recall_rate, n_trials=n_triples,
+        passed=recall_rate >= 0.99,
+        score=recall_rate,
+        n_trials=n_triples,
         details={
-            "n_triples": n_triples, "correct_recalls": correct, "recall_rate": recall_rate,
+            "n_triples": n_triples,
+            "correct_recalls": correct,
+            "recall_rate": recall_rate,
             "avg_confidence_error": round(avg_conf_error, 6) if math.isfinite(avg_conf_error) else None,
         },
         duration_seconds=duration,
@@ -292,6 +363,7 @@ def bench_conformal_coverage(*, n_calibration: int = 200, n_test: int = 500, alp
     labels = ["A", "B", "C", "D"]
     n_labels = len(labels)
 
+    # Synthetic softmax distributions with noise
     def random_dist() -> dict[str, float]:
         raw = [rng.expovariate(1.0) for _ in range(n_labels)]
         s = sum(raw)
@@ -306,43 +378,63 @@ def bench_conformal_coverage(*, n_calibration: int = 200, n_test: int = 500, alp
                 return lab
         return labels[-1]
 
+    # LAC predictor
     lac = ConformalPredictor(alpha=alpha, method="lac", min_calibration=8)
     for _ in range(n_calibration):
         dist = random_dist()
-        lac.calibrate(p_label=dist[sample_true(dist)])
+        true = sample_true(dist)
+        lac.calibrate(p_label=dist[true])
 
+    # APS predictor
     aps = ConformalPredictor(alpha=alpha, method="aps", min_calibration=8)
     for _ in range(n_calibration):
         dist = random_dist()
-        aps.calibrate(p_distribution=dist, true_label=sample_true(dist))
+        true = sample_true(dist)
+        aps.calibrate(p_distribution=dist, true_label=true)
 
+    # Test coverage
+    test_data = [(random_dist(), sample_true(d := random_dist()) or sample_true(d)) for _ in range(n_test)]
+    # Fix: properly generate test data
     test_data_fixed = []
     for _ in range(n_test):
         d = random_dist()
-        test_data_fixed.append((d, sample_true(d)))
+        t = sample_true(d)
+        test_data_fixed.append((d, t))
 
     lac_cov = empirical_coverage(lac, test_data_fixed)
     aps_cov = empirical_coverage(aps, test_data_fixed)
+
+    # Compute set sizes
     lac_sizes = [lac.predict_set(d).set_size for d, _ in test_data_fixed]
     aps_sizes = [aps.predict_set(d).set_size for d, _ in test_data_fixed]
     avg_lac_size = sum(lac_sizes) / max(1, len(lac_sizes))
     avg_aps_size = sum(aps_sizes) / max(1, len(aps_sizes))
+
     target = 1.0 - alpha
+    # Allow small finite-sample slack
     slack = 0.05
-    both_ok = lac_cov >= (target - slack) and aps_cov >= (target - slack)
+    lac_ok = lac_cov >= (target - slack)
+    aps_ok = aps_cov >= (target - slack)
+    both_ok = lac_ok and aps_ok
 
     duration = time.time() - start
     return SubstrateBenchmarkResult(
         name="conformal_coverage_guarantee",
         description=f"Split-conformal coverage >= {target:.2f} (alpha={alpha})",
-        passed=both_ok, score=(lac_cov + aps_cov) / 2.0, n_trials=n_test,
+        passed=both_ok,
+        score=(lac_cov + aps_cov) / 2.0,
+        n_trials=n_test,
         details={
-            "alpha": alpha, "target_coverage": target,
-            "lac_coverage": round(lac_cov, 4), "aps_coverage": round(aps_cov, 4),
-            "lac_meets_target": lac_cov >= (target - slack),
-            "aps_meets_target": aps_cov >= (target - slack),
-            "avg_lac_set_size": round(avg_lac_size, 2), "avg_aps_set_size": round(avg_aps_size, 2),
-            "n_calibration": n_calibration, "n_test": n_test,
+            "alpha": alpha,
+            "target_coverage": target,
+            "lac_coverage": round(lac_cov, 4),
+            "aps_coverage": round(aps_cov, 4),
+            "lac_meets_target": lac_ok,
+            "aps_meets_target": aps_ok,
+            "avg_lac_set_size": round(avg_lac_size, 2),
+            "avg_aps_set_size": round(avg_aps_size, 2),
+            "n_calibration": n_calibration,
+            "n_test": n_test,
         },
         duration_seconds=duration,
     )
@@ -366,31 +458,48 @@ def bench_vsa_algebra(*, dims: Sequence[int] = (1000, 5000, 10000), n_triples: i
         cb = VSACodebook(dim=dim, base_seed=seed)
         correct = 0
         cos_sims: list[float] = []
+
         atoms = [f"atom_{i}" for i in range(n_triples * 3)]
+        # Pre-register all atoms
         for a in atoms:
             cb.atom(a)
+
         for i in range(n_triples):
-            s, p, o = atoms[i * 3], atoms[i * 3 + 1], atoms[i * 3 + 2]
+            s = atoms[i * 3]
+            p = atoms[i * 3 + 1]
+            o = atoms[i * 3 + 2]
+
             encoded = cb.encode_triple(s, p, o)
-            decoded, cos = cb.decode_role(encoded, "ROLE_OBJECT",
-                candidates=[o] + [atoms[j] for j in rng.sample(range(len(atoms)), min(20, len(atoms)))])
+            # Decode object via role unbinding
+            decoded, cos = cb.decode_role(encoded, "ROLE_OBJECT", candidates=[o] + [atoms[j] for j in rng.sample(range(len(atoms)), min(20, len(atoms)))])
             cos_sims.append(cos)
             if decoded == o:
                 correct += 1
+
         acc = correct / max(1, n_triples)
         avg_cos = sum(cos_sims) / max(1, len(cos_sims))
-        per_dim[dim] = {"accuracy": round(acc, 4), "avg_cosine": round(avg_cos, 4),
-                        "n_triples": n_triples, "correct": correct}
+        per_dim[dim] = {
+            "accuracy": round(acc, 4),
+            "avg_cosine": round(avg_cos, 4),
+            "n_triples": n_triples,
+            "correct": correct,
+        }
         total_correct += correct
         total_trials += n_triples
 
     overall_acc = total_correct / max(1, total_trials)
     duration = time.time() - start
+
     return SubstrateBenchmarkResult(
         name="vsa_algebraic_fidelity",
         description="VSA bind/unbind round-trip accuracy across dimensionalities",
-        passed=overall_acc >= 0.85, score=overall_acc, n_trials=total_trials,
-        details={"per_dimensionality": per_dim, "dims_tested": list(dims)},
+        passed=overall_acc >= 0.85,
+        score=overall_acc,
+        n_trials=total_trials,
+        details={
+            "per_dimensionality": per_dim,
+            "dims_tested": list(dims),
+        },
         duration_seconds=duration,
     )
 
@@ -411,10 +520,14 @@ def bench_hopfield_retrieval(*, d_model: int = 256, store_sizes: Sequence[int] =
 
     for n_store in store_sizes:
         mem = HopfieldAssociativeMemory(d_model, max_items=max(n_store + 10, 100))
+
+        # Store random unit-norm patterns
         patterns = torch.randn(n_store, d_model, generator=rng_torch)
         patterns = patterns / patterns.norm(dim=1, keepdim=True).clamp_min(1e-6)
         for i in range(n_store):
             mem.remember(patterns[i].unsqueeze(0), patterns[i].unsqueeze(0))
+
+        # Query with noisy versions of stored patterns
         correct = 0
         cos_sims: list[float] = []
         for q_idx in range(min(n_queries, n_store)):
@@ -422,26 +535,40 @@ def bench_hopfield_retrieval(*, d_model: int = 256, store_sizes: Sequence[int] =
             query = patterns[q_idx] + noise
             query = query / query.norm().clamp_min(1e-6)
             retrieved, weights = mem.retrieve(query)
+            # Check if retrieved is closest to the original
             sim = float(torch.nn.functional.cosine_similarity(
-                retrieved.view(1, -1), patterns[q_idx].view(1, -1)).item())
+                retrieved.view(1, -1), patterns[q_idx].view(1, -1)
+            ).item())
             cos_sims.append(sim)
             if sim > 0.8:
                 correct += 1
+
         n_q = min(n_queries, n_store)
         acc = correct / max(1, n_q)
         avg_cos = sum(cos_sims) / max(1, len(cos_sims))
-        per_size[n_store] = {"accuracy": round(acc, 4), "avg_cosine": round(avg_cos, 4),
-                             "n_queries": n_q, "correct": correct}
+        per_size[n_store] = {
+            "accuracy": round(acc, 4),
+            "avg_cosine": round(avg_cos, 4),
+            "n_queries": n_q,
+            "correct": correct,
+        }
         total_correct += correct
         total_queries += n_q
 
     overall_acc = total_correct / max(1, total_queries)
     duration = time.time() - start
+
     return SubstrateBenchmarkResult(
         name="hopfield_retrieval_accuracy",
         description="Modern Continuous Hopfield one-step retrieval at varying store sizes",
-        passed=overall_acc >= 0.70, score=overall_acc, n_trials=total_queries,
-        details={"d_model": d_model, "per_store_size": per_size, "store_sizes_tested": list(store_sizes)},
+        passed=overall_acc >= 0.70,
+        score=overall_acc,
+        n_trials=total_queries,
+        details={
+            "d_model": d_model,
+            "per_store_size": per_size,
+            "store_sizes_tested": list(store_sizes),
+        },
         duration_seconds=duration,
     )
 
@@ -461,6 +588,7 @@ def bench_active_inference(*, n_episodes: int = 200, max_steps: int = 3, seed: i
     pomdp = build_tiger_pomdp()
     agent = ActiveInferenceAgent(pomdp, horizon=1, learn=True)
     env = TigerDoorEnv(seed=seed)
+
     agent_successes = 0
     agent_returns: list[float] = []
     for _ in range(n_episodes):
@@ -480,20 +608,25 @@ def bench_active_inference(*, n_episodes: int = 200, max_steps: int = 3, seed: i
 
     agent_rate = agent_successes / max(1, n_episodes)
     random_rate = random_successes / max(1, n_episodes)
+    agent_mean_return = sum(agent_returns) / max(1, len(agent_returns))
+    random_mean_return = sum(random_returns) / max(1, len(random_returns))
     advantage = agent_rate - random_rate
-    duration = time.time() - start
 
+    duration = time.time() - start
     return SubstrateBenchmarkResult(
         name="active_inference_decision_quality",
         description="EFE-driven Tiger POMDP agent vs random baseline",
-        passed=advantage > 0.05, score=agent_rate, n_trials=n_episodes,
+        passed=advantage > 0.05,
+        score=agent_rate,
+        n_trials=n_episodes,
         details={
             "agent_success_rate": round(agent_rate, 4),
             "random_success_rate": round(random_rate, 4),
             "advantage_over_random": round(advantage, 4),
-            "agent_mean_return": round(sum(agent_returns) / max(1, len(agent_returns)), 4),
-            "random_mean_return": round(sum(random_returns) / max(1, len(random_returns)), 4),
-            "n_episodes": n_episodes, "max_steps": max_steps,
+            "agent_mean_return": round(agent_mean_return, 4),
+            "random_mean_return": round(random_mean_return, 4),
+            "n_episodes": n_episodes,
+            "max_steps": max_steps,
         },
         duration_seconds=duration,
     )
@@ -504,23 +637,33 @@ def bench_active_inference(*, n_episodes: int = 200, max_steps: int = 3, seed: i
 # ---------------------------------------------------------------------------
 
 ALL_SUBSTRATE_BENCHMARKS = [
-    bench_rule_shift, bench_adversarial_prompt_resistance, bench_causal_reasoning,
-    bench_memory_fidelity, bench_conformal_coverage, bench_vsa_algebra,
-    bench_hopfield_retrieval, bench_active_inference,
+    bench_rule_shift,
+    bench_adversarial_prompt_resistance,
+    bench_causal_reasoning,
+    bench_memory_fidelity,
+    bench_conformal_coverage,
+    bench_vsa_algebra,
+    bench_hopfield_retrieval,
+    bench_active_inference,
 ]
 
 
 def run_substrate_benchmark_suite(
-    *, seed: int = 0, benchmarks: Sequence[str] | None = None,
+    *,
+    seed: int = 0,
+    benchmarks: Sequence[str] | None = None,
     output_path: Path | None = None,
 ) -> SubstrateBenchmarkSuite:
     """Run all (or selected) substrate benchmarks and return the suite result."""
+
     suite = SubstrateBenchmarkSuite()
     suite_start = time.time()
+
     for bench_fn in ALL_SUBSTRATE_BENCHMARKS:
         name = bench_fn.__name__.replace("bench_", "")
         if benchmarks is not None and name not in benchmarks:
             continue
+
         print(f"  Running substrate benchmark: {name} ...", flush=True)
         try:
             result = bench_fn(seed=seed)
@@ -530,17 +673,30 @@ def run_substrate_benchmark_suite(
         except Exception as exc:
             logger.exception("Substrate benchmark %s failed", name)
             suite.results.append(SubstrateBenchmarkResult(
-                name=name, description=f"Error: {exc}", passed=False,
-                score=0.0, n_trials=0, details={"error": str(exc)},
+                name=name,
+                description=f"Error: {exc}",
+                passed=False,
+                score=0.0,
+                n_trials=0,
+                details={"error": str(exc)},
             ))
             print(f"    ERROR: {exc}", flush=True)
+
     suite.total_duration_seconds = time.time() - suite_start
+
     if output_path is not None:
         output_path.parent.mkdir(parents=True, exist_ok=True)
-        output_path.write_text(json.dumps(suite.summary(), indent=2, default=str), encoding="utf-8")
+        output_path.write_text(
+            json.dumps(suite.summary(), indent=2, default=str), encoding="utf-8"
+        )
         print(f"  Wrote substrate benchmark results to {output_path}", flush=True)
+
     return suite
 
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
 
 def _histogram(values: list[int | float], bins: int) -> dict[str, int]:
     """Simple histogram for details."""

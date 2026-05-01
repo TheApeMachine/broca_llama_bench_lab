@@ -1,6 +1,67 @@
 \section{Introduction}
 \label{sec:introduction}
 
-This document describes the Broca-conditioned Llama stack and supporting
-benchmark infrastructure. Replace this placeholder with a problem statement,
-contributions, and notation as the draft matures.
+Large language models have become the default substrate for a widening range of
+cognitive tasks: planning, tool use, causal reasoning, memory management, and
+uncertainty calibration.  Yet the transformer architecture was designed for
+sequence-to-sequence transduction, not for any of these tasks.  The prevailing
+approach---encoding all context, instructions, and state into a text
+prompt---conflates two fundamentally different concerns: \emph{what to say}
+(surface-form generation) and \emph{what to think} (world modelling,
+inference, control).
+
+This paper proposes an alternative division of labour.  We treat the LLM as a
+\textbf{language organ}: a frozen decoder whose only responsibility is to
+produce fluent, well-formed language.  All cognitive operations---persistent
+memory, causal reasoning, decision-making under uncertainty, belief revision,
+and top-down control---are handled by a separate \textbf{cognitive substrate}
+that communicates with the LLM exclusively through \emph{grafts}: small modules
+that modify the residual stream, lexical plan, and logit distribution at every
+decoding step, without touching the frozen model's weights and without
+consuming prompt tokens.
+
+The substrate is assembled from components with published mathematical
+guarantees rather than from learned or heuristic modules:
+
+\begin{itemize}[nosep]
+  \item \textbf{Active inference} (Friston): POMDPs that minimise Expected Free
+    Energy, coupling epistemic and pragmatic value in a single decision
+    criterion.
+  \item \textbf{Finite SCM with do-calculus} (Pearl): exact interventional and
+    counterfactual queries, with automatic backdoor and frontdoor
+    identification.
+  \item \textbf{Holographic Reduced Representations} (Plate): compositional
+    bind/unbind/bundle algebra in $O(d \log d)$ via FFT, with capacity
+    $\sim 0.5\,d / \log d$.
+  \item \textbf{Modern Continuous Hopfield networks} (Ramsauer et al., 2020):
+    one-step retrieval with exponential storage capacity in $d$.
+  \item \textbf{Split-conformal prediction} (Vovk; Romano et al., 2020):
+    distribution-free coverage guarantee $P[y \in C(x)] \geq 1 - \alpha$.
+  \item \textbf{Multivariate Hawkes processes}: self- and mutually-exciting
+    event streams for working-memory ``heat.''
+  \item \textbf{Predictive coding}: cross-entropy gap between graft-on and
+    graft-off forwards, yielding the substrate's surprise signal.
+\end{itemize}
+
+The LLM's weights are \emph{never updated}.  Behavioural changes arise entirely
+from the substrate's reads and writes through grafts.  This design has three
+practical advantages: (1)~the language organ can be swapped (e.g.\ Llama~3.2
+$\to$ a future checkpoint) without retraining any cognitive component;
+(2)~the substrate's state is fully persistent (SQLite WAL), surviving restarts
+and enabling long-running agents; and (3)~every cognitive claim---retrieval
+correctness, coverage, capacity, convergence---has a paper trail rather than a
+vibe.
+
+\paragraph{Contributions.}
+\begin{enumerate}[nosep]
+  \item The \textsc{Mosaic} architecture and its graft-based communication
+    protocol between a frozen LLM and a persistent cognitive substrate
+    (\S\ref{sec:methods}).
+  \item A three-tier evaluation framework: standard NLP benchmarks for
+    regression testing, architecture probes for graft effectiveness, and
+    substrate-specific benchmarks for algebraic guarantees
+    (\S\ref{sec:experiments}).
+  \item A fully automated benchmark-to-paper pipeline that regenerates all
+    experiment tables, figures, and prose from fresh benchmark runs, closing
+    the loop from code change to typeset report.
+\end{enumerate}

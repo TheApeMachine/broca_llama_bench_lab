@@ -7,12 +7,18 @@
 \usepackage{graphicx}
 \usepackage{booktabs}
 \usepackage{hyperref}
+\usepackage{microtype}
+\usepackage{xcolor}
+\usepackage{amssymb}% for \checkmark
 \hypersetup{colorlinks=true,linkcolor=blue,urlcolor=blue,citecolor=blue}
 % Figures for experiments live alongside generated stubs under include/experiment/.
 \graphicspath{{./}{include/experiment/}}
 
-\title{Broca--Llama Bench Lab\\Technical Report (Auto-Generated Draft)}
-\author{ASI Broca Llama Bench Lab}
+\title{MOSAIC: A Cognitive Substrate Architecture for\\Frozen Language Models}
+\author{%
+  The Mosaic Project\\
+  \texttt{theapemachine/mosaic}
+}
 \date{\today}
 
 \begin{document}
@@ -24,5 +30,8 @@
 \input{include/section/experiments}
 \input{section/04_discussion}
 \input{section/05_conclusion}
+
+\bibliographystyle{plain}
+% \bibliography{references}  % Uncomment when .bib file is added
 
 \end{document}

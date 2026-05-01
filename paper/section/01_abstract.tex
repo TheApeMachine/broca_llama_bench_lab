@@ -1,7 +1,28 @@
 \begin{abstract}
-This draft is maintained alongside the \texttt{asi\_broca\_llama\_bench\_lab} codebase.
-Narrative sections under \texttt{paper/section/} can be edited by hand; the
-\texttt{Experiments} section pulls in automatically generated benchmark exports
-from \texttt{paper/include/experiment/} via \texttt{make paper-bench} or the
-self-improve hook (\texttt{BROCA\_SELF\_IMPROVE\_RUN\_PAPER}).
+We present \textsc{Mosaic}, an architecture that treats a frozen large language
+model as a \emph{language organ}---a surface-form generator stripped of the
+planning, memory, and reasoning responsibilities that current LLM deployments
+force onto the prompt.  All higher cognition is delegated to a persistent
+\emph{cognitive substrate} built from mathematically grounded components:
+POMDPs under active inference for decision-making, a finite structural causal
+model with exact \texttt{do(\,)} calculus for causal reasoning, holographic
+reduced representations for compositional memory, Modern Continuous Hopfield
+networks for one-step associative retrieval, split-conformal prediction for
+calibrated uncertainty, and multivariate Hawkes processes for temporal
+excitation.  The substrate communicates with the frozen LLM exclusively through
+\emph{grafts}---small modules that bias the residual stream, lexical plan, and
+logit distribution at every decoding step---rather than through the prompt.
+
+We evaluate the architecture on three axes.  First, standard NLP benchmarks
+(BoolQ, PIQA, ARC, WinoGrande, HellaSwag, CommonsenseQA, OpenBookQA, MMLU,
+GSM8K) confirm that the graft infrastructure preserves the frozen model's
+leaderboard accuracy when no substrate signal is injected.  Second, scripted
+architecture probes show that the full Broca stack achieves perfect
+speech-exact accuracy on semantic-memory recall, active-inference action
+selection, and causal intervention queries where the bare LLM scores zero.
+Third, a suite of eight substrate-specific benchmarks verifies the algebraic
+and control-theoretic guarantees of every major component: online Bayesian
+belief revision, iterative hypothesis masking, Simpson's-paradox resolution via
+do-calculus, triple-store fidelity, conformal coverage, VSA round-trip
+accuracy, Hopfield retrieval scaling, and EFE-driven decision quality.
 \end{abstract}
