@@ -160,7 +160,7 @@ class GraftMotorTrainer:
                 )
                 continue
             mask = torch.ones_like(full, dtype=torch.bool)
-            extra = {"tokenizer": self.tokenizer}
+            extra = {"tokenizer": self.tokenizer, "motor_prompt_len": int(prompt.shape[1])}
             features = item.get("broca_features")
             if isinstance(features, torch.Tensor):
                 extra["broca_features"] = features.to(full.device)

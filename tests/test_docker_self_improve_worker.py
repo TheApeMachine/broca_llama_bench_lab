@@ -146,7 +146,8 @@ def test_mind_wiring_start_stop(tmp_path: Path, fake_host_loader, monkeypatch: p
     fake_host_loader()
     mind = BrocaMind(seed=0, db_path=tmp_path / "m4.sqlite", namespace="ut4", device="cpu", hf_token=False)
     monkeypatch.setenv("GITHUB_TOKEN", "x")
+    # Patch before the background thread's first loop iteration (it calls _run_once_safe immediately).
+    monkeypatch.setattr(SelfImproveDockerWorker, "_run_once_safe", MagicMock())
     worker = mind.start_self_improve_worker(interval_s=3600.0, enabled=True)
     assert worker is mind._self_improve_worker
-    monkeypatch.setattr(worker, "_run_once_safe", MagicMock())
     mind.stop_self_improve_worker()

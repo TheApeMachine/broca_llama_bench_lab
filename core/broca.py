@@ -630,6 +630,10 @@ class PersistentSemanticMemory:
         if self._conn is None:
             self._conn = sqlite3.connect(str(self.path), check_same_thread=False, timeout=30.0)
             self._conn.execute("PRAGMA journal_mode=WAL")
+            try:
+                self._conn.execute("PRAGMA busy_timeout=60000")
+            except sqlite3.Error:
+                pass
         return self._conn
 
     def close(self) -> None:
@@ -1270,14 +1274,21 @@ class PersistentSemanticMemory:
 class WorkspaceJournal:
     """Episodic log of workspace frames paired with raw utterances (same SQLite file as semantic memory)."""
 
-    def __init__(self, path: str | Path):
+    def __init__(self, path: str | Path, *, shared_memory: PersistentSemanticMemory | None = None):
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
+        self._shared_memory = shared_memory
+        if shared_memory is not None and Path(shared_memory.path).resolve() != self.path.resolve():
+            raise ValueError("WorkspaceJournal shared_memory must use the same database path as the journal")
         self._init_schema()
 
     def _connect(self) -> sqlite3.Connection:
-        con = sqlite3.connect(self.path, timeout=30.0)
+        con = sqlite3.connect(self.path, timeout=30.0, check_same_thread=False)
         con.execute("PRAGMA journal_mode=WAL")
+        try:
+            con.execute("PRAGMA busy_timeout=5000")
+        except sqlite3.Error:
+            pass
         return con
 
     def _init_schema(self) -> None:
@@ -1299,21 +1310,23 @@ class WorkspaceJournal:
 
     def append(self, utterance: str, frame: CognitiveFrame) -> int:
         now = time.time()
-        with self._connect() as con:
+        payload = (
+            now,
+            utterance,
+            frame.intent,
+            frame.subject,
+            frame.answer,
+            float(frame.confidence),
+            json.dumps(frame.evidence or {}, sort_keys=True),
+        )
+
+        def _insert_on(con: sqlite3.Connection) -> int:
             cur = con.execute(
                 """
                 INSERT INTO workspace_journal(ts, utterance, intent, subject, answer, confidence, evidence_json)
                 VALUES (?,?,?,?,?,?,?)
                 """,
-                (
-                    now,
-                    utterance,
-                    frame.intent,
-                    frame.subject,
-                    frame.answer,
-                    float(frame.confidence),
-                    json.dumps(frame.evidence or {}, sort_keys=True),
-                ),
+                payload,
             )
             jid = int(cur.lastrowid)
             logger.debug(
@@ -1325,6 +1338,28 @@ class WorkspaceJournal:
                 (utterance[:120] + "…") if len(utterance) > 120 else utterance,
             )
             return jid
+
+        sm = self._shared_memory
+        if sm is not None:
+            with sm._sqlite_lock:
+                jid = _insert_on(sm._ensure_conn())
+            return jid
+
+        delay = 0.02
+        last_exc: sqlite3.OperationalError | None = None
+        for _ in range(30):
+            try:
+                with self._connect() as con:
+                    return _insert_on(con)
+            except sqlite3.OperationalError as exc:
+                last_exc = exc
+                msg = str(exc).lower()
+                if "locked" not in msg and "busy" not in msg:
+                    raise
+                time.sleep(delay)
+                delay = min(delay * 1.4, 0.35)
+        assert last_exc is not None
+        raise last_exc
 
     def fetch(self, episode_id: int) -> dict | None:
         with self._connect() as con:
@@ -2815,7 +2850,7 @@ class BrocaMind:
         resolved_device = device if isinstance(device, torch.device) else pick_torch_device(device)
         mid = llama_model_id or DEFAULT_BROCA_MODEL_ID
         self.memory = PersistentSemanticMemory(db_path, namespace=namespace)
-        self.journal = WorkspaceJournal(Path(db_path))
+        self.journal = WorkspaceJournal(Path(db_path), shared_memory=self.memory)
         self.episode_graph = EpisodeAssociationGraph(Path(db_path))
         self._last_journal_id: int | None = None
         self.host, self.tokenizer = load_llama_broca_host(mid, device=resolved_device, token=hf_token)

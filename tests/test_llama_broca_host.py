@@ -34,7 +34,7 @@ class FakeInnerModel(nn.Module):
         self.embed = nn.Embedding(8, 4)
         self.layers = nn.ModuleList([FakeLayer(), FakeLayer()])
 
-    def forward(self, input_ids, attention_mask=None, return_dict=True):
+    def forward(self, input_ids, attention_mask=None, return_dict=True, **kwargs):
         x = self.embed(input_ids)
         for layer in self.layers:
             x = layer(x)[0]

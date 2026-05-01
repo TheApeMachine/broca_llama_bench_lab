@@ -30,7 +30,7 @@ from core.continuous_frame import SKETCH_DIM
 def _build_synthetic_mind(tmp: Path) -> types.SimpleNamespace:
     db = tmp / "rem.sqlite"
     memory = PersistentSemanticMemory(db, namespace="t")
-    journal = WorkspaceJournal(db)
+    journal = WorkspaceJournal(db, shared_memory=memory)
     graph = EpisodeAssociationGraph(db)
     rng = random.Random(0)
 

@@ -105,6 +105,15 @@ def write_comparison_table_tex(summary: Mapping[str, Any], dest: Path) -> None:
     dest.write_text("\n".join(lines), encoding="utf-8")
 
 
+def _has_paired_shell_comparison(summary: Mapping[str, Any]) -> bool:
+    comp = summary.get("comparison")
+    if not isinstance(comp, Mapping) or not comp:
+        return False
+    shell = (comp.get("llama_broca_shell") or {}).get("per_task") or {}
+    per_v = summary.get("per_task") or {}
+    return bool(set(per_v.keys()) & set(shell.keys()))
+
+
 def write_hf_native_experiment_tex(
     *,
     summary: Mapping[str, Any] | None,
@@ -167,7 +176,7 @@ def write_hf_native_experiment_tex(
         "",
     ]
 
-    if isinstance(summary.get("comparison"), Mapping):
+    if _has_paired_shell_comparison(summary):
         blocks.extend(
             [
                 r"\begin{table}[htbp]",
@@ -360,7 +369,12 @@ def refresh_paper_experiments(*, root: Path | None = None) -> dict[str, Any]:
 
     if summary is not None:
         write_vanilla_table_tex(summary, exp_dir / "hf_native_vanilla_table.tex")
-        write_comparison_table_tex(summary, exp_dir / "hf_native_comparison_table.tex")
+        if _has_paired_shell_comparison(summary):
+            write_comparison_table_tex(summary, exp_dir / "hf_native_comparison_table.tex")
+        else:
+            (exp_dir / "hf_native_comparison_table.tex").write_text(
+                "% omitted — no Broca-shell paired run in this summary\n", encoding="utf-8"
+            )
         pdf_src = native_run_dir / "accuracy_by_task.pdf" if native_run_dir else None
         png_src = native_run_dir / "accuracy_by_task.png" if native_run_dir else None
         dst_pdf = exp_dir / "hf_native_accuracy_by_task.pdf"

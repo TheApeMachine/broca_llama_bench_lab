@@ -9,3 +9,8 @@ runs/*
 *.sqlite-wal
 
 __pycache__/
+main.aux
+main.log
+main.out
+paper/build/
+.claude/

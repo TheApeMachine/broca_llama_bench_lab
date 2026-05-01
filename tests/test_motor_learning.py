@@ -54,8 +54,11 @@ class _StubHost(nn.Module):
 
     def forward(self, input_ids, attention_mask, extra_state=None):
         x = self.embed(input_ids)
-        # Apply the "graft" only at the last position to mirror the real path.
-        last_idx = input_ids.shape[1] - 1
+        # Apply the graft at the last *prompt* position (see motor_prompt_len in GraftMotorTrainer).
+        if extra_state and "motor_prompt_len" in extra_state:
+            last_idx = max(0, int(extra_state["motor_prompt_len"]) - 1)
+        else:
+            last_idx = input_ids.shape[1] - 1
         x_last = x[:, last_idx]
         delta = self.graft_module(x_last)
         x = x.clone()
