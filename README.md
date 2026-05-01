@@ -47,6 +47,7 @@ memory · active inference · causal substrate · workspace
   - [Top-down cognitive control](#top-down-cognitive-control)
   - [Meta-learning: macros, native tools, dynamic grafts](#meta-learning-macros-native-tools-dynamic-grafts)
   - [Self-improvement](#self-improvement)
+  - [The substrate writes its own paper](#the-substrate-writes-its-own-paper)
 - [Live observability](#live-observability)
 - [Running things](#running-things)
 - [Benchmarks](#benchmarks)
@@ -399,7 +400,105 @@ own track record.
 > **Opt-in and gated.** Requires `BROCA_SELF_IMPROVE=1` (or
 > `--self-improve`), `GITHUB_TOKEN` with `repo` scope, Docker, and a
 > resolvable `git` remote. Defaults are conservative: 1 cycle per
-> hour, 4 GiB memory, 2 CPUs, 30-minute timeout.
+> hour, 4 GiB memory, 2 CPUs, 30-minute timeout. Set
+> `BROCA_SELF_IMPROVE_RUN_PAPER=1` to also refresh the LaTeX
+> experiments after every successful Docker cycle (see below).
+
+---
+
+### The substrate writes its own paper
+
+The lab ships a [LaTeX scaffold](paper/main.tex) and a benchmark-to-TeX
+harness ([core/paper/harness.py](core/paper/harness.py)) so the
+substrate can keep a continuously up-to-date technical report on
+itself. The narrative sections are hand-edited; everything that should
+be backed by **numbers** is auto-generated from a fresh benchmark run.
+
+```mermaid
+flowchart LR
+    subgraph Generated["paper/include/experiment/<br/>(auto-generated)"]
+      T1[hf_native_vanilla_table.tex]
+      T2[hf_native_comparison_table.tex]
+      F1[hf_native_accuracy_by_task.pdf]
+      J1[hf_native_summary.json]
+      X1[exp_hf_native_benchmark.tex]
+      X2[exp_broca_architecture.tex]
+      M[_inputs.tex<br/>auto-manifest]
+    end
+
+    subgraph Authored["paper/section/<br/>(hand-edited)"]
+      A1[01_abstract.tex]
+      A2[02_introduction.tex]
+      A3[03_methods.tex]
+      A4[04_discussion.tex]
+      A5[05_conclusion.tex]
+    end
+
+    BR[python -m core.paper] -->|HF datasets benchmark| Generated
+    BR -->|Broca architecture probes| Generated
+    Generated --> Main[paper/main.tex]
+    Authored --> Main
+    Main -->|latexmk / pdflatex| PDF[paper/main.pdf]
+
+    SI[SelfImproveDockerWorker<br/>after a green cycle] -. BROCA_SELF_IMPROVE_RUN_PAPER=1 .-> BR
+```
+
+**One command builds the PDF end-to-end:**
+
+```bash
+make paper
+# == make paper-bench  →  python -m core.paper
+# == make paper-pdf    →  latexmk -pdf paper/main.tex   (or pdflatex ×2)
+```
+
+| Make target | What it does |
+| --- | --- |
+| `make paper-bench` | Runs the native HF benchmark (preset / limit configurable via env) and the Broca architecture probes; writes per-task accuracy tables, the paired vanilla-vs-Broca-shell comparison, the matplotlib accuracy figure, and `summary.json` into `paper/include/experiment/`; auto-rebuilds the `_inputs.tex` manifest. |
+| `make paper-pdf` | Compiles `paper/main.tex` to `paper/main.pdf` with `latexmk` if available, otherwise two `pdflatex` passes. |
+| `make paper` | The full pipeline: refresh experiments, then build the PDF. |
+
+What the harness writes:
+
+- **Per-task accuracy table** for the vanilla decoder.
+- **Paired comparison table** vanilla decoder vs. `LlamaBrocaHost`-shell
+  on the same weights and items — wrapper-integrity check, surfaced as
+  table when both runs share at least one task.
+- **Per-task accuracy bar chart** copied straight from the benchmark
+  run directory (`accuracy_by_task.pdf`/`.png`).
+- **Architecture probe table** comparing `baseline_bare_language_host`
+  vs. `enhanced_broca_architecture` on speech-exact and answer-present
+  metrics, with a third row for the delta.
+- **Stub TeX with a status note** when a block cannot be refreshed
+  (missing HF token, missing Docker, GPT-2 backend, etc.) so the PDF
+  always builds and tells you *why* a section is empty.
+
+Tunables (all read from environment by the harness):
+
+| Variable | Effect | Default |
+| --- | --- | --- |
+| `PAPER_MODEL` / `BENCHMARK_MODEL` | Checkpoint to evaluate | `meta-llama/Llama-3.2-1B-Instruct` |
+| `PAPER_NATIVE_PRESET` | Native preset (`smoke` … `full`) | `quick` |
+| `PAPER_BENCH_LIMIT` | Items per task | `50` |
+| `PAPER_BENCH_SEED` / `BENCHMARK_SEED` | Sampling seed | `0` |
+| `PAPER_DEVICE` / `BENCHMARK_DEVICE` | Torch device override | auto |
+| `PAPER_SKIP_NATIVE=1` | Skip the HF benchmark step | off |
+| `PAPER_SKIP_ARCH_EVAL=1` | Skip the architecture probe step | off |
+| `HF_TOKEN` | For gated checkpoints | — |
+
+**Closing the loop with self-improvement.** Set
+`BROCA_SELF_IMPROVE_RUN_PAPER=1` and every successful Docker cycle of
+`SelfImproveDockerWorker` calls `refresh_paper_experiments()` after
+the validation passes. The substrate now ships a PR *and* updates its
+own paper to reflect the new metrics — a tight closed loop from
+"propose change" → "validate in container" → "land in master" →
+"re-run benchmarks" → "regenerate the paper".
+
+> **Why a paper, not just a metrics dump?** A paper forces structure:
+> abstract → introduction → methods → experiments → discussion →
+> conclusion. The substrate has to fit its results into a frame a human
+> can read top-to-bottom. Numbers without that frame rot in JSON files
+> nobody opens; numbers in a typeset PDF with a manifest of inputs and
+> a build pipeline get read, cited, and audited.
 
 ---
 
@@ -509,6 +608,18 @@ Vanilla mode (no substrate, just HF streaming) — useful as a baseline:
 HF_TOKEN=… python -m core.chat_cli
 ```
 
+### Refresh the paper
+
+```bash
+make paper                          # full pipeline → paper/main.pdf
+HF_TOKEN=… make paper-bench         # only refresh experiment TeX
+make paper-pdf                      # only rebuild the PDF
+PAPER_NATIVE_PRESET=quick PAPER_BENCH_LIMIT=50 make paper-bench
+```
+
+See [The substrate writes its own paper](#the-substrate-writes-its-own-paper)
+for what gets generated and the full env-var matrix.
+
 ---
 
 ## Benchmarks
@@ -608,6 +719,8 @@ Highlights:
 | [core/demo.py](core/demo.py)                                                                                                                               | Architecture demo                                          |
 | [core/benchmarks/](core/benchmarks/)                                                                                                                       | Native HF + lm-eval harnesses                              |
 | [core/docker_self_improve_worker.py](core/docker_self_improve_worker.py)                                                                                   | Self-improve daemon                                        |
+| [core/paper/](core/paper/) · [paper/](paper/)                                                                                                              | Benchmark-to-LaTeX harness + auto-refreshing tech report   |
+| [Makefile](Makefile)                                                                                                                                       | `make chat / bench / paper / paper-bench / paper-pdf`      |
 | [core/logging_setup.py](core/logging_setup.py)                                                                                                             | Stream + rotating-file logging config                      |
 
 ---
