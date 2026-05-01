@@ -9,9 +9,12 @@ from .active_inference import (
     CategoricalPOMDP,
     CoupledDecision,
     CoupledEFEAgent,
+    ToolForagingAgent,
     build_causal_epistemic_pomdp,
     build_tiger_pomdp,
+    build_tool_foraging_pomdp,
     derived_listen_channel_reliability,
+    extend_pomdp_with_synthesize_tool,
 )
 from .broca import (
     BrocaMind,
@@ -43,6 +46,27 @@ from .continuous_frame import (
 from .vsa import bind, unbind, bundle, permute, hypervector, cleanup
 
 # Heavy / optional: load on first attribute access (PEP 562).
+from .chunking import (
+    ChunkingDetectionConfig,
+    CompiledMacro,
+    DMNChunkingCompiler,
+    MacroChunkRegistry,
+    macro_frame_features,
+)
+from .native_tools import (
+    NativeTool,
+    NativeToolRegistry,
+    SandboxResult,
+    ToolSandbox,
+    ToolSynthesisError,
+)
+from .dynamic_grafts import (
+    ACTIVATION_MODE_KIND,
+    CapturedActivationMode,
+    DynamicGraftSynthesizer,
+    capture_activation_mode,
+)
+
 _LAZY_EXPORTS: dict[str, tuple[str, str]] = {
     "VSACodebook": (".vsa", "VSACodebook"),
     "vsa_cosine": (".vsa", "cosine"),
@@ -97,9 +121,26 @@ __all__ = [
     "CategoricalPOMDP",
     "CoupledDecision",
     "CoupledEFEAgent",
+    "ToolForagingAgent",
     "build_causal_epistemic_pomdp",
     "build_tiger_pomdp",
+    "build_tool_foraging_pomdp",
+    "extend_pomdp_with_synthesize_tool",
     "derived_listen_channel_reliability",
+    "ChunkingDetectionConfig",
+    "CompiledMacro",
+    "DMNChunkingCompiler",
+    "MacroChunkRegistry",
+    "macro_frame_features",
+    "NativeTool",
+    "NativeToolRegistry",
+    "SandboxResult",
+    "ToolSandbox",
+    "ToolSynthesisError",
+    "ACTIVATION_MODE_KIND",
+    "CapturedActivationMode",
+    "DynamicGraftSynthesizer",
+    "capture_activation_mode",
     "BrocaMind",
     "CognitiveBackgroundWorker",
     "CognitiveFrame",

@@ -524,3 +524,217 @@ def random_episode(env: TigerDoorEnv, *, max_steps: int = 3) -> tuple[bool, floa
     return success, total
 
 
+# ---------------------------------------------------------------------------
+# Tool foraging POMDP — when to synthesize a new native tool
+# ---------------------------------------------------------------------------
+
+
+TOOL_FORAGING_STATES: tuple[str, ...] = ("knowledge_sufficient", "knowledge_insufficient")
+TOOL_FORAGING_ACTIONS: tuple[str, ...] = (
+    "use_existing_tool",
+    "explore_memory",
+    "synthesize_tool",
+)
+TOOL_FORAGING_OBSERVATIONS: tuple[str, ...] = ("info_gained", "info_stagnant")
+
+
+def _tool_foraging_likelihoods(*, n_existing_tools: int) -> list[list[list[float]]]:
+    """Construct A[action][observation][state] for the tool-foraging POMDP.
+
+    The likelihood table is parameterized by ``n_existing_tools`` so existing
+    tools genuinely lower the perceived ambiguity of the
+    ``use_existing_tool`` action: with no tools at all, "use_existing_tool"
+    becomes nearly useless, and the maths automatically inflates the
+    epistemic value of ``synthesize_tool``.
+    """
+
+    n = max(0, int(n_existing_tools))
+    # Coverage saturates as more tools accumulate; one tool already gives ~0.5.
+    coverage = 1.0 - 1.0 / (1.0 + n)  # 0.0 at n=0, 0.5 at n=1, 0.66 at n=2, →1.0
+
+    p_use_gain_suff = max(0.5 + _EPS, 0.5 + 0.45 * coverage)  # capped well below 1.0
+    p_use_gain_insuff = 0.20  # insufficient knowledge → existing tool rarely helps
+
+    p_explore_gain_suff = 0.55  # already know the answer; memory adds little
+    p_explore_gain_insuff = 0.40  # might find context, but not the missing equation
+
+    p_synth_gain_suff = 0.30  # wasted effort when nothing was missing
+    p_synth_gain_insuff = 0.85  # builds the missing equation; large information gain
+
+    return [
+        [  # use_existing_tool
+            [p_use_gain_suff, p_use_gain_insuff],
+            [1.0 - p_use_gain_suff, 1.0 - p_use_gain_insuff],
+        ],
+        [  # explore_memory
+            [p_explore_gain_suff, p_explore_gain_insuff],
+            [1.0 - p_explore_gain_suff, 1.0 - p_explore_gain_insuff],
+        ],
+        [  # synthesize_tool
+            [p_synth_gain_suff, p_synth_gain_insuff],
+            [1.0 - p_synth_gain_suff, 1.0 - p_synth_gain_insuff],
+        ],
+    ]
+
+
+def build_tool_foraging_pomdp(
+    *,
+    n_existing_tools: int = 0,
+    insufficient_prior: float = 0.5,
+) -> CategoricalPOMDP:
+    """POMDP whose minimal-EFE action chooses *when to synthesize a new tool*.
+
+    The agent prefers ``info_gained`` over ``info_stagnant``.  When the
+    belief leans toward ``knowledge_insufficient`` and few tools exist, the
+    Expected Free Energy of ``synthesize_tool`` drops below the alternatives
+    — so the substrate is *mathematically forced* to grow itself a new
+    sensory organ rather than continue churning over an empty memory.
+
+    Args:
+        n_existing_tools:
+            How many native tools are currently registered.  Higher numbers
+            make ``use_existing_tool`` more reliable (lower ambiguity) and
+            therefore raise the bar for choosing ``synthesize_tool``.
+        insufficient_prior:
+            Initial belief mass on ``knowledge_insufficient``.  The
+            substrate should pass a higher value when its DMN reports high
+            epistemic uncertainty (e.g. the unified agent's normalized
+            policy posterior entropy).
+    """
+
+    pi = float(max(_EPS, min(1.0 - _EPS, insufficient_prior)))
+    A = _tool_foraging_likelihoods(n_existing_tools=int(n_existing_tools))
+    B = identity_transition(len(TOOL_FORAGING_ACTIONS), len(TOOL_FORAGING_STATES))
+    # We strongly prefer "info_gained"; "info_stagnant" is only mildly tolerable.
+    C = normalize([0.85, 0.15])
+    D = normalize([1.0 - pi, pi])
+    pomdp = CategoricalPOMDP(
+        list(A),
+        list(B),
+        list(C),
+        list(D),
+        list(TOOL_FORAGING_STATES),
+        list(TOOL_FORAGING_ACTIONS),
+        list(TOOL_FORAGING_OBSERVATIONS),
+    )
+    logger.debug(
+        "build_tool_foraging_pomdp: n_tools=%d insufficient_prior=%.4f coverage_signal=%.4f",
+        int(n_existing_tools),
+        pi,
+        1.0 - 1.0 / (1.0 + int(max(0, n_existing_tools))),
+    )
+    return pomdp
+
+
+def extend_pomdp_with_synthesize_tool(
+    pomdp: CategoricalPOMDP,
+    *,
+    n_existing_tools: int = 0,
+) -> CategoricalPOMDP:
+    """Return a new POMDP with the original action space *plus* ``synthesize_tool``.
+
+    Used when an existing causal/spatial POMDP needs to gain the
+    tool-synthesis option without rebuilding from scratch.  The new action
+    inherits the original transition/likelihood shapes (states unchanged)
+    and adds rows derived from :func:`_tool_foraging_likelihoods`.
+
+    Note: the original POMDP is not mutated; a new instance is returned.
+    """
+
+    n_states = pomdp.n_states
+    n_actions = pomdp.n_actions + 1
+    n_obs = pomdp.n_observations
+
+    # Build likelihood for the new action: spread mass across observations such that
+    # for each existing state, prefer the *highest-mass observation* of any existing
+    # action (i.e., synthesizing reproduces "the best known sensor" once it succeeds).
+    new_a_obs_by_state: list[float] = []
+    coverage = 1.0 - 1.0 / (1.0 + int(max(0, n_existing_tools)))
+    for s in range(n_states):
+        # Find each observation's max likelihood across existing actions for this state.
+        per_obs = [
+            max(pomdp.A[a][o][s] for a in range(pomdp.n_actions))
+            for o in range(n_obs)
+        ]
+        # Synthesizing succeeds with at least the existing best, scaled by an exploration boost.
+        boosted = [(0.5 + 0.5 * coverage) * x + (1.0 - (0.5 + 0.5 * coverage)) * (1.0 / n_obs) for x in per_obs]
+        new_a_obs_by_state.append(boosted)
+    new_A_action = [[new_a_obs_by_state[s][o] for s in range(n_states)] for o in range(n_obs)]
+
+    A_new: list[list[list[float]]] = [
+        [[pomdp.A[a][o][s] for s in range(n_states)] for o in range(n_obs)]
+        for a in range(pomdp.n_actions)
+    ]
+    A_new.append(new_A_action)
+
+    B_new: list[list[list[float]]] = [
+        [[pomdp.B[a][sp][s] for s in range(n_states)] for sp in range(n_states)]
+        for a in range(pomdp.n_actions)
+    ]
+    # New action keeps the state space stationary (synthesizing a tool changes the
+    # *model*, not the latent world state — so the transition is identity).
+    B_new.append([[1.0 if sp == s else 0.0 for s in range(n_states)] for sp in range(n_states)])
+
+    return CategoricalPOMDP(
+        A_new,
+        B_new,
+        list(pomdp.C),
+        list(pomdp.D),
+        list(pomdp.state_names),
+        list(pomdp.action_names) + ["synthesize_tool"],
+        list(pomdp.observation_names),
+    )
+
+
+@dataclass
+class ToolForagingAgent:
+    """Active-inference agent specialised for the synthesize_tool decision.
+
+    Wraps an :class:`ActiveInferenceAgent` over :func:`build_tool_foraging_pomdp`
+    and exposes a single method, :meth:`should_synthesize`, that returns
+    ``True`` when the EFE-minimising action is ``synthesize_tool``.  This is
+    the entry point the DMN calls during idle ticks.
+    """
+
+    pomdp: CategoricalPOMDP
+    agent: ActiveInferenceAgent = field(init=False)
+
+    def __post_init__(self) -> None:
+        self.agent = ActiveInferenceAgent(self.pomdp, horizon=1, learn=False)
+
+    @classmethod
+    def build(
+        cls,
+        *,
+        n_existing_tools: int = 0,
+        insufficient_prior: float = 0.5,
+    ) -> "ToolForagingAgent":
+        return cls(
+            pomdp=build_tool_foraging_pomdp(
+                n_existing_tools=int(n_existing_tools),
+                insufficient_prior=float(insufficient_prior),
+            )
+        )
+
+    def update_belief(self, *, insufficient_prior: float) -> None:
+        """Set the prior over ``knowledge_insufficient`` ahead of the next decision."""
+
+        pi = float(max(_EPS, min(1.0 - _EPS, insufficient_prior)))
+        self.pomdp.D = normalize([1.0 - pi, pi])
+        self.agent.qs = list(self.pomdp.D)
+
+    def decide(self) -> Decision:
+        return self.agent.decide()
+
+    def should_synthesize(self) -> bool:
+        d = self.decide()
+        return d.action_name == "synthesize_tool"
+
+    def observe(self, action_name: str, observation_name: str, *, lr: float = 1.0) -> list[float]:
+        """Update belief after seeing a real-world observation, e.g. ``info_gained`` or ``info_stagnant``."""
+
+        a = self.pomdp.action_names.index(str(action_name))
+        o = self.pomdp.observation_names.index(str(observation_name))
+        return self.agent.update(a, o, lr=lr)
+
+

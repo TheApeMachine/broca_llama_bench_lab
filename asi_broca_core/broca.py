@@ -12,7 +12,7 @@ import threading
 import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Sequence
+from typing import Any, Callable, Optional, Sequence
 
 import torch
 import torch.nn as nn
@@ -21,11 +21,19 @@ import torch.nn.functional as F
 from .active_inference import (
     ActiveInferenceAgent,
     CoupledEFEAgent,
+    ToolForagingAgent,
     build_causal_epistemic_pomdp,
     build_tiger_pomdp,
     entropy as belief_entropy,
 )
 from .causal import build_simpson_scm
+from .chunking import (
+    ChunkingDetectionConfig,
+    CompiledMacro,
+    DMNChunkingCompiler,
+    MacroChunkRegistry,
+    macro_frame_features,
+)
 from .continuous_frame import (
     COGNITIVE_FRAME_DIM,
     SKETCH_DIM,
@@ -48,6 +56,9 @@ from .hawkes import MultivariateHawkesProcess, PersistentHawkes, fit_excitation_
 from .preference_learning import DirichletPreference, PersistentPreference, feedback_polarity_from_text
 from .ontological_expansion import OntologicalRegistry, PersistentOntologicalRegistry
 from .causal_discovery import pc_algorithm, build_scm_from_skeleton
+from .native_tools import NativeTool, NativeToolRegistry, ToolSandbox, ToolSynthesisError
+from .dynamic_grafts import DynamicGraftSynthesizer, CapturedActivationMode, ACTIVATION_MODE_KIND
+from .memory import SQLiteActivationMemory
 
 logger = logging.getLogger(__name__)
 
@@ -1459,6 +1470,8 @@ class CognitiveBackgroundWorker:
             ("consolidation", self._phase1_consolidation),
             ("separation", self._phase2_separation),
             ("latent_discovery", self._phase3_latent_discovery),
+            ("chunk_compilation", self._phase4_chunk_compilation),
+            ("tool_foraging", self._phase5_tool_foraging),
         ):
             phase_started = time.time()
             try:
@@ -1820,6 +1833,114 @@ class CognitiveBackgroundWorker:
         except (RuntimeError, ValueError):
             logger.debug("DMN.phase3.transitive.similarity_failed a=%d b=%d", a, b, exc_info=True)
             return None
+
+    # ------------------------------------------------------------------ Phase 4
+
+    def _phase4_chunk_compilation(self) -> tuple[list[dict], dict[str, Any]]:
+        """Detect repeated motifs in the workspace journal and compile them into macros.
+
+        Implements the proceduralization side of the System-2 → System-1
+        transition: every repeated reasoning trajectory becomes a single
+        ``CompiledMacro`` whose mean feature vector is what the
+        :class:`TrainableBrocaGraft` injects when the substrate next sees the
+        macro's prefix.
+        """
+
+        compiler = getattr(self.mind, "chunking_compiler", None)
+        if compiler is None:
+            return [], {"compiled": 0, "candidates": 0, "scanned": 0}
+        result = compiler.run_once()
+        return list(result.get("reflections") or []), {
+            "compiled": int(result.get("compiled", 0)),
+            "candidates": int(result.get("candidates", 0)),
+            "scanned": int(result.get("scanned", 0)),
+        }
+
+    # ------------------------------------------------------------------ Phase 5
+
+    def _phase5_tool_foraging(self) -> tuple[list[dict], dict[str, Any]]:
+        """Decide whether the substrate should synthesize a new native tool.
+
+        We do **not** synthesize the tool here — that requires an LLM call to
+        produce candidate Python source and is therefore an external,
+        user-or-agent-driven step.  What we *do* run during DMN time is the
+        active-inference math itself: when the unified faculty's posterior is
+        confused (high entropy) and there are few existing tools, the EFE of
+        ``synthesize_tool`` collapses below the alternatives, and we emit a
+        ``tool_synthesis_recommended`` reflection so a downstream agent
+        knows to act.
+        """
+
+        agent = getattr(self.mind, "tool_foraging_agent", None)
+        unified = getattr(self.mind, "unified_agent", None)
+        registry = getattr(self.mind, "tool_registry", None)
+        if agent is None or unified is None or registry is None:
+            return [], {"ran": False}
+
+        try:
+            coupled = unified.decide()
+        except Exception:
+            logger.exception("DMN.phase5.tool_foraging: unified_agent.decide failed")
+            return [], {"ran": False, "error": True}
+
+        if coupled.faculty == "spatial":
+            posterior = list(coupled.spatial_decision.posterior_over_policies)
+        else:
+            posterior = list(coupled.causal_decision.posterior_over_policies)
+
+        n = len(posterior)
+        if n < 2:
+            insufficient_prior = 0.5
+        else:
+            h = belief_entropy(posterior)
+            h_max = math.log(n)
+            insufficient_prior = max(1e-6, min(1 - 1e-6, h / max(h_max, 1e-9)))
+
+        agent.update_belief(insufficient_prior=float(insufficient_prior))
+        decision = agent.decide()
+        recommended = decision.action_name == "synthesize_tool"
+
+        reflections: list[dict] = []
+        if recommended:
+            evidence = {
+                "action": decision.action_name,
+                "insufficient_prior": float(insufficient_prior),
+                "n_existing_tools": int(registry.count()),
+                "policy_efe": [
+                    {
+                        "policy": list(int(a) for a in p.policy),
+                        "expected_free_energy": float(p.expected_free_energy),
+                    }
+                    for p in decision.policies
+                ],
+                "instrument": "dmn_tool_foraging",
+                "coupled_faculty": coupled.faculty,
+            }
+            reflection_id = self.mind.memory.record_reflection(
+                "tool_synthesis_recommended",
+                "tool_foraging",
+                "synthesize_tool",
+                f"EFE math recommends synthesizing a new tool (insufficient_prior={insufficient_prior:.3f})",
+                evidence,
+                dedupe_key=f"tool_synthesis_recommended:{int(time.time() // 60)}",
+            )
+            if reflection_id is not None:
+                reflections.append({"id": reflection_id, "kind": "tool_synthesis_recommended", **evidence})
+                logger.info(
+                    "DMN.phase5.tool_foraging.recommend: id=%d insufficient_prior=%.3f n_tools=%d",
+                    reflection_id,
+                    insufficient_prior,
+                    registry.count(),
+                )
+
+        summary = {
+            "ran": True,
+            "recommended": recommended,
+            "insufficient_prior": float(insufficient_prior),
+            "n_existing_tools": int(registry.count()),
+            "chosen_action": decision.action_name,
+        }
+        return reflections, summary
 
     # ------------------------------------------------------------------ REM sleep
 
@@ -2522,6 +2643,39 @@ class BrocaMind:
         # substrate produced; the trainer pulls items from here at REM time.
         self.motor_replay: list[dict] = []
 
+        # Proceduralization (System 2 → System 1). The macro registry persists
+        # compiled motifs across processes; the compiler runs on every DMN tick
+        # and grows the registry as repeated reasoning patterns are detected.
+        self.macro_registry = MacroChunkRegistry(Path(db_path), namespace=f"{namespace}__macros")
+        self.chunking_compiler = DMNChunkingCompiler(self, registry=self.macro_registry)
+
+        # Native tool synthesis. Tools live in the same SQLite file but in their
+        # own namespace; ``attach_tools_to_scm`` rehydrates every persisted tool
+        # into the live SCM as an endogenous equation.
+        self.tool_registry = NativeToolRegistry(Path(db_path), namespace=f"{namespace}__tools")
+        try:
+            self.tool_registry.attach_to_scm(self.scm)
+        except Exception:
+            logger.exception("BrocaMind: initial tool attachment failed")
+
+        # Activation-memory-backed dynamic graft synthesizer. The same SQLite
+        # file backs the activation memory; modes are stored under their own
+        # kind so they don't collide with other activation rows.
+        self.activation_memory = SQLiteActivationMemory(
+            Path(db_path), default_namespace=f"{namespace}__activation"
+        )
+        self.dynamic_graft_synth = DynamicGraftSynthesizer(
+            self.activation_memory, namespace=f"{namespace}__activation"
+        )
+
+        # Tool foraging agent. The number of existing tools and the unified
+        # agent's posterior entropy together drive when ``synthesize_tool``
+        # wins on Expected Free Energy.
+        self.tool_foraging_agent = ToolForagingAgent.build(
+            n_existing_tools=self.tool_registry.count(),
+            insufficient_prior=0.5,
+        )
+
     @property
     def background_worker(self) -> CognitiveBackgroundWorker | None:
         return self._background_worker
@@ -2575,6 +2729,147 @@ class BrocaMind:
         """
 
         return self.vsa.encode_triple(subject, predicate, obj)
+
+    # -- Native tool synthesis -------------------------------------------------
+
+    def synthesize_native_tool(
+        self,
+        name: str,
+        source: str,
+        *,
+        function_name: str | None = None,
+        parents: Sequence[str],
+        domain: Sequence[Any],
+        sample_inputs: Sequence[dict],
+        description: str = "",
+        attach: bool = True,
+        overwrite: bool = False,
+    ) -> NativeTool:
+        """Compile, sandbox, verify, persist, and (optionally) attach a synthesized tool.
+
+        After synthesis the tool foraging agent's belief is updated to reflect
+        the larger toolbox, so the next ``synthesize_tool`` decision factors in
+        the additional coverage.
+        """
+
+        tool = self.tool_registry.synthesize(
+            name,
+            source,
+            function_name=function_name,
+            parents=parents,
+            domain=domain,
+            sample_inputs=sample_inputs,
+            description=description,
+            overwrite=overwrite,
+        )
+        if attach:
+            try:
+                self.tool_registry.attach_to_scm(self.scm)
+            except Exception:
+                logger.exception("BrocaMind.synthesize_native_tool: SCM re-attach failed")
+        # Rebuild the tool foraging agent so its likelihoods reflect the new tool count.
+        self.tool_foraging_agent = ToolForagingAgent.build(
+            n_existing_tools=self.tool_registry.count(),
+            insufficient_prior=0.5,
+        )
+        return tool
+
+    def attach_tools_to_scm(self) -> int:
+        """Re-attach every persisted native tool onto :attr:`scm`. Returns the count attached."""
+
+        return self.tool_registry.attach_to_scm(self.scm)
+
+    def should_synthesize_tool(self) -> bool:
+        """Run the tool foraging agent against the current substrate state.
+
+        The ``insufficient_prior`` is derived from the unified agent's
+        normalized posterior entropy: when the substrate is genuinely
+        confused (high entropy → high prior on ``knowledge_insufficient``)
+        the EFE math will prefer ``synthesize_tool`` over the alternatives.
+        """
+
+        try:
+            coupled = self.unified_agent.decide()
+        except Exception:
+            return False
+        # Use whichever faculty currently wins on EFE; its posterior entropy is
+        # the substrate's best self-estimate of confusion.
+        if coupled.faculty == "spatial":
+            posterior = list(coupled.spatial_decision.posterior_over_policies)
+        else:
+            posterior = list(coupled.causal_decision.posterior_over_policies)
+        n = len(posterior)
+        if n < 2:
+            insufficient_prior = 0.5
+        else:
+            h = belief_entropy(posterior)
+            h_max = math.log(n)
+            insufficient_prior = max(1e-6, min(1 - 1e-6, h / max(h_max, 1e-9)))
+        self.tool_foraging_agent.update_belief(insufficient_prior=float(insufficient_prior))
+        return self.tool_foraging_agent.should_synthesize()
+
+    # -- Proceduralization / macro lookup --------------------------------------
+
+    def recent_intents(self, *, limit: int = 8) -> list[str]:
+        try:
+            rows = self.journal.recent(limit=int(limit))
+        except Exception:
+            return []
+        return [str(r.get("intent", "") or "unknown") for r in rows]
+
+    def find_matching_macro(self, *, recent_intents: Sequence[str] | None = None) -> CompiledMacro | None:
+        """Return the most-observed macro whose prefix matches the recent intent tail."""
+
+        recent = list(recent_intents) if recent_intents is not None else self.recent_intents()
+        return self.macro_registry.find_macro_matching_prefix(recent)
+
+    def macro_speech_features(self, macro: CompiledMacro) -> torch.Tensor:
+        """Return the COGNITIVE_FRAME_DIM-shaped features the macro should inject via TrainableBrocaGraft."""
+
+        return macro_frame_features(macro)
+
+    # -- Dynamic graft synthesis -----------------------------------------------
+
+    def synthesize_activation_mode(
+        self,
+        *,
+        name: str,
+        prompt: str,
+        slot: str = "final_hidden",
+        query_mode: str = "sequence_mean",
+        value_mode: str = "mean_activation",
+        target_token: str | None = None,
+        confidence: float = 1.0,
+    ) -> CapturedActivationMode:
+        """Capture and persist an activation mode for the host (System-1 LLM tool).
+
+        The captured mode lives in :attr:`activation_memory` and can be loaded
+        into a :class:`KVMemoryGraft` via
+        :meth:`load_activation_modes_into_graft`.
+        """
+
+        return self.dynamic_graft_synth.synthesize(
+            self.host,
+            self.tokenizer,
+            name=name,
+            prompt=prompt,
+            slot=slot,
+            query_mode=query_mode,
+            value_mode=value_mode,
+            target_token=target_token,
+            confidence=float(confidence),
+        )
+
+    def load_activation_modes_into_graft(
+        self,
+        graft: Any,
+        *,
+        names: Optional[Sequence[str]] = None,
+        clear_first: bool = True,
+    ) -> int:
+        return self.dynamic_graft_synth.load_modes(
+            graft, names=names, clear_first=clear_first
+        )
 
     def vector_for_concept(self, name: str, *, base_sketch: torch.Tensor | None = None) -> torch.Tensor:
         """Return the substrate's preferred vector for a concept name.
