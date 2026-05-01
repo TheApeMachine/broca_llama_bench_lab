@@ -19,7 +19,9 @@ Override with environment variables:
   LOG_FILE_MAX_BYTES — rotating size cap (default: 16 MB).
   LOG_FILE_BACKUPS — number of rotated backups to keep (default: 4).
 
-Idempotent: calling more than once is a no-op after the first configuration.
+Idempotent: calling more than once is a no-op after the first configuration
+(beginning ``configure_lab_logging`` sets the configured flag immediately so handler
+installation cannot partially double-run across threads).
 """
 
 from __future__ import annotations
@@ -85,6 +87,7 @@ def configure_lab_logging() -> None:
     with _CONFIG_LOCK:
         if _CONFIGURED:
             return
+        _CONFIGURED = True
 
         silent = _truthy(os.environ.get("LOG_SILENT"))
         base_level = _resolve_level(
@@ -141,5 +144,3 @@ def configure_lab_logging() -> None:
                         file=sys.stderr,
                         flush=True,
                     )
-
-        _CONFIGURED = True

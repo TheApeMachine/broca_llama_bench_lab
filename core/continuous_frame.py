@@ -115,23 +115,31 @@ def stable_sketch(text: str, *, dim: int = SKETCH_DIM, n_seeds: int = SKETCH_SEE
 
 
 class FrozenSubwordProjector:
-    """Project frozen tokenizer embedding averages into the frame sketch space."""
+    """Project frozen tokenizer embedding averages into the frame sketch space.
+
+    Projection output dim is fixed to :data:`SKETCH_DIM` so ``pack_cognitive_frame`` /
+    ``_encode_or_sketch`` agree on vector size.
+
+    By default ``embedding_weight`` is stored as ``embedding_weight.detach()`` (no copy).
+    The caller must not mutate that tensor afterward. Pass ``clone_embedding=True`` to
+    take an independent copy when the underlying weight buffer may be updated in place.
+    """
 
     def __init__(
         self,
         tokenizer: Any,
         embedding_weight: torch.Tensor,
         *,
-        dim: int = SKETCH_DIM,
         seed: int = 0,
+        clone_embedding: bool = False,
     ) -> None:
         self.tokenizer = tokenizer
-        self.dim = int(dim)
-        weight = embedding_weight.detach().clone()
-        self.embedding_weight = weight
+        self.dim = int(SKETCH_DIM)
+        w = embedding_weight.detach()
+        self.embedding_weight = w.clone() if clone_embedding else w
         g = torch.Generator(device="cpu")
         g.manual_seed(int(seed))
-        self.projection = torch.empty((weight.shape[1], self.dim), dtype=torch.float32)
+        self.projection = torch.empty((self.embedding_weight.shape[1], self.dim), dtype=torch.float32)
         self.projection.normal_(mean=0.0, std=1.0 / math.sqrt(float(self.dim)), generator=g)
 
     def _encode(self, text: str) -> list[int]:
@@ -160,8 +168,8 @@ def frozen_subword_projector_from_model(
     model: Any,
     tokenizer: Any,
     *,
-    dim: int = SKETCH_DIM,
     seed: int = 0,
+    clone_embedding: bool = False,
 ) -> FrozenSubwordProjector | None:
     """Build a frame-space projector from a host model's frozen input embeddings."""
 
@@ -174,7 +182,7 @@ def frozen_subword_projector_from_model(
     weight = getattr(emb, "weight", None)
     if weight is None:
         return None
-    return FrozenSubwordProjector(tokenizer, weight, dim=dim, seed=seed)
+    return FrozenSubwordProjector(tokenizer, weight, seed=seed, clone_embedding=clone_embedding)
 
 
 def _encode_or_sketch(text: str, text_encoder: TextEncoder | None) -> torch.Tensor:

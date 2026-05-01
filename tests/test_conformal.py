@@ -94,7 +94,33 @@ def test_persistent_calibration_round_trip(tmp_path: Path):
     fresh = ConformalPredictor(alpha=0.1, method="lac")
     store.hydrate(fresh, channel="rel")
     assert len(fresh) == len(predictor)
-    assert fresh.get_scores() == predictor.get_scores()
+    assert fresh.scores == predictor.scores
+
+
+def test_conformal_set_p_values_emits_deprecation():
+    result = ConformalPredictor(alpha=0.1, method="lac").predict_set({"a": 1.0})
+    with pytest.warns(DeprecationWarning, match="label_probs"):
+        _ = result.p_values
+
+
+def test_conformal_predictor_get_scores_emits_deprecation():
+    p = ConformalPredictor(alpha=0.1, method="lac")
+    p.calibrate(0.5)
+    with pytest.warns(DeprecationWarning, match="scores"):
+        assert p.get_scores() == p.scores
+
+
+def test_aps_predict_set_label_probs_full_distribution():
+    rng = random.Random(0)
+    predictor = ConformalPredictor(alpha=0.05, method="aps", min_calibration=1)
+    for _ in range(20):
+        dist, label = _synthetic_calibration(rng, 1)[0]
+        predictor.calibrate(p_distribution=dist, true_label=label)
+    query = {"x": 0.5, "y": 0.3, "z": 0.2}
+    result = predictor.predict_set(query)
+    assert set(result.label_probs.keys()) == set(query.keys())
+    assert sum(result.label_probs.values()) == pytest.approx(1.0, abs=1e-6)
+    assert len(result.labels) <= len(query)
 
 
 def test_threshold_monotonic_in_alpha():

@@ -24,7 +24,9 @@ from __future__ import annotations
 import logging
 import math
 import sqlite3
+import threading
 import time
+import warnings
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, Mapping, Sequence
@@ -59,8 +61,18 @@ class ConformalSet:
 
     @property
     def p_values(self) -> dict[str, float]:
-        """Backward-compatible alias for :attr:`label_probs` (model probabilities, not conformal p-values)."""
+        """Deprecated alias for :attr:`label_probs`.
 
+        This field holds model-estimated probabilities, not conformal *p*-values.
+
+        Prefer :attr:`label_probs`.
+        """
+
+        warnings.warn(
+            "Conformal.p_values is deprecated; use Conformal.label_probs instead",
+            DeprecationWarning,
+            stacklevel=2,
+        )
         return self.label_probs
 
     @property
@@ -110,9 +122,12 @@ class ConformalPredictor:
         return list(self._scores)
 
     def get_scores(self) -> list[float]:
-        """Public copy of calibration scores (same as :attr:`scores`)."""
-
-        return list(self._scores)
+        warnings.warn(
+            "ConformalPredictor.get_scores() is deprecated; use ConformalPredictor.scores instead",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        return self.scores
 
     def __len__(self) -> int:
         return len(self._scores)
@@ -186,11 +201,11 @@ class ConformalPredictor:
                 if score <= threshold or not math.isfinite(threshold):
                     labels.append(label)
         else:
+            label_probs = {str(lab): float(p) for lab, p in distribution.items()}
             ranked = sorted(distribution.items(), key=lambda kv: -float(kv[1]))
             cumulative = 0.0
             for label, p in ranked:
                 cumulative += float(p)
-                label_probs[label] = float(p)
                 labels.append(label)
                 if cumulative >= threshold or not math.isfinite(threshold):
                     break
@@ -230,15 +245,19 @@ class PersistentConformalCalibration:
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.namespace = namespace
+        self._conn: sqlite3.Connection | None = None
+        self._lock = threading.RLock()
         self._init_schema()
 
-    def _connect(self) -> sqlite3.Connection:
-        con = sqlite3.connect(self.path)
-        con.execute("PRAGMA journal_mode=WAL")
-        return con
+    def _ensure_conn_locked(self) -> sqlite3.Connection:
+        if self._conn is None:
+            self._conn = sqlite3.connect(str(self.path), check_same_thread=False)
+            self._conn.execute("PRAGMA journal_mode=WAL")
+        return self._conn
 
     def _init_schema(self) -> None:
-        with self._connect() as con:
+        with self._lock:
+            con = self._ensure_conn_locked()
             con.execute(
                 """
                 CREATE TABLE IF NOT EXISTS conformal_scores (
@@ -257,7 +276,8 @@ class PersistentConformalCalibration:
             )
 
     def add(self, channel: str, method: str, score: float, label: str = "") -> int:
-        with self._connect() as con:
+        with self._lock:
+            con = self._ensure_conn_locked()
             cur = con.execute(
                 "INSERT INTO conformal_scores(namespace, channel, method, score, label, created_at) VALUES (?,?,?,?,?,?)",
                 (
@@ -272,7 +292,8 @@ class PersistentConformalCalibration:
             return int(cur.lastrowid)
 
     def scores(self, channel: str, method: str) -> list[float]:
-        with self._connect() as con:
+        with self._lock:
+            con = self._ensure_conn_locked()
             rows = con.execute(
                 "SELECT score FROM conformal_scores WHERE namespace=? AND channel=? AND method=? ORDER BY id",
                 (self.namespace, channel, method),
@@ -284,8 +305,7 @@ class PersistentConformalCalibration:
     ) -> ConformalPredictor:
         """Reload a predictor's calibration set from disk."""
 
-        scores = self.scores(channel, predictor.method)
-        predictor.load_scores(list(scores))
+        predictor.load_scores(self.scores(channel, predictor.method))
         return predictor
 
     def persist(
@@ -312,13 +332,31 @@ class PersistentConformalCalibration:
                     channel,
                     predictor.method,
                 )
-                with self._connect() as con:
-                    con.execute(
-                        "DELETE FROM conformal_scores WHERE namespace=? AND channel=? AND method=?",
-                        (self.namespace, channel, predictor.method),
-                    )
-                for s in mem:
-                    self.add(channel, predictor.method, float(s), label)
+                with self._lock:
+                    con = self._ensure_conn_locked()
+                    con.execute("BEGIN IMMEDIATE")
+                    try:
+                        con.execute(
+                            "DELETE FROM conformal_scores WHERE namespace=? AND channel=? AND method=?",
+                            (self.namespace, channel, predictor.method),
+                        )
+                        ts = time.time()
+                        for s in mem:
+                            con.execute(
+                                "INSERT INTO conformal_scores(namespace, channel, method, score, label, created_at) VALUES (?,?,?,?,?,?)",
+                                (
+                                    self.namespace,
+                                    channel,
+                                    predictor.method,
+                                    float(s),
+                                    str(label),
+                                    ts,
+                                ),
+                            )
+                        con.commit()
+                    except Exception:
+                        con.rollback()
+                        raise
                 return
         new_tail = mem[len(existing) :]
         for s in new_tail:

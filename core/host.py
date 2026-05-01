@@ -9,6 +9,11 @@ def freeze_module(module: nn.Module) -> None:
 
 
 def count_parameters(module: nn.Module) -> tuple[int, int]:
-    total = sum(p.numel() for p in module.parameters())
-    trainable = sum(p.numel() for p in module.parameters() if p.requires_grad)
+    total = 0
+    trainable = 0
+    for p in module.parameters():
+        n = p.numel()
+        total += n
+        if p.requires_grad:
+            trainable += n
     return total, trainable

@@ -31,6 +31,16 @@ For real Llama + HuggingFace datasets benchmarks:
 pip install -r requirements-benchmark.txt
 ```
 
+## Logging
+
+Importing `core` does not reconfigure global logging by default. To apply the lab log format on import, set:
+
+```bash
+export AUTO_CONFIGURE_LAB_LOGGING=1
+```
+
+(`true` is also accepted.) Otherwise call `configure_lab_logging()` from `core` after import.
+
 `meta-llama/Llama-3.2-1B-Instruct` is a gated Hugging Face model. Use one of:
 
 ```bash

@@ -14,6 +14,7 @@ checkpoint is gated on the Hugging Face Hub, so real runs normally require
 from __future__ import annotations
 
 import argparse
+import csv
 import dataclasses
 import datetime as _dt
 import itertools
@@ -25,7 +26,7 @@ import re
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Iterable, Iterator, Mapping, Sequence
+from typing import Any, Callable, Iterable, Iterator, Mapping, Protocol, Sequence
 
 import torch
 import torch.nn.functional as F
@@ -59,6 +60,8 @@ class BenchmarkExample:
 
     For ``mode='mc'``, ``choices`` and ``gold_index`` are used.  The harness
     scores each continuation under the model and picks the maximum.
+    ``gold_index`` may be ``None`` when the split row has no usable gold label
+    (e.g. malformed Winogrande answers).
     For ``mode='generate'``, ``expected_text`` is compared with parsed model
     generations.
     """
@@ -91,17 +94,28 @@ def _clean(s: Any) -> str:
     return " ".join(str(s).replace("\n", " ").split())
 
 
+def _choice_label_at(i: int) -> str:
+    """Map 0-based choice index to Excel-style labels (A..Z, AA, AB, ...)."""
+
+    n = i + 1
+    label = ""
+    while n > 0:
+        n, r = divmod(n - 1, 26)
+        label = chr(65 + r) + label
+    return label
+
+
 def _lettered_prompt(question: str, choices: Sequence[str], *, prefix: str = "Question") -> str:
     lines = [f"{prefix}: {_clean(question)}", "Choices:"]
     for i, choice in enumerate(choices):
-        label = _LETTERS[i]
+        label = _choice_label_at(i)
         lines.append(f"{label}. {_clean(choice)}")
     lines.append("Answer:")
     return "\n".join(lines)
 
 
 def _choice_labels(n: int) -> tuple[str, ...]:
-    return tuple(f" {_LETTERS[i]}" for i in range(n))
+    return tuple(f" {_choice_label_at(i)}" for i in range(n))
 
 
 def _find_answer_key_index(labels: Sequence[Any], answer_key: Any) -> int | None:
@@ -161,7 +175,17 @@ def build_winogrande(row: Mapping[str, Any], idx: int) -> BenchmarkExample:
     else:
         prefix, suffix = sentence, ""
     choices = (str(row["option1"]) + suffix, str(row["option2"]) + suffix)
-    gold = int(row["answer"]) - 1
+    raw = row.get("answer")
+    gold: int | None
+    if raw is None or (isinstance(raw, str) and not str(raw).strip()):
+        gold = None
+    else:
+        try:
+            parsed = int(str(raw).strip())
+        except ValueError:
+            gold = None
+        else:
+            gold = parsed - 1 if parsed in (1, 2) else None
     return BenchmarkExample(
         "winogrande",
         str(idx),
@@ -264,9 +288,6 @@ def resolve_task_names(tasks: str | Sequence[str] | None = None, *, preset: str 
 
 def _take_rows(ds: Iterable[Mapping[str, Any]], *, limit: int | None, seed: int, shuffle: bool) -> list[tuple[int, Mapping[str, Any]]]:
     indexed: list[tuple[int, Mapping[str, Any]]] = []
-    if shuffle and hasattr(ds, "shuffle") and not hasattr(ds, "__iter__"):
-        # In practice Dataset has both, so the generic path below handles shuffling.
-        pass
     for i, row in enumerate(ds):
         indexed.append((i, row))
         if limit is not None and not shuffle and len(indexed) >= limit:
@@ -346,6 +367,36 @@ def normalize_number_text(text: str) -> str:
     return x
 
 
+def _shared_hf_format_prompt(tokenizer: Any, prompt: str, *, chat_template: bool) -> str:
+    if not chat_template:
+        return prompt
+    tmpl = getattr(tokenizer, "apply_chat_template", None)
+    if not callable(tmpl):
+        return prompt
+    return str(tmpl([{"role": "user", "content": prompt}], tokenize=False, add_generation_prompt=True))
+
+
+def _shared_hf_encode_context_choice(
+    tokenizer: Any,
+    max_seq_len: int,
+    context: str,
+    choice: str,
+) -> tuple[list[int], int, int]:
+    tok = tokenizer
+    context_ids = list(tok.encode(context, add_special_tokens=False))
+    choice_ids = list(tok.encode(choice, add_special_tokens=False))
+    if not choice_ids:
+        choice_ids = list(tok.encode(" " + choice, add_special_tokens=False))
+    bos = getattr(tok, "bos_token_id", None)
+    prefix_extra = 1 if bos is not None else 0
+    budget_context = max(0, max_seq_len - len(choice_ids) - prefix_extra)
+    if len(context_ids) > budget_context:
+        context_ids = context_ids[-budget_context:]
+    ids = ([int(bos)] if bos is not None else []) + context_ids + choice_ids
+    cont_start = prefix_extra + len(context_ids)
+    return ids, cont_start, len(choice_ids)
+
+
 class HFLocalCausalLM:
     """A small local evaluator around ``transformers.AutoModelForCausalLM``."""
 
@@ -382,7 +433,7 @@ class HFLocalCausalLM:
             self.tokenizer.pad_token = self.tokenizer.eos_token
             self.tokenizer.pad_token_id = int(self.tokenizer.eos_token_id)
         model_kwargs = dict(
-            dtype=self.dtype,
+            torch_dtype=self.dtype,
             low_cpu_mem_usage=True,
             token=self.token_arg,
             trust_remote_code=trust_remote_code,
@@ -399,30 +450,13 @@ class HFLocalCausalLM:
         self.max_seq_len = int(max_seq_len or min(cfg_len, 4096))
 
     def format_prompt(self, prompt: str, *, chat_template: bool = False) -> str:
-        if not chat_template:
-            return prompt
-        tmpl = getattr(self.tokenizer, "apply_chat_template", None)
-        if not callable(tmpl):
-            return prompt
-        return str(tmpl([{"role": "user", "content": prompt}], tokenize=False, add_generation_prompt=True))
+        return _shared_hf_format_prompt(self.tokenizer, prompt, chat_template=chat_template)
 
     def _encode_context_choice(self, context: str, choice: str) -> tuple[list[int], int, int]:
-        tok = self.tokenizer
-        context_ids = list(tok.encode(context, add_special_tokens=False))
-        choice_ids = list(tok.encode(choice, add_special_tokens=False))
-        if not choice_ids:
-            choice_ids = list(tok.encode(" " + choice, add_special_tokens=False))
-        bos = getattr(tok, "bos_token_id", None)
-        prefix_extra = 1 if bos is not None else 0
-        budget_context = max(0, self.max_seq_len - len(choice_ids) - prefix_extra)
-        if len(context_ids) > budget_context:
-            context_ids = context_ids[-budget_context:]
-        ids = ([int(bos)] if bos is not None else []) + context_ids + choice_ids
-        cont_start = prefix_extra + len(context_ids)
-        return ids, cont_start, len(choice_ids)
+        return _shared_hf_encode_context_choice(self.tokenizer, self.max_seq_len, context, choice)
 
     @torch.no_grad()
-    def score_choices(self, prompt: str, choices: Sequence[str], *, normalize: bool = True, chat_template: bool = False) -> ChoicePrediction | tuple[list[float], list[float], list[int]]:
+    def score_choices(self, prompt: str, choices: Sequence[str], *, normalize: bool = True, chat_template: bool = False) -> tuple[list[float], list[float], list[int]]:
         context = self.format_prompt(prompt, chat_template=chat_template)
         encoded = [self._encode_context_choice(context, c) for c in choices]
         max_len = max(len(ids) for ids, _, _ in encoded)
@@ -515,30 +549,13 @@ class HFLocalLlamaBrocaShell:
         return self
 
     def format_prompt(self, prompt: str, *, chat_template: bool = False) -> str:
-        if not chat_template:
-            return prompt
-        tmpl = getattr(self.tokenizer, "apply_chat_template", None)
-        if not callable(tmpl):
-            return prompt
-        return str(tmpl([{"role": "user", "content": prompt}], tokenize=False, add_generation_prompt=True))
+        return _shared_hf_format_prompt(self.tokenizer, prompt, chat_template=chat_template)
 
     def _encode_context_choice(self, context: str, choice: str) -> tuple[list[int], int, int]:
-        tok = self.tokenizer
-        context_ids = list(tok.encode(context, add_special_tokens=False))
-        choice_ids = list(tok.encode(choice, add_special_tokens=False))
-        if not choice_ids:
-            choice_ids = list(tok.encode(" " + choice, add_special_tokens=False))
-        bos = getattr(tok, "bos_token_id", None)
-        prefix_extra = 1 if bos is not None else 0
-        budget_context = max(0, self.max_seq_len - len(choice_ids) - prefix_extra)
-        if len(context_ids) > budget_context:
-            context_ids = context_ids[-budget_context:]
-        ids = ([int(bos)] if bos is not None else []) + context_ids + choice_ids
-        cont_start = prefix_extra + len(context_ids)
-        return ids, cont_start, len(choice_ids)
+        return _shared_hf_encode_context_choice(self.tokenizer, self.max_seq_len, context, choice)
 
     @torch.no_grad()
-    def score_choices(self, prompt: str, choices: Sequence[str], *, normalize: bool = True, chat_template: bool = False) -> ChoicePrediction | tuple[list[float], list[float], list[int]]:
+    def score_choices(self, prompt: str, choices: Sequence[str], *, normalize: bool = True, chat_template: bool = False) -> tuple[list[float], list[float], list[int]]:
         context = self.format_prompt(prompt, chat_template=chat_template)
         encoded = [self._encode_context_choice(context, c) for c in choices]
         max_len = max(len(ids) for ids, _, _ in encoded)
@@ -588,14 +605,21 @@ class HFLocalLlamaBrocaShell:
         ).strip()
 
 
-class BenchmarkBackendProtocol:
-    """Duck-typed protocol used by tests and by ``HFLocalCausalLM``."""
+class BenchmarkBackendProtocol(Protocol):
+    """Structural protocol for MC scoring and greedy generation backends."""
 
-    def score_choices(self, prompt: str, choices: Sequence[str], *, normalize: bool = True, chat_template: bool = False):
-        raise NotImplementedError
+    def score_choices(
+        self,
+        prompt: str,
+        choices: Sequence[str],
+        *,
+        normalize: bool = True,
+        chat_template: bool = False,
+    ) -> tuple[list[float], list[float], list[int]]:
+        ...
 
     def generate(self, prompt: str, *, max_new_tokens: int = 128, chat_template: bool = True) -> str:
-        raise NotImplementedError
+        ...
 
 
 def evaluate_example(
@@ -625,7 +649,7 @@ def evaluate_example(
             "metadata": ex.metadata,
         }
     if ex.mode == "generate":
-        pred_text = backend.generate(ex.prompt, max_new_tokens=generation_max_new_tokens, chat_template=True)
+        pred_text = backend.generate(ex.prompt, max_new_tokens=generation_max_new_tokens, chat_template=chat_template)
         expected = str(ex.expected_text or "")
         # GSM8K is numeric; other future gen tasks can use normalized exact.
         if ex.task == "gsm8k":
@@ -658,6 +682,106 @@ def summarize_rows(rows: Sequence[dict[str, Any]]) -> dict[str, Any]:
         "correct": correct,
         "accuracy": correct / len(rows),
     }
+
+
+def export_csv(results: Mapping[str, Any], out_dir: Path) -> None:
+    """Write per-task metrics and aggregate summary as CSV files."""
+
+    out_dir = Path(out_dir)
+    per_task = results.get("per_task") or {}
+    fieldnames = ("task", "n", "correct", "accuracy", "seconds")
+    task_rows: list[dict[str, Any]] = []
+    for task in sorted(per_task.keys()):
+        m = per_task[task]
+        if not isinstance(m, Mapping):
+            continue
+        task_rows.append({
+            "task": task,
+            "n": m.get("n", ""),
+            "correct": m.get("correct", ""),
+            "accuracy": m.get("accuracy", ""),
+            "seconds": m.get("seconds", ""),
+        })
+    per_path = out_dir / "per_task.csv"
+    if task_rows:
+        with per_path.open("w", newline="", encoding="utf-8") as f:
+            w = csv.DictWriter(f, fieldnames=list(fieldnames))
+            w.writeheader()
+            w.writerows(task_rows)
+    agg = results.get("aggregate") or {}
+    agg_path = out_dir / "aggregate.csv"
+    with agg_path.open("w", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        w.writerow(("metric", "value"))
+        for k in sorted(agg.keys()):
+            w.writerow((k, agg[k]))
+
+
+def plot_results(results: Mapping[str, Any], out_dir: Path) -> None:
+    """Save a per-task accuracy bar chart (PNG) when matplotlib is available."""
+
+    try:
+        import matplotlib.pyplot as plt
+        import seaborn as sns
+    except ImportError:  # pragma: no cover - optional benchmark extra
+        return
+    out_dir = Path(out_dir)
+    per_task = results.get("per_task") or {}
+    tasks: list[str] = []
+    accs: list[float] = []
+    for task in sorted(per_task.keys()):
+        m = per_task[task]
+        if not isinstance(m, Mapping):
+            continue
+        try:
+            accs.append(float(m["accuracy"]))
+            tasks.append(task)
+        except (KeyError, TypeError, ValueError):
+            continue
+    if not tasks:
+        return
+    sns.set_theme(style="whitegrid")
+    fig, ax = plt.subplots(figsize=(max(6.0, 0.35 * len(tasks)), 4.0))
+    ax.bar(tasks, accs, color=sns.color_palette("deep", n_colors=1)[0])
+    ax.set_ylim(0.0, 1.0)
+    ax.set_ylabel("accuracy")
+    ax.set_xlabel("task")
+    ax.set_title(str(results.get("model_id", "model")))
+    plt.setp(ax.get_xticklabels(), rotation=40, ha="right")
+    fig.tight_layout()
+    fig.savefig(out_dir / "accuracy_by_task.png", dpi=150)
+    plt.close(fig)
+
+
+def render_latex_table(results: Mapping[str, Any], out_dir: Path) -> None:
+    """Emit a small LaTeX ``tabular`` snippet for the per-task accuracies."""
+
+    out_dir = Path(out_dir)
+    per_task = results.get("per_task") or {}
+    lines = [
+        r"\begin{tabular}{lrr}",
+        r"\hline",
+        r"Task & $n$ & Accuracy \\",
+        r"\hline",
+    ]
+    for task in sorted(per_task.keys()):
+        m = per_task[task]
+        if not isinstance(m, Mapping):
+            continue
+        safe_task = str(task).replace("_", r"\_")
+        lines.append(
+            f"{safe_task} & {m.get('n', '')} & {float(m.get('accuracy', 0.0)):.4f} \\\\",
+        )
+    lines.extend([r"\hline", r"\end{tabular}", ""])
+    (out_dir / "summary_table.tex").write_text("\n".join(lines), encoding="utf-8")
+
+
+def generate_artifacts(results: Mapping[str, Any], out_dir: str | Path) -> None:
+    """Publication-oriented exports matching the structure of ``summary.json``."""
+
+    export_csv(results, Path(out_dir))
+    plot_results(results, Path(out_dir))
+    render_latex_table(results, Path(out_dir))
 
 
 def evaluate_task(
@@ -904,6 +1028,10 @@ def run_hf_datasets_benchmark(
         "artifacts": {
             "summary": "summary.json",
             "task_jsonl": [f"{t}.jsonl" for t in tasks],
+            "per_task_csv": "per_task.csv",
+            "aggregate_csv": "aggregate.csv",
+            "accuracy_plot_png": "accuracy_by_task.png",
+            "latex_table": "summary_table.tex",
         },
     }
 
@@ -964,6 +1092,7 @@ def run_hf_datasets_benchmark(
 
     (out / "summary.json").write_text(json.dumps(result, indent=2, ensure_ascii=False), encoding="utf-8")
     print(f"\nWrote summary.json -> {out / 'summary.json'}", flush=True)
+    generate_artifacts(result, out)
     return result
 
 
@@ -995,7 +1124,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
 def main(argv: Sequence[str] | None = None) -> None:
     args = build_arg_parser().parse_args(argv)
     tasks = resolve_task_names(args.tasks, preset=args.preset)
-    limit = None if args.limit is not None and int(args.limit) < 0 else int(args.limit)
+    limit = None if args.limit is not None and args.limit < 0 else args.limit
     hf_tok_raw = os.environ.get("HF_TOKEN")
     hf_token: str | bool | None = hf_tok_raw if hf_tok_raw and hf_tok_raw.strip() else None
     run_hf_datasets_benchmark(

@@ -55,19 +55,21 @@ class EpisodeAssociationGraph:
         lo, hi = (ia, ib) if ia < ib else (ib, ia)
         now = time.time()
         with self._connect() as con:
-            row = con.execute(
-                "SELECT weight FROM episode_association WHERE lo=? AND hi=?",
-                (lo, hi),
-            ).fetchone()
-            w = float(row[0]) + float(delta) if row else float(delta)
             con.execute(
                 """
                 INSERT INTO episode_association(lo, hi, weight, updated_at)
                 VALUES (?,?,?,?)
-                ON CONFLICT(lo, hi) DO UPDATE SET weight=excluded.weight, updated_at=excluded.updated_at
+                ON CONFLICT(lo, hi) DO UPDATE SET
+                    weight = episode_association.weight + excluded.weight,
+                    updated_at = excluded.updated_at
                 """,
-                (lo, hi, w, now),
+                (lo, hi, float(delta), now),
             )
+            row = con.execute(
+                "SELECT weight FROM episode_association WHERE lo=? AND hi=?",
+                (lo, hi),
+            ).fetchone()
+            w = float(row[0]) if row else float(delta)
             logger.debug(
                 "EpisodeAssociationGraph.bump: lo=%s hi=%s weight=%s", lo, hi, w
             )
@@ -193,6 +195,8 @@ class EpisodeAssociationGraph:
             new_rank = {node: teleport for node in nodes}
             for src, neighbors in adj.items():
                 total = out_weight[src]
+                if total <= 0.0 or math.isclose(total, 0.0):
+                    continue
                 share = d * rank[src] / total
                 for dst, w in neighbors:
                     new_rank[dst] += share * w
@@ -206,20 +210,31 @@ def merge_epistemic_evidence_dict(base: dict, incoming: dict) -> dict:
     """Union-merge provenance lists used across semantic rows and frames."""
 
     out = dict(base)
-    for key in ("episode_ids", "instruments"):
-        if key not in incoming:
-            continue
-        cur = list(out.get(key) or [])
-        seen = set(cur)
-        for x in incoming[key]:
-            if x not in seen:
-                seen.add(x)
-                cur.append(x)
-        out[key] = cur
+    ep_list = list(out.get("episode_ids") or [])
+    ep_seen = set(ep_list)
+
+    instruments_list = list(out.get("instruments") or [])
+    inst_seen = set(instruments_list)
+
+    if "instruments" in incoming:
+        for x in incoming["instruments"]:
+            if x not in inst_seen:
+                inst_seen.add(x)
+                instruments_list.append(x)
+
+    if "episode_ids" in incoming:
+        for x in incoming["episode_ids"]:
+            if x not in ep_seen:
+                ep_seen.add(x)
+                ep_list.append(x)
+
     if "journal_id" in incoming and incoming["journal_id"] is not None:
-        jcur = list(out.get("episode_ids") or [])
         jid = int(incoming["journal_id"])
-        if jid not in jcur:
-            jcur.append(jid)
-            out["episode_ids"] = jcur
+        if jid not in ep_seen:
+            ep_seen.add(jid)
+            ep_list.append(jid)
+
+    out["episode_ids"] = ep_list
+    if "instruments" in base or "instruments" in incoming:
+        out["instruments"] = instruments_list
     return out

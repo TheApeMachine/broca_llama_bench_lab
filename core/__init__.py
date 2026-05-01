@@ -1,5 +1,6 @@
 __version__ = "0.5.0-llama-bench"
 
+import os
 from typing import Any
 
 from .logging_setup import configure_lab_logging
@@ -45,43 +46,35 @@ from .continuous_frame import (
 )
 from .vsa import bind, unbind, bundle, permute, hypervector, cleanup
 
-# Heavy / optional: load on first attribute access (PEP 562).
-from .chunking import (
-    ChunkingDetectionConfig,
-    CompiledMacro,
-    DMNChunkingCompiler,
-    MacroChunkRegistry,
-    macro_frame_features,
-)
-from .native_tools import (
-    NativeTool,
-    NativeToolRegistry,
-    SandboxResult,
-    ToolSandbox,
-    ToolSynthesisError,
-)
-from .dynamic_grafts import (
-    ACTIVATION_MODE_KIND,
-    CapturedActivationMode,
-    DynamicGraftSynthesizer,
-    capture_activation_mode,
-)
-from .top_down_control import (
-    CausalConstraint,
-    CausalConstraintGraft,
-    EpistemicInterruptionMonitor,
-    EpistemicInterruptionResult,
-    HypothesisAttempt,
-    HypothesisMaskingGraft,
-    HypothesisSearchResult,
-    HypothesisVerdict,
-    InterruptionEvent,
-    InterruptionVerdict,
-    IterativeHypothesisSearch,
-    ModalityShiftGraft,
-)
+# Optional / heavier subsystems: imported on first attribute access via __getattr__ (PEP 562).
 
 _LAZY_EXPORTS: dict[str, tuple[str, str]] = {
+    "ChunkingDetectionConfig": (".chunking", "ChunkingDetectionConfig"),
+    "CompiledMacro": (".chunking", "CompiledMacro"),
+    "DMNChunkingCompiler": (".chunking", "DMNChunkingCompiler"),
+    "MacroChunkRegistry": (".chunking", "MacroChunkRegistry"),
+    "macro_frame_features": (".chunking", "macro_frame_features"),
+    "NativeTool": (".native_tools", "NativeTool"),
+    "NativeToolRegistry": (".native_tools", "NativeToolRegistry"),
+    "SandboxResult": (".native_tools", "SandboxResult"),
+    "ToolSandbox": (".native_tools", "ToolSandbox"),
+    "ToolSynthesisError": (".native_tools", "ToolSynthesisError"),
+    "ACTIVATION_MODE_KIND": (".dynamic_grafts", "ACTIVATION_MODE_KIND"),
+    "CapturedActivationMode": (".dynamic_grafts", "CapturedActivationMode"),
+    "DynamicGraftSynthesizer": (".dynamic_grafts", "DynamicGraftSynthesizer"),
+    "capture_activation_mode": (".dynamic_grafts", "capture_activation_mode"),
+    "CausalConstraint": (".top_down_control", "CausalConstraint"),
+    "CausalConstraintGraft": (".top_down_control", "CausalConstraintGraft"),
+    "EpistemicInterruptionMonitor": (".top_down_control", "EpistemicInterruptionMonitor"),
+    "EpistemicInterruptionResult": (".top_down_control", "EpistemicInterruptionResult"),
+    "HypothesisAttempt": (".top_down_control", "HypothesisAttempt"),
+    "HypothesisMaskingGraft": (".top_down_control", "HypothesisMaskingGraft"),
+    "HypothesisSearchResult": (".top_down_control", "HypothesisSearchResult"),
+    "HypothesisVerdict": (".top_down_control", "HypothesisVerdict"),
+    "InterruptionEvent": (".top_down_control", "InterruptionEvent"),
+    "InterruptionVerdict": (".top_down_control", "InterruptionVerdict"),
+    "IterativeHypothesisSearch": (".top_down_control", "IterativeHypothesisSearch"),
+    "ModalityShiftGraft": (".top_down_control", "ModalityShiftGraft"),
     "VSACodebook": (".vsa", "VSACodebook"),
     "vsa_cosine": (".vsa", "cosine"),
     "HopfieldAssociativeMemory": (".hopfield", "HopfieldAssociativeMemory"),
@@ -118,10 +111,7 @@ def __getattr__(name: str) -> Any:
 
     mod = importlib.import_module(module_name, __package__)
     val = getattr(mod, attr)
-    if name == "vsa_cosine":
-        globals()["vsa_cosine"] = val
-    else:
-        globals()[name] = val
+    globals()[name] = val
     return val
 
 
@@ -232,4 +222,6 @@ __all__ = [
     "DiscoveredGraph",
 ]
 
-configure_lab_logging()
+_auto_log = str(os.environ.get("AUTO_CONFIGURE_LAB_LOGGING", "")).strip().lower()
+if _auto_log in {"1", "true"}:
+    configure_lab_logging()

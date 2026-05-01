@@ -84,10 +84,15 @@ def bind(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
         raise ValueError(
             f"VSA bind requires matching shapes, got {a.shape} vs {b.shape}"
         )
-    fa = torch.fft.rfft(a.to(torch.float32))
-    fb = torch.fft.rfft(b.to(torch.float32))
-    out = torch.fft.irfft(fa * fb, n=a.shape[-1])
-    return out.to(dtype=a.dtype)
+    out_dtype = torch.promote_types(a.dtype, b.dtype)
+    compute_dtype = torch.promote_types(out_dtype, torch.float32)
+    aa = a.to(compute_dtype)
+    bb = b.to(compute_dtype)
+    fa = torch.fft.rfft(aa)
+    fb = torch.fft.rfft(bb)
+    raw = torch.fft.irfft(fa * fb, n=a.shape[-1])
+    target_dtype = out_dtype if out_dtype.is_floating_point else compute_dtype
+    return raw.to(target_dtype)
 
 
 def unbind(c: torch.Tensor, a: torch.Tensor) -> torch.Tensor:
@@ -103,10 +108,14 @@ def unbind(c: torch.Tensor, a: torch.Tensor) -> torch.Tensor:
         raise ValueError(
             f"VSA unbind requires matching shapes, got {c.shape} vs {a.shape}"
         )
-    fc = torch.fft.rfft(c.to(torch.float32))
-    fa = torch.fft.rfft(a.to(torch.float32))
-    out = torch.fft.irfft(fc * fa.conj(), n=c.shape[-1])
-    return out.to(dtype=c.dtype)
+    common = torch.promote_types(c.dtype, a.dtype)
+    compute_dtype = torch.promote_types(common, torch.float32)
+    cc = c.to(compute_dtype)
+    aa = a.to(compute_dtype)
+    fc = torch.fft.rfft(cc)
+    fa = torch.fft.rfft(aa)
+    raw = torch.fft.irfft(fc * fa.conj(), n=c.shape[-1])
+    return raw.to(dtype=c.dtype)
 
 
 def bundle(vectors: Iterable[torch.Tensor], *, normalize: bool = True) -> torch.Tensor:
@@ -136,7 +145,7 @@ def permute(v: torch.Tensor, *, shift: int = 1) -> torch.Tensor:
 
 
 def cosine(a: torch.Tensor, b: torch.Tensor) -> float:
-    """Cosine similarity, clamped to a Python float."""
+    """Cosine similarity computed and returned as a Python float."""
 
     return float(
         F.cosine_similarity(
@@ -260,10 +269,13 @@ class VSACodebook:
 
         unbound = unbind(encoded, self.atom(role))
         if candidates is None:
-            books = self._atoms
+            with self._lock:
+                books = dict(self._atoms)
         else:
+            with self._lock:
+                atom_copy = dict(self._atoms)
             books = {
-                name: self._atoms[name] for name in candidates if name in self._atoms
+                name: atom_copy[name] for name in candidates if name in atom_copy
             }
             unknown = sorted(set(candidates) - set(books))
             if unknown:

@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 import os
+import warnings
 
 import torch
+
+_KNOWN_DEVICE_ORDER_TOKENS = frozenset({"mps", "cuda", "cpu"})
 
 
 def normalize_device_arg(raw: str | None) -> str | None:
@@ -40,16 +43,25 @@ def pick_torch_device(pref: str | None = None, *, preferred_order: tuple[str, ..
         return dev
 
     order = preferred_order or ("mps", "cuda")
-    resolved: list[torch.device] = []
     for token in order:
-        if token == "mps":
+        t = str(token).strip().lower()
+        if t not in _KNOWN_DEVICE_ORDER_TOKENS:
+            warnings.warn(
+                f"pick_torch_device: unrecognized token {token!r} in preferred_order; expected one of {sorted(_KNOWN_DEVICE_ORDER_TOKENS)}",
+                UserWarning,
+                stacklevel=2,
+            )
+            continue
+        if t == "mps":
             backend = getattr(torch.backends, "mps", None)
             if backend is not None and backend.is_available():
-                resolved.append(torch.device("mps"))
-        elif token == "cuda" and torch.cuda.is_available():
-            resolved.append(torch.device("cuda"))
+                return torch.device("mps")
+        elif t == "cuda" and torch.cuda.is_available():
+            return torch.device("cuda")
+        elif t == "cpu":
+            return torch.device("cpu")
 
-    return resolved[0] if resolved else torch.device("cpu")
+    return torch.device("cpu")
 
 
 def inference_dtype(device: torch.device) -> torch.dtype:

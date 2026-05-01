@@ -51,11 +51,22 @@ class DiscoveredGraph:
     directed_edges: set[tuple[str, str]]
     separating_sets: dict[frozenset, frozenset] = field(default_factory=dict)
 
+    def __post_init__(self) -> None:
+        p: dict[str, list[str]] = {v: [] for v in self.variables}
+        c: dict[str, list[str]] = {v: [] for v in self.variables}
+        for u, w in self.directed_edges:
+            if w in p:
+                p[w].append(u)
+            if u in c:
+                c[u].append(w)
+        self._parents_of: dict[str, tuple[str, ...]] = {v: tuple(sorted(set(p[v]))) for v in self.variables}
+        self._children_of: dict[str, tuple[str, ...]] = {v: tuple(sorted(set(c[v]))) for v in self.variables}
+
     def parents(self, v: str) -> list[str]:
-        return [u for (u, w) in self.directed_edges if w == v]
+        return list(self._parents_of.get(v, ()))
 
     def children(self, v: str) -> list[str]:
-        return [w for (u, w) in self.directed_edges if u == v]
+        return list(self._children_of.get(v, ()))
 
 
 def _g_squared_independence(
@@ -93,7 +104,6 @@ def _g_squared_independence(
     n_z = cell_counter(z_vals)
 
     g = 0.0
-    df_levels: set[tuple] = set()
     for (xv, yv, *zvals), nxyz in n_xyz.items():
         zv = tuple(zvals)
         nxz = n_xz[(xv,) + zv]
@@ -105,12 +115,17 @@ def _g_squared_independence(
         if expected <= 0.0:
             continue
         g += 2.0 * nxyz * math.log(nxyz / expected)
-        df_levels.add(zv)
 
     x_levels = len({r[x] for r in rows if x in r})
     y_levels = len({r[y] for r in rows if y in r})
     df_per_z = max(0, (x_levels - 1) * (y_levels - 1))
-    df_z_count = max(1, len(df_levels)) if z_vals else 1
+    if z_vals:
+        df_z_count = 1
+        for zvar in z_vals:
+            df_z_count *= len({r[zvar] for r in rows if zvar in r})
+        df_z_count = max(1, df_z_count)
+    else:
+        df_z_count = 1
     df = df_per_z * df_z_count
     p = _chi2_sf(g, df) if df > 0 else 1.0
     independent = bool(p >= alpha)
@@ -167,6 +182,85 @@ def _chi2_sf(stat: float, df: int) -> float:
     return float(max(0.0, q))
 
 
+def _directed_parents_to(directed: set[tuple[str, str]], v: str) -> set[str]:
+    return {u for (u, w) in directed if w == v}
+
+
+def _meek_try_rule1(
+    variables: Sequence[str],
+    edges: set[frozenset],
+    directed: set[tuple[str, str]],
+    u: str,
+    v: str,
+    edge: frozenset,
+) -> bool:
+    for w in variables:
+        if w in (u, v):
+            continue
+        if (w, u) in directed and frozenset((w, v)) not in edges and (w, v) not in directed and (v, w) not in directed:
+            if (u, v) not in directed and (v, u) not in directed:
+                directed.add((u, v))
+                edges.discard(edge)
+                logger.info("pc_algorithm.orient.R1: %s -> %s (chain via %s)", u, v, w)
+                return True
+    return False
+
+
+def _meek_try_rule2(
+    variables: Sequence[str],
+    edges: set[frozenset],
+    directed: set[tuple[str, str]],
+    u: str,
+    v: str,
+    edge: frozenset,
+) -> bool:
+    for w in variables:
+        if w in (u, v):
+            continue
+        if (u, w) in directed and (w, v) in directed:
+            directed.add((u, v))
+            edges.discard(edge)
+            logger.info("pc_algorithm.orient.R2: %s -> %s (path via %s)", u, v, w)
+            return True
+    return False
+
+
+def _meek_try_rule3(
+    variables: Sequence[str],
+    edges: set[frozenset],
+    directed: set[tuple[str, str]],
+    u: str,
+    v: str,
+    edge: frozenset,
+) -> bool:
+    parents_v = _directed_parents_to(directed, v)
+    for w in parents_v:
+        if w == u:
+            continue
+        if frozenset((u, w)) not in edges:
+            continue
+        if (w, v) not in directed:
+            continue
+        for x in parents_v:
+            if x in (u, v, w):
+                continue
+            if frozenset((u, x)) not in edges:
+                continue
+            if (x, v) not in directed:
+                continue
+            wx_edge = frozenset((w, x)) in edges
+            wx_dir = (w, x) in directed or (x, w) in directed
+            if wx_edge or wx_dir:
+                continue
+            if (u, v) in directed or (v, u) in directed:
+                continue
+            directed.add((u, v))
+            edges.discard(edge)
+            logger.info("pc_algorithm.orient.R3: %s -> %s (colliders via %s, %s)", u, v, w, x)
+            return True
+    return False
+
+
 def pc_algorithm(
     rows: Sequence[Mapping[str, object]],
     variables: Sequence[str] | None = None,
@@ -206,23 +300,40 @@ def pc_algorithm(
             edge = frozenset((a, b))
             if edge not in edges:
                 continue
-            adj = (neighbors(a) | neighbors(b)) - {a, b}
-            if len(adj) < l:
-                continue
-            for z in combinations(sorted(adj), l):
-                independent, g, p = _g_squared_independence(rows, a, b, z, alpha=alpha)
-                logger.debug(
-                    "pc_algorithm.CI: %s ⊥ %s | %s -> indep=%s g=%.3f p=%.4f",
-                    a,
-                    b,
-                    list(z),
-                    independent,
-                    g,
-                    p,
-                )
-                if independent:
-                    to_remove.append((a, b, frozenset(z)))
-                    break
+            adj_a = neighbors(a) - {b}
+            adj_b = neighbors(b) - {a}
+            separated = False
+            if len(adj_a) >= l:
+                for z in combinations(sorted(adj_a), l):
+                    independent, g, p = _g_squared_independence(rows, a, b, z, alpha=alpha)
+                    logger.debug(
+                        "pc_algorithm.CI: %s ⊥ %s | %s -> indep=%s g=%.3f p=%.4f",
+                        a,
+                        b,
+                        list(z),
+                        independent,
+                        g,
+                        p,
+                    )
+                    if independent:
+                        to_remove.append((a, b, frozenset(z)))
+                        separated = True
+                        break
+            if not separated and len(adj_b) >= l:
+                for z in combinations(sorted(adj_b), l):
+                    independent, g, p = _g_squared_independence(rows, a, b, z, alpha=alpha)
+                    logger.debug(
+                        "pc_algorithm.CI: %s ⊥ %s | %s -> indep=%s g=%.3f p=%.4f",
+                        a,
+                        b,
+                        list(z),
+                        independent,
+                        g,
+                        p,
+                    )
+                    if independent:
+                        to_remove.append((a, b, frozenset(z)))
+                        break
         for a, b, z in to_remove:
             edges.discard(frozenset((a, b)))
             sep_sets[frozenset((a, b))] = z
@@ -248,60 +359,14 @@ def pc_algorithm(
         for edge in list(edges):
             a, b = sorted(edge)
             for u, v in [(a, b), (b, a)]:
-                # R1: if there is w -> u and w not adjacent to v, then orient u -> v.
-                for w in variables:
-                    if w in (u, v):
-                        continue
-                    if (w, u) in directed and frozenset((w, v)) not in edges and (w, v) not in directed and (v, w) not in directed:
-                        if (u, v) not in directed and (v, u) not in directed:
-                            directed.add((u, v))
-                            edges.discard(edge)
-                            changed = True
-                            logger.info("pc_algorithm.orient.R1: %s -> %s (chain via %s)", u, v, w)
-                            break
-                if changed:
+                if _meek_try_rule1(variables, edges, directed, u, v, edge):
+                    changed = True
                     break
-                # R2: if u -> w -> v and u — v, then u -> v.
-                for w in variables:
-                    if w in (u, v):
-                        continue
-                    if (u, w) in directed and (w, v) in directed:
-                        directed.add((u, v))
-                        edges.discard(edge)
-                        changed = True
-                        logger.info("pc_algorithm.orient.R2: %s -> %s (path via %s)", u, v, w)
-                        break
-                if changed:
+                if _meek_try_rule2(variables, edges, directed, u, v, edge):
+                    changed = True
                     break
-                # R3: u — v with u — w, u — w'; w -> v, x -> v; w, x not adjacent => u -> v.
-                for w in variables:
-                    if w in (u, v):
-                        continue
-                    if frozenset((u, w)) not in edges:
-                        continue
-                    if (w, v) not in directed:
-                        continue
-                    for x in variables:
-                        if x in (u, v, w):
-                            continue
-                        if frozenset((u, x)) not in edges:
-                            continue
-                        if (x, v) not in directed:
-                            continue
-                        wx_edge = frozenset((w, x)) in edges
-                        wx_dir = (w, x) in directed or (x, w) in directed
-                        if wx_edge or wx_dir:
-                            continue
-                        if (u, v) in directed or (v, u) in directed:
-                            continue
-                        directed.add((u, v))
-                        edges.discard(edge)
-                        changed = True
-                        logger.info("pc_algorithm.orient.R3: %s -> %s (colliders via %s, %s)", u, v, w, x)
-                        break
-                    if changed:
-                        break
-                if changed:
+                if _meek_try_rule3(variables, edges, directed, u, v, edge):
+                    changed = True
                     break
             if changed:
                 break
@@ -334,7 +399,7 @@ def build_scm_from_skeleton(graph: DiscoveredGraph, rows: Sequence[Mapping[str, 
     seen_dir: set[tuple[str, str]] = set(graph.directed_edges)
     for edge in sorted(graph.undirected_edges, key=lambda e: tuple(sorted(e))):
         a, b = sorted(edge, key=lambda v: graph.variables.index(v))
-        if (b, a) in seen_dir:
+        if (a, b) in seen_dir:
             continue
         seen_dir.add((a, b))
         parents_of[b].append(a)
@@ -370,7 +435,7 @@ def build_scm_from_skeleton(graph: DiscoveredGraph, rows: Sequence[Mapping[str, 
                 key = tuple(values[p] for p in parents)
                 row = table.get(key)
                 if row is None:
-                    logger.debug(
+                    logger.warning(
                         "build_scm_from_skeleton.CPT: missing CPT key=%r for node=%r; using dom[0]=%r as fallback",
                         key,
                         var,
@@ -380,7 +445,8 @@ def build_scm_from_skeleton(graph: DiscoveredGraph, rows: Sequence[Mapping[str, 
                 u_val = int(values[u]) % SCM_EXOGENOUS_DOMAIN_SIZE
                 cumulative = 0.0
                 scale = float(SCM_EXOGENOUS_DOMAIN_SIZE)
-                for value, p in row.items():
+                for value in dom:
+                    p = row[value]
                     cumulative += float(p) * scale
                     if u_val < cumulative:
                         return value

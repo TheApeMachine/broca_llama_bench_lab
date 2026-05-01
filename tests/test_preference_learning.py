@@ -81,9 +81,14 @@ def test_feedback_polarity_classifier_basic_signs():
     assert abs(p_neutral) < 1e-6
 
 
-def test_feedback_polarity_detects_no_with_punctuation():
-    p_neg, _ = feedback_polarity_from_text("No.")
+def test_feedback_polarity_detects_no_thanks():
+    p_neg, _ = feedback_polarity_from_text("No thanks.")
     assert p_neg == -1.0
+
+
+def test_no_problem_without_positive_cue_is_neutral():
+    p, _ = feedback_polarity_from_text("No problem.")
+    assert abs(p) < 1e-6
 
 
 def test_initial_C_seeds_preference_correctly():

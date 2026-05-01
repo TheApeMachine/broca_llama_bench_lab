@@ -23,12 +23,12 @@ from __future__ import annotations
 import json
 import logging
 import sqlite3
-import struct
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterable, Sequence
 
+import numpy as np
 import torch
 
 from .continuous_frame import COGNITIVE_FRAME_DIM
@@ -38,12 +38,28 @@ logger = logging.getLogger(__name__)
 
 
 def _vec_to_blob(v: torch.Tensor) -> tuple[bytes, int]:
-    flat = v.detach().cpu().float().reshape(-1)
-    return struct.pack(f"<{flat.numel()}f", *[float(x) for x in flat.tolist()]), int(flat.numel())
+    arr = v.detach().cpu().numpy().astype(np.float32, copy=False).reshape(-1)
+    arr = np.ascontiguousarray(arr)
+    return arr.tobytes(), int(arr.size)
 
 
 def _blob_to_vec(blob: bytes, dim: int) -> torch.Tensor:
-    return torch.tensor(struct.unpack(f"<{dim}f", blob), dtype=torch.float32)
+    arr = np.frombuffer(blob, dtype=np.float32, count=dim)
+    return torch.from_numpy(arr.copy())
+
+
+def _align_vec_to_dim(vec: torch.Tensor, dim: int) -> torch.Tensor:
+    """Pad or truncate a 1-D feature vector to ``dim`` (same rules as :func:`macro_frame_features`)."""
+
+    v = vec.detach().float().reshape(-1)
+    n = v.numel()
+    if n == dim:
+        return v
+    if n > dim:
+        return v[:dim].clone()
+    out = torch.zeros(dim, dtype=torch.float32)
+    out[:n] = v
+    return out
 
 
 @dataclass
@@ -93,6 +109,7 @@ class MacroChunkRegistry:
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.namespace = str(namespace)
+        self._prefix_match_cache: dict[tuple[str, ...], CompiledMacro | None] = {}
         self._init_schema()
 
     def _connect(self) -> sqlite3.Connection:
@@ -169,7 +186,8 @@ class MacroChunkRegistry:
                 # The merged mean is a weighted average of prior_vec and macro.feature_vector.
                 w_old = float(prior_count) / float(max(1, new_count))
                 w_new = float(macro.observation_count) / float(max(1, new_count))
-                merged_vec = prior_vec * w_old + macro.feature_vector.detach().cpu().float() * w_new
+                new_aligned = _align_vec_to_dim(macro.feature_vector, prior_dim)
+                merged_vec = prior_vec * w_old + new_aligned * w_new
                 merged_conf = prior_conf * w_old + float(macro.avg_confidence) * w_new
                 merged_episodes_set: list[int] = list(prior_episodes)
                 seen = set(int(e) for e in merged_episodes_set)
@@ -206,6 +224,7 @@ class MacroChunkRegistry:
                 macro.observation_count,
             )
             macro.id = rid
+            self._prefix_match_cache.clear()
             return rid
 
     def all_macros(self) -> list[CompiledMacro]:
@@ -259,7 +278,10 @@ class MacroChunkRegistry:
                 "DELETE FROM macro_chunks WHERE namespace=? AND name=?",
                 (self.namespace, name),
             )
-        return int(cur.rowcount or 0) > 0
+        cleared = int(cur.rowcount or 0) > 0
+        if cleared:
+            self._prefix_match_cache.clear()
+        return cleared
 
     def count(self) -> int:
         with self._connect() as con:
@@ -277,16 +299,24 @@ class MacroChunkRegistry:
 
         if not recent_intents:
             return None
+        cache_key = tuple(recent_intents)
+        if cache_key in self._prefix_match_cache:
+            cached = self._prefix_match_cache[cache_key]
+            return cached if cached else None
+
         candidates: list[CompiledMacro] = []
         for m in self.all_macros():
             if m.matches_prefix(recent_intents):
                 candidates.append(m)
         if not candidates:
+            self._prefix_match_cache[cache_key] = None
             return None
         candidates.sort(
             key=lambda m: (m.observation_count, m.avg_confidence), reverse=True
         )
-        return candidates[0]
+        best = candidates[0]
+        self._prefix_match_cache[cache_key] = best
+        return best
 
 
 def _frame_features_from_row(row: dict, *, text_encoder=None) -> torch.Tensor:
@@ -425,7 +455,18 @@ class DMNChunkingCompiler:
             for s in starts:
                 for offset in range(len(pat)):
                     row = rows[s + offset]
-                    instance_ids.append(int(row.get("id", -1)))
+                    raw_id = row.get("id", None)
+                    try:
+                        eid = int(raw_id) if raw_id is not None else None
+                    except (TypeError, ValueError):
+                        eid = None
+                    if eid is None or eid < 0:
+                        logger.warning(
+                            "DMNChunkingCompiler: skipping journal row without valid non-negative integer id keys=%s",
+                            list(row.keys()),
+                        )
+                        continue
+                    instance_ids.append(eid)
                     confs.append(float(row.get("confidence", 0.0)))
                     try:
                         instance_feats.append(
@@ -486,11 +527,4 @@ def macro_frame_features(macro: CompiledMacro) -> torch.Tensor:
     feature dimension still loads cleanly.
     """
 
-    v = macro.feature_vector.detach().float().reshape(-1)
-    if v.numel() == COGNITIVE_FRAME_DIM:
-        return v
-    if v.numel() > COGNITIVE_FRAME_DIM:
-        return v[:COGNITIVE_FRAME_DIM].clone()
-    out = torch.zeros(COGNITIVE_FRAME_DIM, dtype=torch.float32)
-    out[: v.numel()] = v
-    return out
+    return _align_vec_to_dim(macro.feature_vector, COGNITIVE_FRAME_DIM)

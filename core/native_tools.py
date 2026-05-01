@@ -32,9 +32,11 @@ synthesize tools from inputs (LLM completions) it does not fully trust.
 from __future__ import annotations
 
 import ast
+import inspect
 import json
 import logging
 import sqlite3
+import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -65,6 +67,8 @@ _SAFE_BUILTIN_NAMES: tuple[str, ...] = (
     "float",
     "frozenset",
     "int",
+    "isinstance",
+    "issubclass",
     "len",
     "list",
     "map",
@@ -124,6 +128,7 @@ class _ASTValidator(ast.NodeVisitor):
         "help",
         "memoryview",
         "object",
+        "super",
         "type",
     }
 
@@ -168,6 +173,10 @@ class ToolSandbox:
     passed as ``function_name`` and which has the signature
     ``def function_name(values: dict) -> object``.  All other top-level
     statements are forbidden.
+
+    This sandbox only restricts namespaces and parses AST—it does **not**
+    isolate CPU time or memory. Malicious **synchronous** code can still infinite-loop
+    or allocate until the OS intervenes; do not rely on subprocess-level containment.
     """
 
     def __init__(self, *, max_source_chars: int = 4096):
@@ -185,12 +194,18 @@ class ToolSandbox:
         except SyntaxError as exc:
             raise ToolSynthesisError(f"syntax error in tool source: {exc}") from exc
 
-        # Allow only function defs and (optionally) module docstring at the top level.
         if not tree.body:
             raise ToolSynthesisError("tool source is empty")
-        defs: list[ast.FunctionDef] = []
+
+        validator = _ASTValidator()
+        validator.visit(tree)
+        if validator.errors:
+            raise ToolSynthesisError("; ".join(validator.errors))
+
+        # Allow only function defs / async defs and (optionally) module docstring at top level.
+        defs: list[ast.FunctionDef | ast.AsyncFunctionDef] = []
         for node in tree.body:
-            if isinstance(node, ast.FunctionDef):
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 defs.append(node)
             elif (
                 isinstance(node, ast.Expr)
@@ -200,7 +215,7 @@ class ToolSandbox:
                 continue  # module docstring
             else:
                 raise ToolSynthesisError(
-                    "synthesized tool source may only contain function definitions"
+                    "synthesized tool source may only contain function or async function definitions"
                 )
         if not defs:
             raise ToolSynthesisError("no function definition found in tool source")
@@ -209,10 +224,6 @@ class ToolSandbox:
             raise ToolSynthesisError(
                 f"expected a function named {function_name!r}; found {[d.name for d in defs]!r}"
             )
-        validator = _ASTValidator()
-        validator.visit(tree)
-        if validator.errors:
-            raise ToolSynthesisError("; ".join(validator.errors))
 
         safe_builtins = _build_safe_builtins()
         namespace: dict[str, Any] = {"__builtins__": safe_builtins}
@@ -224,6 +235,11 @@ class ToolSandbox:
         fn = namespace.get(function_name)
         if not callable(fn):
             raise ToolSynthesisError(f"compiled namespace has no callable {function_name!r}")
+        if inspect.iscoroutinefunction(fn):
+            raise ToolSynthesisError(
+                f"compiled tool {function_name!r} is an async def; "
+                "synthesized tools must be ordinary synchronous callables for verification and SCM use",
+            )
         return SandboxResult(fn=fn, source=source, function_name=function_name)
 
     @staticmethod
@@ -240,7 +256,8 @@ class ToolSandbox:
 
         if not sample_inputs:
             raise ToolSynthesisError("at least one sample input is required for verification")
-        domain_set = list(domain)
+        domain_elems = list(domain)
+        domain_set = set(domain_elems)
         outputs: list[Any] = []
         for i, sample in enumerate(sample_inputs):
             try:
@@ -251,7 +268,7 @@ class ToolSandbox:
                 ) from exc
             if out not in domain_set:
                 raise ToolSynthesisError(
-                    f"tool returned {out!r} for sample {i}; not in declared domain {domain_set!r}"
+                    f"tool returned {out!r} for sample {i}; not in declared domain {domain_elems!r}"
                 )
             outputs.append(out)
         return outputs
@@ -264,7 +281,12 @@ class ToolSandbox:
 
 @dataclass
 class NativeTool:
-    """A verified, persisted native tool — one node in the substrate's causal graph."""
+    """A verified, persisted native tool — one node in the substrate's causal graph.
+
+    ``rehydrated`` is True once a live sandbox callable exists in this process
+    (successful ``registry.get(..., rehydrate=True)`` or fresh ``synthesize``).
+    Rehydrate failures clear ``verified`` so ``verified`` does not falsely imply ``fn``.
+    """
 
     name: str
     source: str
@@ -273,6 +295,7 @@ class NativeTool:
     domain: tuple
     fn: Callable[[Mapping[str, Any]], Any] | None = None
     verified: bool = False
+    rehydrated: bool = False
     sample_inputs: tuple[dict, ...] = field(default_factory=tuple)
     sample_outputs: tuple = field(default_factory=tuple)
     description: str = ""
@@ -314,15 +337,13 @@ class NativeToolRegistry:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.namespace = str(namespace)
         self.sandbox = sandbox or ToolSandbox()
+        self._db_lock = threading.RLock()
+        self._conn: sqlite3.Connection | None = None
         self._init_schema()
 
-    def _connect(self) -> sqlite3.Connection:
-        con = sqlite3.connect(self.path)
-        con.execute("PRAGMA journal_mode=WAL")
-        return con
-
     def _init_schema(self) -> None:
-        with self._connect() as con:
+        with self._db_lock:
+            con = self._lazy_open()
             con.execute(
                 """
                 CREATE TABLE IF NOT EXISTS native_tools (
@@ -346,6 +367,15 @@ class NativeToolRegistry:
                 "CREATE INDEX IF NOT EXISTS idx_native_tools_namespace ON native_tools(namespace)"
             )
 
+    def _lazy_open(self) -> sqlite3.Connection:
+        """Open the shared SQLite connection once (caller holds ``self._db_lock``)."""
+
+        if self._conn is None:
+            self._conn = sqlite3.connect(self.path, timeout=5.0)
+            self._conn.execute("PRAGMA journal_mode=WAL")
+            self._conn.isolation_level = None
+        return self._conn
+
     def synthesize(
         self,
         name: str,
@@ -366,6 +396,11 @@ class NativeToolRegistry:
         fn_name = function_name or name
         compiled = self.sandbox.compile(source, fn_name)
         domain_t = tuple(domain)
+        if not domain_t:
+            raise ToolSynthesisError(
+                f"native tool {name!r}: domain must declare at least one allowed output "
+                "(empty domains are ambiguous for SCM fallbacks and verification)",
+            )
         # Verify produces outputs as a side-effect; we keep the recorded outputs for telemetry.
         outputs = self.sandbox.verify(
             compiled.fn, domain=domain_t, sample_inputs=list(sample_inputs)
@@ -378,6 +413,7 @@ class NativeToolRegistry:
             domain=domain_t,
             fn=compiled.fn,
             verified=True,
+            rehydrated=True,
             sample_inputs=tuple(dict(s) for s in sample_inputs),
             sample_outputs=tuple(outputs),
             description=description,
@@ -403,7 +439,8 @@ class NativeToolRegistry:
         domain_repr = self._serialize_domain(tool.domain)
         sample_inputs_repr = self._serialize_samples(tool.sample_inputs)
         sample_outputs_repr = self._serialize_outputs(tool.sample_outputs)
-        with self._connect() as con:
+        with self._db_lock:
+            con = self._lazy_open()
             row = con.execute(
                 "SELECT id FROM native_tools WHERE namespace=? AND name=?",
                 (self.namespace, tool.name),
@@ -469,7 +506,20 @@ class NativeToolRegistry:
             elif tname == "float":
                 out.append(float(v))
             elif tname == "bool":
-                out.append(bool(v))
+                # JSON/manual edits rarely preserve strict bool types; normalize before SCM checks / hashing.
+                if isinstance(v, bool):
+                    bv = v
+                elif isinstance(v, str) and v in ("true", "True", "false", "False"):
+                    bv = v in ("true", "True")
+                elif isinstance(v, int):
+                    bv = bool(v)
+                elif isinstance(v, str):
+                    bv = bool(int(v))
+                else:
+                    raise ToolSynthesisError(
+                        f"cannot coerce serialized bool payload {v!r} (got {type(v).__name__})"
+                    )
+                out.append(bv)
             elif tname == "NoneType":
                 out.append(None)
             else:
@@ -520,6 +570,7 @@ class NativeToolRegistry:
             domain=domain,
             fn=None,
             verified=bool(int(verified)),
+            rehydrated=False,
             sample_inputs=sample_inputs,
             sample_outputs=sample_outputs,
             description=str(description),
@@ -529,15 +580,20 @@ class NativeToolRegistry:
             try:
                 compiled = self.sandbox.compile(tool.source, tool.function_name)
                 tool.fn = compiled.fn
+                tool.rehydrated = True
             except ToolSynthesisError:
                 logger.exception(
                     "NativeToolRegistry: failed to rehydrate tool %s; leaving fn=None",
                     tool.name,
                 )
+                tool.fn = None
+                tool.rehydrated = False
+                tool.verified = False
         return tool
 
     def get(self, name: str, *, rehydrate: bool = True) -> NativeTool | None:
-        with self._connect() as con:
+        with self._db_lock:
+            con = self._lazy_open()
             row = con.execute(
                 """
                 SELECT id, namespace, name, source, function_name, parents_json, domain_json,
@@ -549,7 +605,8 @@ class NativeToolRegistry:
         return self._row_to_tool(row, rehydrate=rehydrate) if row is not None else None
 
     def all_tools(self, *, rehydrate: bool = True) -> list[NativeTool]:
-        with self._connect() as con:
+        with self._db_lock:
+            con = self._lazy_open()
             rows = con.execute(
                 """
                 SELECT id, namespace, name, source, function_name, parents_json, domain_json,
@@ -561,7 +618,8 @@ class NativeToolRegistry:
         return [self._row_to_tool(row, rehydrate=rehydrate) for row in rows]
 
     def remove(self, name: str) -> bool:
-        with self._connect() as con:
+        with self._db_lock:
+            con = self._lazy_open()
             cur = con.execute(
                 "DELETE FROM native_tools WHERE namespace=? AND name=?",
                 (self.namespace, name),
@@ -569,7 +627,8 @@ class NativeToolRegistry:
         return int(cur.rowcount or 0) > 0
 
     def count(self) -> int:
-        with self._connect() as con:
+        with self._db_lock:
+            con = self._lazy_open()
             row = con.execute(
                 "SELECT COUNT(*) FROM native_tools WHERE namespace=?",
                 (self.namespace,),
@@ -599,9 +658,11 @@ class NativeToolRegistry:
             if not tool.verified or tool.fn is None:
                 continue
             if tool.name in scm.equations:
-                # Already attached; refresh the function pointer so a re-synthesized tool wins.
-                scm.equations[tool.name] = scm.equations[tool.name].__class__(
-                    name=tool.name, parents=tuple(tool.parents), fn=self._wrap_for_scm(tool)
+                scm.update_endogenous(
+                    tool.name,
+                    fn=self._wrap_for_scm(tool),
+                    domain=list(tool.domain),
+                    parents=tuple(tool.parents),
                 )
                 attached += 1
                 continue
@@ -648,16 +709,19 @@ class NativeToolRegistry:
 
     @staticmethod
     def _wrap_for_scm(tool: NativeTool) -> Callable[[dict], Any]:
-        """Wrap a tool's ``fn`` so the SCM gets a deterministic, domain-bound callable.
+        """Wrap ``tool.fn`` for SCM queries with tolerant fallbacks on errors.
 
-        Any exception inside the synthesized function is converted into the
-        domain's first value — a "safe default" that keeps SCM evaluation
-        non-fatal.  Failures are still logged so they show up in DMN
-        telemetry.
+        Any exception inside the synthesized function yields the declared domain's
+        first value. Outputs that violate the domain invoke the same coercion path
+        as :meth:`NativeTool.domain_coerce`, then fall back if coercion rejects.
         """
 
-        fallback = tool.domain[0] if tool.domain else 0
-        domain_set = set(tool.domain)
+        if not tool.domain:
+            raise ToolSynthesisError(
+                f"native tool {tool.name!r} has empty domain; cannot synthesize SCM wrapper"
+            )
+        fallback = tool.domain[0]
+        domain_elems = list(tool.domain)
         name = tool.name
         fn = tool.callable_or_raise()
 
@@ -667,16 +731,16 @@ class NativeToolRegistry:
             except Exception:
                 logger.exception("NativeTool %s raised; using fallback %r", name, fallback)
                 return fallback
-            if out not in domain_set:
+            try:
+                return tool.domain_coerce(out)
+            except ToolSynthesisError:
                 logger.warning(
-                    "NativeTool %s produced %r outside domain %r; using fallback %r",
+                    "NativeTool %s produced out-of-domain output; using fallback %r (domain=%r)",
                     name,
-                    out,
-                    tool.domain,
                     fallback,
+                    domain_elems,
                 )
                 return fallback
-            return out
 
         return _wrapped
 

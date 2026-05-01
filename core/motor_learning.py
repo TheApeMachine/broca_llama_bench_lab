@@ -151,8 +151,6 @@ class GraftMotorTrainer:
         for item in items[: self.config.max_replay_per_tick]:
             messages = item["messages"]
             plan = self._plan_tensor_from_item(item)
-            if plan is None:
-                continue
             try:
                 prompt, full = self._build_inputs(messages, plan)
             except (RuntimeError, ValueError):

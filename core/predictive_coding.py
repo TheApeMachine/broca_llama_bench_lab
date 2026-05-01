@@ -24,6 +24,10 @@ logger = logging.getLogger(__name__)
 
 
 def _batch_from_ids(rows: Sequence[Sequence[int]], pad_id: int, *, device: torch.device | str):
+    if not rows:
+        z_ids = torch.full((0, 1), pad_id, dtype=torch.long, device=device)
+        z_mask = torch.zeros((0, 1), dtype=torch.bool, device=device)
+        return z_ids, z_mask
     max_len = max(1, max(len(r) for r in rows))
     ids = torch.full((len(rows), max_len), pad_id, dtype=torch.long)
     mask = torch.zeros((len(rows), max_len), dtype=torch.bool)
@@ -73,7 +77,7 @@ def lexical_plan_cross_entropy_mean(
                 if bf_device is not None:
                     extra["broca_features"] = bf_device
 
-            last_pos = int(mask.long().sum().item()) - 1
+            last_pos = max(int(mask.long().sum().item()) - 1, 0)
 
             if grafts_on and lm_head is not None:
                 out = model(batch_ids, mask, extra_state=extra, return_cache=True)
@@ -110,7 +114,7 @@ def lexical_surprise_gap(
 
     prefix_ids = speech_seed_ids(tokenizer, prefix)
     target_ids = tokenizer.encode(utterance)
-    plan_ids = tokenizer.encode_plan_words(list(plan_words))
+    plan_ids = tokenizer.encode_plan_words(list(plan_words), lowercase=True)
 
     if not target_ids:
         return 0.0, 0.0, 0.0
@@ -137,7 +141,7 @@ def lexical_surprise_gap(
             }
             if prepared_broca is not None:
                 extra["broca_features"] = prepared_broca
-            last_pos = int(mask.long().sum().item()) - 1
+            last_pos = max(int(mask.long().sum().item()) - 1, 0)
 
             if lm_head is None:
                 use_dual = False
@@ -161,7 +165,7 @@ def lexical_surprise_gap(
             sum_graft -= float(F.log_softmax(logits_graft, dim=-1)[tid])
             row.append(tid)
 
-    if use_dual and len(target_ids) > 0:
+    if use_dual:
         n = float(len(target_ids))
         ce_p = sum_plain / n
         ce_g = sum_graft / n

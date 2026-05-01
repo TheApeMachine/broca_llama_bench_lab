@@ -13,8 +13,13 @@ from core.llama_broca_host import LlamaBrocaHost
 
 
 def is_llama_hf_model_id(model_id: str) -> bool:
-    s = model_id.lower()
-    return "llama" in s or "meta-llama" in s
+    return "llama" in model_id.lower()
+
+
+def _write_pair_json(pair: dict[str, Any], out_dir: Path) -> Path:
+    path = out_dir / "lm_eval_pair.json"
+    path.write_text(json.dumps(pair, indent=2, default=str), encoding="utf-8")
+    return path
 
 
 def build_hflm(
@@ -117,7 +122,8 @@ def run_paired_lm_eval(
     if limit is None or limit == "":
         limit_arg = None
     else:
-        limit_arg = int(limit)
+        val = float(limit)
+        limit_arg = int(val) if val.is_integer() else val
 
     attn_eager = coarse == "mps"
 
@@ -150,20 +156,17 @@ def run_paired_lm_eval(
             "skipped": True,
             "reason": "non-Llama checkpoint — Broca host only applies to LlamaFamily models",
         }
-        pair_path = out_dir / "lm_eval_pair.json"
-        pair_path.write_text(json.dumps(pair, indent=2, default=str), encoding="utf-8")
-        return pair_path
+        return _write_pair_json(pair, out_dir)
 
     lm2 = build_hflm(model_id, device_s=device_s, coarse=coarse, attn_eager=attn_eager)
     try:
         wrap_hflm_with_broca_host(lm2)
     except Exception as exc:
         pair["broca_host_parity_lm_eval"] = {"skipped": True, "reason": str(exc)}
-        pair_path = out_dir / "lm_eval_pair.json"
-        pair_path.write_text(json.dumps(pair, indent=2, default=str), encoding="utf-8")
+        path = _write_pair_json(pair, out_dir)
         del lm2
         gc.collect()
-        return pair_path
+        return path
 
     r_br = simple_evaluate(
         model=lm2,
@@ -185,7 +188,7 @@ def run_paired_lm_eval(
         e = r_br["results"].get(task, {})
         row: dict[str, float | None] = {}
         for key in set(b) & set(e):
-            if ",none" not in key:
+            if "," not in key:
                 continue
             if isinstance(b.get(key), str) or isinstance(e.get(key), str):
                 continue
@@ -204,8 +207,6 @@ def run_paired_lm_eval(
     }
     pair["delta_host_parity_minus_baseline"] = deltas
 
-    pair_path = out_dir / "lm_eval_pair.json"
-    pair_path.write_text(json.dumps(pair, indent=2, default=str), encoding="utf-8")
-    return pair_path
+    return _write_pair_json(pair, out_dir)
 
 

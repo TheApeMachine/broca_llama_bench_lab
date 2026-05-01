@@ -1,3 +1,24 @@
+"""Cognitive substrate ("Broca") orchestration for a frozen Llama host.
+
+`PersistentSemanticMemory` is SQLite-backed factual storage (WAL, one shared
+connection per instance, guarded by a lock for thread-safe reuse).
+`GlobalWorkspace` blackboards frames and `IntrinsicCue` signals from language
+and background workers. `CognitiveBackgroundWorker` / DMN phases run offline
+consolidation and emit cues (tagged with `source="dmn"` where applicable).
+
+`BrocaMind` wires `LlamaBrocaHost` to `BaseGraft` / lexical and logit grafts,
+`DynamicGraftSynthesizer` modes (`DYNAMIC_GRAFT*` in ``dynamic_grafts``),
+active inference + SCM faculties (`build_simpson_scm`, tools, Hawkes, conformal,
+etc.), and routes utterances through `CognitiveRouter`. Grafts read
+``extra_state`` (e.g. ``broca_features``, ``broca_logit_bias``) during
+`LlamaBrocaHost.forward`; background threads must use workspace locks where the
+host is shared.
+
+**Public knobs (non-exhaustive):** `DEFAULT_BROCA_MODEL_ID`, `SEMANTIC_CONFIDENCE_FLOOR`,
+`BELIEF_REVISION_LOG_ODDS_THRESHOLD`, `BELIEF_REVISION_MIN_CLAIMS`, plus the main
+types `BrocaMind`, `PersistentSemanticMemory`, `GlobalWorkspace`, `CognitiveFrame`,
+`CognitiveRouter`, `IntrinsicCue`, `LexicalPlanGraft`, `TrainableBrocaGraft`.
+"""
 
 from __future__ import annotations
 
@@ -12,7 +33,7 @@ import threading
 import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Optional, Sequence
+from typing import Any, Callable, Mapping, Optional, Sequence
 
 import torch
 import torch.nn as nn
@@ -277,7 +298,9 @@ class LLMRelationExtractor(RelationExtractor):
         if attention_mask is not None:
             attention_mask = attention_mask.to(device)
         
-        pad_id = getattr(hf_tok, "pad_token_id", None) or getattr(hf_tok, "eos_token_id", None)
+        pad_id = getattr(hf_tok, "pad_token_id", None)
+        if pad_id is None:
+            pad_id = getattr(hf_tok, "eos_token_id", None)
         
         with torch.no_grad():
             output = llm.generate(
@@ -534,15 +557,35 @@ class PersistentSemanticMemory:
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.namespace = namespace
+        self._sqlite_lock = threading.Lock()
+        self._conn: sqlite3.Connection | None = None
         self._init_schema()
 
-    def _connect(self) -> sqlite3.Connection:
-        con = sqlite3.connect(self.path)
-        con.execute("PRAGMA journal_mode=WAL")
-        return con
+    def _ensure_conn(self) -> sqlite3.Connection:
+        """Lazy single connection per memory store (WAL, safe across threads via lock)."""
+
+        if self._conn is None:
+            self._conn = sqlite3.connect(str(self.path), check_same_thread=False)
+            self._conn.execute("PRAGMA journal_mode=WAL")
+        return self._conn
+
+    def close(self) -> None:
+        with self._sqlite_lock:
+            if self._conn is not None:
+                try:
+                    self._conn.close()
+                finally:
+                    self._conn = None
+
+    def __del__(self) -> None:
+        try:
+            self.close()
+        except Exception:
+            pass
 
     def _init_schema(self) -> None:
-        with self._connect() as con:
+        with self._sqlite_lock:
+            con = self._ensure_conn()
             con.execute(
                 """
                 CREATE TABLE IF NOT EXISTS semantic_memory (
@@ -628,7 +671,8 @@ class PersistentSemanticMemory:
             )
             logger.debug("PersistentSemanticMemory.upsert: ns=%s %s.%s -> %s conf=%s", self.namespace, subject.lower(), predicate.lower(), obj.lower(), confidence)
             return
-        with self._connect() as c:
+        with self._sqlite_lock:
+            c = self._ensure_conn()
             c.execute(
                 """
                 INSERT INTO semantic_memory(namespace, subject, predicate, object, confidence, evidence_json, created_at, updated_at)
@@ -652,7 +696,8 @@ class PersistentSemanticMemory:
         evidence: dict | None = None,
     ) -> int:
         now = time.time()
-        with self._connect() as con:
+        with self._sqlite_lock:
+            con = self._ensure_conn()
             cur = con.execute(
                 """
                 INSERT INTO semantic_claims(namespace, subject, predicate, object, confidence, status, evidence_json, created_at)
@@ -689,7 +734,8 @@ class PersistentSemanticMemory:
             "SELECT id, subject, predicate, object, confidence, status, evidence_json, created_at "
             f"FROM semantic_claims WHERE {' AND '.join(clauses)} ORDER BY id"
         )
-        with self._connect() as con:
+        with self._sqlite_lock:
+            con = self._ensure_conn()
             rows = con.execute(sql, args).fetchall()
         return [
             {
@@ -738,7 +784,8 @@ class PersistentSemanticMemory:
             if cur.rowcount == 0:
                 return None
             return int(cur.lastrowid)
-        with self._connect() as c:
+        with self._sqlite_lock:
+            c = self._ensure_conn()
             cur = c.execute(
                 """
                 INSERT OR IGNORE INTO memory_reflections(namespace, dedupe_key, kind, subject, predicate, summary, evidence_json, created_at)
@@ -760,7 +807,8 @@ class PersistentSemanticMemory:
             "SELECT id, dedupe_key, kind, subject, predicate, summary, evidence_json, created_at "
             f"FROM memory_reflections WHERE {' AND '.join(clauses)} ORDER BY id"
         )
-        with self._connect() as con:
+        with self._sqlite_lock:
+            con = self._ensure_conn()
             rows = con.execute(sql, args).fetchall()
         return [
             {
@@ -836,7 +884,8 @@ class PersistentSemanticMemory:
                     json.dumps(sorted(int(i) for i in best["claim_ids"]), separators=(",", ":")).encode()
                 ).hexdigest()
                 dedupe = f"belief_revision:{subject}:{predicate}:{current_obj}->{best_obj}:{claim_ids_digest}"
-                with self._connect() as con:
+                with self._sqlite_lock:
+                    con = self._ensure_conn()
                     con.execute("BEGIN")
                     try:
                         reflection_id = self.record_reflection(
@@ -963,7 +1012,8 @@ class PersistentSemanticMemory:
         }
 
     def get(self, subject: str, predicate: str) -> tuple[str, float, dict] | None:
-        with self._connect() as con:
+        with self._sqlite_lock:
+            con = self._ensure_conn()
             row = con.execute(
                 "SELECT object, confidence, evidence_json FROM semantic_memory WHERE namespace=? AND subject=? AND predicate=?",
                 (self.namespace, subject.lower(), predicate.lower()),
@@ -976,7 +1026,8 @@ class PersistentSemanticMemory:
         """All subjects with this predicate — drives intrinsic cues without a fixed ENTITY list."""
 
         pred = predicate.lower()
-        with self._connect() as con:
+        with self._sqlite_lock:
+            con = self._ensure_conn()
             rows = con.execute(
                 "SELECT DISTINCT subject FROM semantic_memory WHERE namespace=? AND predicate=? ORDER BY subject",
                 (self.namespace, pred),
@@ -984,7 +1035,8 @@ class PersistentSemanticMemory:
         return [str(r[0]) for r in rows]
 
     def subjects(self) -> list[str]:
-        with self._connect() as con:
+        with self._sqlite_lock:
+            con = self._ensure_conn()
             rows = con.execute(
                 "SELECT DISTINCT subject FROM semantic_memory WHERE namespace=? ORDER BY subject",
                 (self.namespace,),
@@ -992,7 +1044,8 @@ class PersistentSemanticMemory:
         return [str(r[0]) for r in rows]
 
     def records_for_subject(self, subject: str) -> list[tuple[str, str, float, dict]]:
-        with self._connect() as con:
+        with self._sqlite_lock:
+            con = self._ensure_conn()
             rows = con.execute(
                 """
                 SELECT predicate, object, confidence, evidence_json
@@ -1008,7 +1061,8 @@ class PersistentSemanticMemory:
         """Known objects already stored for a predicate; used for conflict detection."""
 
         pred = predicate.lower()
-        with self._connect() as con:
+        with self._sqlite_lock:
+            con = self._ensure_conn()
             rows = con.execute(
                 "SELECT DISTINCT object FROM semantic_memory WHERE namespace=? AND predicate=?",
                 (self.namespace, pred),
@@ -1016,12 +1070,14 @@ class PersistentSemanticMemory:
         return frozenset(str(r[0]).lower() for r in rows)
 
     def count(self) -> int:
-        with self._connect() as con:
+        with self._sqlite_lock:
+            con = self._ensure_conn()
             row = con.execute("SELECT COUNT(*) FROM semantic_memory WHERE namespace=?", (self.namespace,)).fetchone()
         return int(row[0])
 
     def mean_confidence(self) -> float | None:
-        with self._connect() as con:
+        with self._sqlite_lock:
+            con = self._ensure_conn()
             row = con.execute(
                 "SELECT AVG(confidence), COUNT(*) FROM semantic_memory WHERE namespace=?",
                 (self.namespace,),
@@ -1041,7 +1097,8 @@ class PersistentSemanticMemory:
     def all_facts(self) -> list[tuple[str, str, str, float, dict]]:
         """Every (subject, predicate, object, confidence, evidence) row in this namespace."""
 
-        with self._connect() as con:
+        with self._sqlite_lock:
+            con = self._ensure_conn()
             rows = con.execute(
                 """
                 SELECT subject, predicate, object, confidence, evidence_json
@@ -1092,7 +1149,8 @@ class PersistentSemanticMemory:
         threshold = max(1, int(min_shared))
         # Group subjects by the (predicate, object) tuples they share.
         bucket: dict[tuple[str, str], list[str]] = {}
-        with self._connect() as con:
+        with self._sqlite_lock:
+            con = self._ensure_conn()
             rows = con.execute(
                 """
                 SELECT subject, predicate, object FROM semantic_memory WHERE namespace=?
@@ -1318,6 +1376,7 @@ class IntrinsicCue:
     urgency: float
     faculty: str
     evidence: dict = field(default_factory=dict)
+    source: str | None = None
 
 
 class GlobalWorkspace:
@@ -1489,7 +1548,8 @@ class CognitiveBackgroundWorker:
         # Reactive belief consolidation runs after the autonomous phases so
         # any DMN-promoted edges or boosted confidences are visible to it.
         try:
-            claim_reflections = self.mind.consolidate_once()
+            with self.mind._cognitive_state_lock:
+                claim_reflections = self.mind.consolidate_once()
         except Exception:
             logger.exception("DMN claim consolidation failed")
             claim_reflections = []
@@ -1534,83 +1594,84 @@ class CognitiveBackgroundWorker:
     # ------------------------------------------------------------------ Phase 1
 
     def _phase1_consolidation(self) -> tuple[list[dict], dict[str, Any]]:
-        cfg = self.config
-        graph = self.mind.episode_graph
-        memory = self.mind.memory
+        with self.mind._cognitive_state_lock:
+            cfg = self.config
+            graph = self.mind.episode_graph
+            memory = self.mind.memory
 
-        decayed, pruned = graph.decay_all(gamma=cfg.decay_gamma, prune_below=cfg.decay_prune_below)
-        centrality = graph.centrality(
-            damping=0.85,
-            iterations=cfg.centrality_iterations,
-            min_weight=cfg.centrality_min_weight,
-        )
+            decayed, pruned = graph.decay_all(gamma=cfg.decay_gamma, prune_below=cfg.decay_prune_below)
+            centrality = graph.centrality(
+                damping=0.85,
+                iterations=cfg.centrality_iterations,
+                min_weight=cfg.centrality_min_weight,
+            )
 
-        boosts: list[dict[str, Any]] = []
-        if centrality:
-            top_episodes = {ep for ep, score in centrality.items() if score >= cfg.centrality_boost_floor}
-            if top_episodes:
-                # Boost any fact whose recorded episode_ids intersect the central set.
-                for subj, pred, _obj, _conf, evidence in memory.all_facts():
-                    eps = evidence.get("episode_ids") if isinstance(evidence, dict) else None
-                    if not isinstance(eps, list):
-                        continue
-                    parsed: list[int] = []
-                    for e in eps:
-                        try:
-                            ei = int(e)
-                        except (TypeError, ValueError):
+            boosts: list[dict[str, Any]] = []
+            if centrality:
+                top_episodes = {ep for ep, score in centrality.items() if score >= cfg.centrality_boost_floor}
+                if top_episodes:
+                    # Boost any fact whose recorded episode_ids intersect the central set.
+                    for subj, pred, _obj, _conf, evidence in memory.all_facts():
+                        eps = evidence.get("episode_ids") if isinstance(evidence, dict) else None
+                        if not isinstance(eps, list):
                             continue
-                        parsed.append(ei)
-                    intersection = [ei for ei in parsed if ei in top_episodes]
-                    if not intersection:
-                        continue
-                    # Scale the boost by the maximum centrality mass that touched this fact.
-                    mass = max(centrality.get(ei, 0.0) for ei in intersection)
-                    factor = 1.0 + (cfg.centrality_boost_factor - 1.0) * min(1.0, mass / max(cfg.centrality_boost_floor, 1e-6))
-                    result = memory.boost_confidence(
-                        subj,
-                        pred,
-                        factor=factor,
-                        cap=cfg.centrality_boost_cap,
-                        reason=f"pagerank_central(mass={mass:.4f})",
-                    )
-                    if result is None:
-                        continue
-                    obj, old_conf, new_conf = result
-                    boosts.append({
-                        "subject": subj,
-                        "predicate": pred,
-                        "object": obj,
-                        "old_confidence": old_conf,
-                        "new_confidence": new_conf,
-                        "factor": float(factor),
-                        "central_episode_mass": float(mass),
-                        "central_episodes": intersection,
-                    })
-                    logger.debug(
-                        "DMN.phase1.boost: subj=%r pred=%r %.4f -> %.4f factor=%.4f mass=%.4f episodes=%s",
-                        subj,
-                        pred,
-                        old_conf,
-                        new_conf,
-                        float(factor),
-                        float(mass),
-                        intersection,
-                    )
+                        parsed: list[int] = []
+                        for e in eps:
+                            try:
+                                ei = int(e)
+                            except (TypeError, ValueError):
+                                continue
+                            parsed.append(ei)
+                        intersection = [ei for ei in parsed if ei in top_episodes]
+                        if not intersection:
+                            continue
+                        # Scale the boost by the maximum centrality mass that touched this fact.
+                        mass = max(centrality.get(ei, 0.0) for ei in intersection)
+                        factor = 1.0 + (cfg.centrality_boost_factor - 1.0) * min(1.0, mass / max(cfg.centrality_boost_floor, 1e-6))
+                        result = memory.boost_confidence(
+                            subj,
+                            pred,
+                            factor=factor,
+                            cap=cfg.centrality_boost_cap,
+                            reason=f"pagerank_central(mass={mass:.4f})",
+                        )
+                        if result is None:
+                            continue
+                        obj, old_conf, new_conf = result
+                        boosts.append({
+                            "subject": subj,
+                            "predicate": pred,
+                            "object": obj,
+                            "old_confidence": old_conf,
+                            "new_confidence": new_conf,
+                            "factor": float(factor),
+                            "central_episode_mass": float(mass),
+                            "central_episodes": intersection,
+                        })
+                        logger.debug(
+                            "DMN.phase1.boost: subj=%r pred=%r %.4f -> %.4f factor=%.4f mass=%.4f episodes=%s",
+                            subj,
+                            pred,
+                            old_conf,
+                            new_conf,
+                            float(factor),
+                            float(mass),
+                            intersection,
+                        )
 
-        reflections: list[dict] = []
-        if boosts:
-            reflections.append({
-                "kind": "consolidation_boost",
-                "boosts": boosts,
-            })
-        summary = {
-            "decayed_edges": int(decayed),
-            "pruned_edges": int(pruned),
-            "central_nodes": len(centrality),
-            "boosted_facts": len(boosts),
-        }
-        return reflections, summary
+            reflections: list[dict] = []
+            if boosts:
+                reflections.append({
+                    "kind": "consolidation_boost",
+                    "boosts": boosts,
+                })
+            summary = {
+                "decayed_edges": int(decayed),
+                "pruned_edges": int(pruned),
+                "central_nodes": len(centrality),
+                "boosted_facts": len(boosts),
+            }
+            return reflections, summary
 
     # ------------------------------------------------------------------ Phase 2
 
@@ -1619,7 +1680,9 @@ class CognitiveBackgroundWorker:
         memory = self.mind.memory
         # Clear any prior DMN-flagged ambiguity cues so we don't accumulate stale ones across ticks.
         ws = self.mind.workspace
-        ws.intrinsic_cues = [c for c in ws.intrinsic_cues if c.faculty != "entity_ambiguity"]
+        ws.intrinsic_cues = [
+            c for c in ws.intrinsic_cues if not (c.faculty == "entity_ambiguity" and getattr(c, "source", None) == "dmn")
+        ]
 
         pairs = memory.overlapping_subject_pairs(min_shared=cfg.overlap_min_shared)
         emitted: list[dict[str, Any]] = []
@@ -1642,7 +1705,9 @@ class CognitiveBackgroundWorker:
                 "ambiguity_nats": float(ambiguity),
                 "shared_predicates": [list(t) for t in pair["shared"]],
             }
-            ws.intrinsic_cues.append(IntrinsicCue(urgency=urgency, faculty="entity_ambiguity", evidence=cue_evidence))
+            ws.intrinsic_cues.append(
+                IntrinsicCue(urgency=urgency, faculty="entity_ambiguity", evidence=cue_evidence, source="dmn")
+            )
             emitted.append(cue_evidence | {"urgency": urgency})
             logger.info(
                 "DMN.phase2.cue: %r ↔ %r ratio=%.3f ambiguity=%.4f nats urgency=%.3f",
@@ -2249,7 +2314,7 @@ def _batch_from_ids(rows: Sequence[Sequence[int]], pad_id: int, *, device: torch
     max_len = max(1, max(len(r) for r in rows))
     ids = torch.full((len(rows), max_len), pad_id, dtype=torch.long)
     mask = torch.zeros((len(rows), max_len), dtype=torch.bool)
-    lengths = torch.tensor([max(1, len(r)) for r in rows], dtype=torch.long)
+    lengths = torch.tensor([len(r) for r in rows], dtype=torch.long)
     for i, row in enumerate(rows):
         if not row:
             continue
@@ -2291,7 +2356,7 @@ def generate_from_plan(
     max_new_tokens: int | None = None,
     broca_features: torch.Tensor | None = None,
 ) -> str:
-    plan_ids = list(tokenizer.encode_plan_words(plan_tokens))
+    plan_ids = list(tokenizer.encode_plan_words(plan_tokens, lowercase=True))
     max_new_tokens = max_new_tokens or len(plan_ids)
     ids = speech_seed_ids(tokenizer, prefix)
     generated: list[int] = []
@@ -2334,6 +2399,39 @@ class FacultyCandidate:
     score: float
     build: Callable[[], CognitiveFrame]
     evidence: dict[str, Any] = field(default_factory=dict)
+
+
+def _discover_scm_treatment_outcome(scm: Any, labels: Mapping[str, Any]) -> tuple[str, str]:
+    """Pick (treatment, outcome) endogenous names for do-calculus style readouts."""
+
+    endo = list(scm.endogenous_names)
+    binaries = [n for n in endo if n in scm.domains and len(scm.domains[n]) == 2]
+    keys_t = frozenset(("t", "treatment", "intervention"))
+    keys_y = frozenset(("y", "outcome", "response"))
+
+    def matches(var: str, keyset: frozenset[str]) -> bool:
+        if var.strip().lower() in keyset:
+            return True
+        lab = labels.get(var)
+        return lab is not None and str(lab).strip().lower() in keyset
+
+    t_name: str | None = next((b for b in binaries if matches(b, keys_t)), None)
+    if t_name is None and binaries:
+        t_name = binaries[0]
+    elif t_name is None and endo:
+        t_name = endo[0]
+    else:
+        t_name = "T"
+
+    y_name: str | None = next((b for b in binaries if b != t_name and matches(b, keys_y)), None)
+    if y_name is None:
+        for n in endo:
+            if n != t_name:
+                y_name = n
+                break
+    if y_name is None:
+        y_name = t_name
+    return t_name, y_name
 
 
 class CognitiveRouter:
@@ -2538,18 +2636,33 @@ class CognitiveRouter:
         )
 
     def _causal_effect(self, mind: "BrocaMind") -> CognitiveFrame:
-        p1 = mind.scm.probability({"Y": 1}, interventions={"T": 1})
-        p0 = mind.scm.probability({"Y": 1}, interventions={"T": 0})
+        scm = mind.scm
+        labels = getattr(scm, "labels", {}) or {}
+        t_name, y_name = _discover_scm_treatment_outcome(scm, labels)
+        dom_t = scm.domains.get(t_name, (0, 1))
+        dom_y = scm.domains.get(y_name, (0, 1))
+        t_lo = 0 if 0 in dom_t else dom_t[0]
+        t_hi = 1 if 1 in dom_t else (dom_t[1] if len(dom_t) > 1 else dom_t[0])
+        y_hi = 1 if 1 in dom_y else dom_y[-1]
+        p1 = scm.probability({y_name: y_hi}, interventions={t_name: t_hi})
+        p0 = scm.probability({y_name: y_hi}, interventions={t_name: t_lo})
         ate = p1 - p0
-        intervention_var = next((name for name in mind.scm.endogenous_names if name in mind.scm.domains and len(mind.scm.domains[name]) == 2), "intervention")
-        labels = getattr(mind.scm, "labels", {}) or {}
         answer_key = "positive_effect" if ate >= 0 else "negative_effect"
         return CognitiveFrame(
             "causal_effect",
-            subject=str(labels.get(intervention_var, intervention_var)),
+            subject=str(labels.get(t_name, t_name)),
             answer=str(labels.get(answer_key, answer_key)),
             confidence=float(min(1.0, abs(ate))),
-            evidence={"p_do_positive": p1, "p_do_negative": p0, "ate": ate, "labels": labels},
+            evidence={
+                "treatment_var": t_name,
+                "outcome_var": y_name,
+                "p_do_positive": p1,
+                "p_do_negative": p0,
+                "p_do_high": p1,
+                "p_do_low": p0,
+                "ate": ate,
+                "labels": labels,
+            },
         )
 
 
@@ -2604,6 +2717,7 @@ class BrocaMind:
         self.causal_agent = ActiveInferenceAgent(self.causal_pomdp, horizon=1, learn=False)
         self.unified_agent = CoupledEFEAgent(self.active_agent, self.causal_agent)
         self._background_worker: CognitiveBackgroundWorker | None = None
+        self._cognitive_state_lock = threading.Lock()
 
         # New substrates ----------------------------------------------------
         d_model = int(getattr(self.host.cfg, "d_model", 96))
@@ -2937,9 +3051,10 @@ class BrocaMind:
 
     def comprehend(self, utterance: str) -> CognitiveFrame:
         toks = utterance_words(utterance)
-        self._intrinsic_scan(toks)
-        frame = self.router.route(self, utterance, toks)
-        out = self._commit_frame(utterance, toks, frame)
+        with self._cognitive_state_lock:
+            self._intrinsic_scan(toks)
+            frame = self.router.route(self, utterance, toks)
+            out = self._commit_frame(utterance, toks, frame)
         # Tell the Hawkes layer that this intent fired so its working memory
         # heats up the relevant channels for the next few seconds.
         try:
@@ -3031,10 +3146,12 @@ class BrocaMind:
             broca_features=frame.to_features(self.text_encoder),
         )
 
-    def answer(self, utterance: str) -> tuple[CognitiveFrame, str]:
+    def answer(self, utterance: str, *, max_new_tokens: int | None = None) -> tuple[CognitiveFrame, str]:
         """One-shot natural-language reply driven by substrate-biased decoding."""
 
-        return self.chat_reply([{"role": "user", "content": utterance}])
+        if max_new_tokens is None:
+            return self.chat_reply([{"role": "user", "content": utterance}])
+        return self.chat_reply([{"role": "user", "content": utterance}], max_new_tokens=int(max_new_tokens))
 
     def chat_reply(
         self,
@@ -3164,7 +3281,7 @@ class BrocaMind:
                 ids.extend(int(t) for t in hf_tok.encode(" " + surface, add_special_tokens=False))
             else:
                 ids.extend(int(t) for t in self.tokenizer.encode(surface))
-            for tid in ids:
+            for tid in set(ids):
                 if tid < 0:
                     continue
                 bias[tid] = max(bias.get(tid, 0.0), 1.0)
@@ -3211,10 +3328,9 @@ class BrocaMind:
             feature_tensor is not None,
             float(substrate_confidence),
         )
+        past_key_values = None
         with torch.no_grad():
-            for step in range(max(1, int(max_new_tokens))):
-                row_t = torch.tensor([current], device=device, dtype=torch.long)
-                mask_t = torch.ones_like(row_t, dtype=torch.bool)
+            for _step in range(max(1, int(max_new_tokens))):
                 # Inertia grows with the autoregressive prefix so the bias and
                 # SNR-targeted grafts can shout over a long babbling tail.
                 inertia = math.log1p(float(len(current)))
@@ -3222,6 +3338,7 @@ class BrocaMind:
                     "tokenizer": self.tokenizer,
                     "substrate_confidence": float(substrate_confidence),
                     "substrate_inertia": float(inertia),
+                    "return_past_key_values": True,
                 }
                 if feature_tensor is not None:
                     extra["broca_features"] = feature_tensor
@@ -3232,8 +3349,19 @@ class BrocaMind:
                     semantic_decay = 0.15 if target_emitted else 1.0
                     extra["broca_logit_bias"] = logit_bias
                     extra["broca_logit_bias_decay"] = semantic_decay
-                logits = self.host(row_t, mask_t, extra_state=extra)
-                last_pos = row_t.shape[1] - 1
+                if past_key_values is not None:
+                    extra["past_key_values"] = past_key_values
+                    row_t = torch.tensor([[current[-1]]], device=device, dtype=torch.long)
+                    mask_t = torch.ones((1, len(current)), dtype=torch.bool, device=device)
+                else:
+                    row_t = torch.tensor([current], device=device, dtype=torch.long)
+                    mask_t = torch.ones_like(row_t, dtype=torch.bool)
+                out = self.host(row_t, mask_t, extra_state=extra)
+                if isinstance(out, tuple):
+                    logits, past_key_values = out
+                else:
+                    raise RuntimeError("LlamaBrocaHost.forward expected (logits, past_key_values) when return_past_key_values is set")
+                last_pos = logits.shape[1] - 1
                 logits_row = logits[0, last_pos].float()
                 if do_sample:
                     scaled = logits_row / max(temperature, 1e-5)

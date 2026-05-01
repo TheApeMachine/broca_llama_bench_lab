@@ -39,11 +39,7 @@ def _to_tensor(image: Any) -> torch.Tensor:
     """Normalize an arbitrary image input to a [3, H, W] float tensor in [0, 1]."""
 
     if isinstance(image, torch.Tensor):
-        t = image.detach()
-        if not torch.is_floating_point(t):
-            t = t.float()
-        else:
-            t = t.float()
+        t = image.detach().float()
         if t.numel() > 0 and float(t.max().item()) > 1.0:
             t = t / 255.0
     else:
@@ -153,6 +149,16 @@ class VisionEncoder:
         self._model = None
         self._processor = None
         self._real = False
+        self._pil_available = False
+        try:
+            import PIL.Image  # type: ignore  # noqa: F401
+
+            self._pil_available = True
+        except ImportError:
+            logger.warning(
+                "VisionEncoder: PIL not installed; real-model tensor inputs will fall back "
+                "to perceptual hashing until Pillow is available"
+            )
         if use_real_model:
             self._try_load_real()
         logger.info(
@@ -181,10 +187,11 @@ class VisionEncoder:
                 AutoModel.from_pretrained(self.model_id).to(self.device).eval()
             )
             self._real = True
-        except Exception as exc:  # pragma: no cover - network/model issues
+        except (FileNotFoundError, OSError, RuntimeError) as exc:  # pragma: no cover
             logger.warning(
-                "VisionEncoder: failed to load %s (%s); using perceptual sketch",
+                "VisionEncoder: failed to load %s [%s]: %s; using perceptual sketch",
                 self.model_id,
+                type(exc).__name__,
                 exc,
             )
             self._real = False
@@ -194,41 +201,54 @@ class VisionEncoder:
         """Map an image to the substrate's cognitive-frame layout."""
 
         if self._real and self._model is not None and self._processor is not None:
-            try:
-                from PIL import Image  # type: ignore
-            except ImportError:
-                self._real = False
-            else:
-                pil = image if hasattr(image, "convert") else None
-                inputs = None
-                if isinstance(image, torch.Tensor):
-                    t = image.detach().float()
-                    if t.ndim == 3:
-                        t = t.unsqueeze(0)
-                    if t.numel() > 0 and float(t.max().item()) > 1.0:
-                        t = t / 255.0
-                    t = t.clamp(0.0, 1.0).to(self.device)
-                    inputs = self._processor(images=t, return_tensors="pt")
-                    inputs = {k: v.to(self.device) for k, v in inputs.items()}
-                elif pil is None:
-                    if isinstance(image, (str, Path)):
-                        pil = Image.open(image).convert("RGB")
-                    elif isinstance(image, (bytes, bytearray)):
-                        pil = Image.open(BytesIO(image)).convert("RGB")
+            pil = image if hasattr(image, "convert") else None
+            inputs = None
+            if isinstance(image, torch.Tensor):
+                if not self._pil_available:
+                    tensor_fb = _to_tensor(image)
+                    sketch_fb = _phash_sketch(tensor_fb)
+                    return _embed_to_cognitive_frame(sketch_fb)
+                t = image.detach().float().cpu()
+                if t.ndim == 3:
+                    t = t.unsqueeze(0)
+                if t.numel() > 0 and float(t.max().item()) > 1.0:
+                    t = t / 255.0
+                t = t.clamp(0.0, 1.0)
+                from PIL import Image as PILImage  # type: ignore
+
+                pil_images: list[Any] = []
+                for bi in range(int(t.shape[0])):
+                    arr = (
+                        (t[bi].clamp(0.0, 1.0) * 255.0)
+                        .clamp(0, 255)
+                        .to(dtype=torch.uint8)
+                        .permute(1, 2, 0)
+                        .contiguous()
+                        .numpy()
+                    )
+                    pil_images.append(PILImage.fromarray(arr, mode="RGB"))
+                inputs = self._processor(images=pil_images, return_tensors="pt")
+                inputs = {k: v.to(self.device) for k, v in inputs.items()}
+            elif pil is None:
+                from PIL import Image as PILOpen  # type: ignore
+
+                if isinstance(image, (str, Path)):
+                    pil = PILOpen.open(image).convert("RGB")
+                elif isinstance(image, (bytes, bytearray)):
+                    pil = PILOpen.open(BytesIO(image)).convert("RGB")
                 if pil is not None:
-                    inputs = self._processor(images=pil, return_tensors="pt").to(
-                        self.device
-                    )
-                if inputs is not None:
-                    feats = (
-                        self._model.get_image_features(**inputs)
-                        if hasattr(self._model, "get_image_features")
-                        else self._model(**inputs).pooler_output
-                    )
-                    embed = F.normalize(
-                        feats[0].detach().cpu().to(torch.float32), dim=0
-                    )
-                    return _embed_to_cognitive_frame(embed)
+                    raw = self._processor(images=pil, return_tensors="pt")
+                    inputs = {k: v.to(self.device) for k, v in dict(raw).items()}
+            if inputs is not None:
+                feats = (
+                    self._model.get_image_features(**inputs)
+                    if hasattr(self._model, "get_image_features")
+                    else self._model(**inputs).pooler_output
+                )
+                embed = F.normalize(
+                    feats[0].detach().cpu().to(torch.float32), dim=0
+                )
+                return _embed_to_cognitive_frame(embed)
         # No-deps perceptual fallback path.
         tensor = _to_tensor(image)
         sketch = _phash_sketch(tensor)

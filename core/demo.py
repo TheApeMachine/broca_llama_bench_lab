@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import numbers
 from pathlib import Path
 
 from .benchmarks.architecture_eval import run_broca_architecture_eval
@@ -48,8 +49,18 @@ def main() -> None:
             raise KeyError("metrics missing 'enhanced_broca_architecture'")
         print("\n=== Broca architecture benchmark ===")
         print(f"results={out / 'broca_architecture_eval.json'}")
-        print(f"enhanced speech_exact_accuracy={enhanced['speech_exact_accuracy']:.3f}")
-        print(f"enhanced answer_present_accuracy={enhanced['answer_present_accuracy']:.3f}")
+        for key in ("speech_exact_accuracy", "answer_present_accuracy"):
+            val = enhanced.get(key)
+            if val is None:
+                raise KeyError(
+                    f"enhanced_broca_architecture missing required metric {key!r}; keys={sorted(enhanced.keys())}"
+                )
+            if not isinstance(val, numbers.Real):
+                raise TypeError(
+                    f"enhanced_broca_architecture[{key!r}] must be numeric, got {type(val).__name__}: {val!r}"
+                )
+        print(f"enhanced speech_exact_accuracy={float(enhanced.get('speech_exact_accuracy')):.3f}")
+        print(f"enhanced answer_present_accuracy={float(enhanced.get('answer_present_accuracy')):.3f}")
 
     if args.mode == "all":
         run_faculty_stack(seed=args.seed, out_dir=out, verbose=True)

@@ -127,7 +127,7 @@ class DirichletPreference:
         denom = safe_total * safe_total * (safe_total + 1.0)
         out = []
         for a in self.alpha:
-            out.append(float(a * (total - a) / denom))
+            out.append(float(a * (safe_total - a) / denom))
         return out
 
     def update(
@@ -187,7 +187,11 @@ class DirichletPreference:
 
 
 _NEGATIVE_SENTIMENT = re.compile(
-    r"\b(?:stop|no|worse|bad|wrong|annoying)\b|\btoo many\b",
+    r"\b(?:stop|worse|bad|wrong|annoying)\b|\btoo many\b|\bno\s+(?:thanks?|thank you)\b",
+)
+_POSITIVE_SENTIMENT = re.compile(
+    r"\b(?:thanks|great|perfect|good|concise|love|helpful)\b",
+    re.I,
 )
 
 
@@ -200,11 +204,12 @@ class PersistentPreference:
         self.namespace = namespace
         self._conn: sqlite3.Connection | None = None
         self._conn_lock = threading.Lock()
+        self._schema_migrated: bool = False
         self._init_schema()
 
     def _conn_get(self) -> sqlite3.Connection:
         if self._conn is None:
-            self._conn = sqlite3.connect(str(self.path), timeout=30.0)
+            self._conn = sqlite3.connect(str(self.path), timeout=30.0, check_same_thread=False)
             self._conn.execute("PRAGMA journal_mode=WAL")
         return self._conn
 
@@ -213,12 +218,19 @@ class PersistentPreference:
             if self._conn is not None:
                 self._conn.close()
                 self._conn = None
+            self._schema_migrated = False
 
     def __del__(self) -> None:  # pragma: no cover - best-effort cleanup
         try:
             self.close()
         except Exception:
             pass
+
+    def _maybe_migrate_schema(self, con: sqlite3.Connection) -> None:
+        if self._schema_migrated:
+            return
+        self._migrate_schema(con)
+        self._schema_migrated = True
 
     def _migrate_schema(self, con: sqlite3.Connection) -> None:
         cols = {
@@ -248,13 +260,13 @@ class PersistentPreference:
                     )
                     """
                 )
-                self._migrate_schema(con)
+                self._maybe_migrate_schema(con)
 
     def save(self, faculty: str, prior: DirichletPreference) -> None:
         with self._conn_lock:
             con = self._conn_get()
             with con:
-                self._migrate_schema(con)
+                self._maybe_migrate_schema(con)
                 con.execute(
                     """
                     INSERT INTO preference_state(
@@ -295,7 +307,7 @@ class PersistentPreference:
         with self._conn_lock:
             con = self._conn_get()
             with con:
-                self._migrate_schema(con)
+                self._maybe_migrate_schema(con)
                 row = con.execute(
                     "SELECT n_observations, prior_strength, alpha_json, history_json "
                     "FROM preference_state WHERE namespace=? AND faculty=?",
@@ -304,9 +316,35 @@ class PersistentPreference:
         if row is None:
             return None
         n_obs, prior_strength, alpha_js, hist_js = row
+        n_exp = int(n_obs)
         ps = float(prior_strength) if prior_strength is not None else 1.0
-        prior = DirichletPreference(int(n_obs), prior_strength=ps)
-        prior.alpha = list(json.loads(alpha_js))
+        try:
+            raw_alpha = json.loads(alpha_js)
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"PreferenceStore.load({faculty!r}): invalid alpha_json") from exc
+        if not isinstance(raw_alpha, list):
+            raise ValueError(
+                f"PreferenceStore.load({faculty!r}): alpha must be a JSON list, got {type(raw_alpha).__name__}",
+            )
+        if len(raw_alpha) != n_exp:
+            raise ValueError(
+                f"PreferenceStore.load({faculty!r}): alpha length {len(raw_alpha)} != n_observations {n_exp}",
+            )
+        parsed_alpha: list[float] = []
+        for i, x in enumerate(raw_alpha):
+            try:
+                v = float(x)
+            except (TypeError, ValueError) as exc:
+                raise ValueError(
+                    f"PreferenceStore.load({faculty!r}): alpha[{i}]={x!r} is not numeric",
+                ) from exc
+            if v < 0:
+                raise ValueError(
+                    f"PreferenceStore.load({faculty!r}): alpha[{i}]={v!r} must be non-negative",
+                )
+            parsed_alpha.append(v)
+        prior = DirichletPreference(n_exp, prior_strength=ps)
+        prior.alpha = parsed_alpha
         prior.history = deque(
             (_preference_event_from_dict(e) for e in json.loads(hist_js)),
             maxlen=_HISTORY_MAXLEN,
@@ -324,9 +362,8 @@ def feedback_polarity_from_text(text: str) -> tuple[float, float]:
 
     s = text.lower()
     weight = min(1.0, 0.2 + 0.05 * len(s.split()))
-    positives = ("thanks", "great", "perfect", "good", "concise", "love", "helpful")
     negative_hit = bool(_NEGATIVE_SENTIMENT.search(s))
-    positive_hit = any(p in s for p in positives)
+    positive_hit = bool(_POSITIVE_SENTIMENT.search(s))
     if positive_hit and not negative_hit:
         return 1.0, float(weight)
     if negative_hit:

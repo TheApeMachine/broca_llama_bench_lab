@@ -2,12 +2,33 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from typing import Any
+
+import numpy as np
 
 from .active_inference import ActiveInferenceAgent, TigerDoorEnv, build_tiger_pomdp, random_episode, run_episode
 from .causal import build_frontdoor_scm, build_simpson_scm
 
 
+def _json_safe(obj: Any) -> Any:
+    """Recursively convert NumPy scalars/arrays so json.dumps succeeds."""
+
+    if isinstance(obj, dict):
+        return {str(k): _json_safe(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_json_safe(v) for v in obj]
+    if isinstance(obj, np.generic):
+        return obj.item()
+    if isinstance(obj, np.ndarray):
+        return obj.tolist()
+    return obj
+
+
 def run_active_inference_experiment(seed: int = 0, episodes: int = 80, verbose: bool = True) -> dict:
+    """Compare active inference to a random baseline on the tiger POMDP (``episodes`` must be >= 1)."""
+
+    if int(episodes) <= 0:
+        raise ValueError(f"episodes must be a positive integer, got {episodes!r}")
     pomdp = build_tiger_pomdp()
     agent = ActiveInferenceAgent(pomdp, horizon=1, learn=True)
     d0 = agent.decide()
@@ -70,11 +91,18 @@ def run_active_inference_experiment(seed: int = 0, episodes: int = 80, verbose: 
         print(f"active inference success={result['active_success']:.3f}, avg_reward={result['active_avg_reward']:.3f}")
         print(f"random baseline   success={result['random_success']:.3f}, avg_reward={result['random_avg_reward']:.3f}")
         # Show that the observation model is not static decoration.
-        listen = pomdp.action_names.index("listen")
-        print("learned listen likelihood columns after episodes:")
-        for s, sname in enumerate(pomdp.state_names):
-            col = {pomdp.observation_names[o]: round(pomdp.A[listen][o][s], 3) for o in range(pomdp.n_observations)}
-            print(f"  state={sname}: {col}")
+        try:
+            listen = pomdp.action_names.index("listen")
+        except ValueError:
+            print(
+                "warning: POMDP action_names has no 'listen'; skipping per-state listen likelihood dump; "
+                f"actions={pomdp.action_names!r}"
+            )
+        else:
+            print("learned listen likelihood columns after episodes:")
+            for s, sname in enumerate(pomdp.state_names):
+                col = {pomdp.observation_names[o]: round(pomdp.A[listen][o][s], 3) for o in range(pomdp.n_observations)}
+                print(f"  state={sname}: {col}")
 
     return result
 
@@ -86,6 +114,8 @@ def run_causal_experiment(verbose: bool = True) -> dict:
     do_t1 = simpson.probability({"Y": 1}, interventions={"T": 1})
     do_t0 = simpson.probability({"Y": 1}, interventions={"T": 0})
     backdoor = simpson.backdoor_sets("T", "Y", max_size=2)
+    if not backdoor:
+        raise ValueError("Simpson SCM has no backdoor set for (T, Y) at max_size=2; cannot compute backdoor adjustment")
     bd = backdoor[0]
     adj_t1 = simpson.backdoor_adjustment(treatment="T", treatment_value=1, outcome="Y", outcome_value=1, adjustment_set=bd)
     adj_t0 = simpson.backdoor_adjustment(treatment="T", treatment_value=0, outcome="Y", outcome_value=1, adjustment_set=bd)
@@ -93,6 +123,8 @@ def run_causal_experiment(verbose: bool = True) -> dict:
 
     front = build_frontdoor_scm()
     fd_sets = front.frontdoor_sets("X", "Y", max_size=1)
+    if not fd_sets:
+        raise ValueError("front-door SCM has no frontdoor set for (X, Y) at max_size=1; cannot compute frontdoor_adjustment")
     fd = fd_sets[0]
     fd_formula = front.frontdoor_adjustment(treatment="X", treatment_value=1, outcome="Y", outcome_value=1, mediator_set=fd)
     fd_do = front.probability({"Y": 1}, interventions={"X": 1})
@@ -138,7 +170,7 @@ def run_all(seed: int = 0, out_dir: str | Path = "runs", verbose: bool = True) -
         "pearl": run_causal_experiment(verbose=verbose),
     }
     path = out_dir / f"results_seed{seed}.json"
-    path.write_text(json.dumps(result, indent=2, sort_keys=True), encoding="utf-8")
+    path.write_text(json.dumps(_json_safe(result), indent=2, sort_keys=True), encoding="utf-8")
     if verbose:
         print(f"\nSaved run summary: {path}")
     return result

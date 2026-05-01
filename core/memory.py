@@ -3,16 +3,30 @@ from __future__ import annotations
 import json
 import logging
 import sqlite3
-import struct
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Protocol, Sequence
 
+import numpy as np
 import torch
 import torch.nn.functional as F
 
 logger = logging.getLogger(__name__)
+
+
+class ActivationMemoryGraftProtocol(Protocol):
+    """Required surface for :meth:`SQLiteActivationMemory.load_into_graft`.
+
+    Many graft classes also expose ``clear()`` and ``set_spread_matrix``; those are
+    optional and are invoked only when :meth:`~SQLiteActivationMemory.load_into_graft`
+    is configured to use them (see runtime checks beside ``remember``, ``clear``,
+    and ``set_spread_matrix`` there).
+    """
+
+    def remember(
+        self, key: torch.Tensor, value: torch.Tensor, *, metadata: Optional[dict] = None
+    ) -> None: ...
 
 
 @dataclass
@@ -28,14 +42,16 @@ class MemoryRecord:
 
 
 def _tensor_to_blob(t: torch.Tensor) -> tuple[bytes, int]:
-    vec = t.detach().cpu().float().reshape(-1)
-    data = struct.pack(f"<{vec.numel()}f", *[float(x) for x in vec.tolist()])
-    return data, int(vec.numel())
+    arr = np.ascontiguousarray(t.detach().cpu().numpy().astype("<f4", copy=False))
+    return arr.tobytes(), int(arr.size)
 
 
 def _blob_to_tensor(blob: bytes, dim: int) -> torch.Tensor:
-    vals = struct.unpack(f"<{dim}f", blob)
-    return torch.tensor(vals, dtype=torch.float32)
+    raw = np.frombuffer(blob, dtype=np.dtype("<f4"))
+    expected = int(dim)
+    if raw.size != expected:
+        raise ValueError(f"blob size {raw.size} != declared dim {expected}")
+    return torch.from_numpy(np.array(raw)).float()
 
 
 class SQLiteActivationMemory:
@@ -53,7 +69,7 @@ class SQLiteActivationMemory:
         self._init_schema()
 
     def _connect(self) -> sqlite3.Connection:
-        con = sqlite3.connect(self.path)
+        con = sqlite3.connect(self.path, timeout=5.0)
         con.execute("PRAGMA journal_mode=WAL")
         return con
 
@@ -104,19 +120,21 @@ class SQLiteActivationMemory:
         lo, hi = (ia, ib) if ia < ib else (ib, ia)
         now = time.time()
         with self._connect() as con:
-            row = con.execute(
-                "SELECT weight FROM activation_association WHERE lo=? AND hi=?",
-                (lo, hi),
-            ).fetchone()
-            w = float(row[0]) + float(delta) if row else float(delta)
             con.execute(
                 """
                 INSERT INTO activation_association(lo, hi, weight, updated_at)
                 VALUES (?,?,?,?)
-                ON CONFLICT(lo, hi) DO UPDATE SET weight=excluded.weight, updated_at=excluded.updated_at
+                ON CONFLICT(lo, hi) DO UPDATE SET
+                    weight = activation_association.weight + excluded.weight,
+                    updated_at = excluded.updated_at
                 """,
-                (lo, hi, w, now),
+                (lo, hi, float(delta), now),
             )
+            row = con.execute(
+                "SELECT weight FROM activation_association WHERE lo=? AND hi=?",
+                (lo, hi),
+            ).fetchone()
+            w = float(row[0]) if row else float(delta)
 
             logger.debug("SQLiteActivationMemory.bump_association: pair=(%s,%s) weight=%s", lo, hi, w)
 
@@ -164,11 +182,39 @@ class SQLiteActivationMemory:
 
         with self._connect() as con:
             if kind is None:
+                ids_subsel = "(SELECT id FROM activation_memory WHERE namespace=?)"
+                assoc_params = (namespace, namespace)
+            else:
+                ids_subsel = "(SELECT id FROM activation_memory WHERE namespace=? AND kind=?)"
+                assoc_params = (namespace, kind, namespace, kind)
+            con.execute(
+                f"DELETE FROM activation_association WHERE lo IN {ids_subsel} OR hi IN {ids_subsel}",
+                assoc_params,
+            )
+            if kind is None:
                 con.execute("DELETE FROM activation_memory WHERE namespace=?", (namespace,))
             else:
                 con.execute("DELETE FROM activation_memory WHERE namespace=? AND kind=?", (namespace, kind))
 
         logger.debug("SQLiteActivationMemory.clear: namespace=%s kind=%s", namespace, kind)
+
+    def delete_records(self, record_ids: Sequence[int]) -> int:
+        """Remove activation_memory rows (and association edges touching them) by primary key."""
+
+        ids = [int(i) for i in record_ids]
+        if not ids:
+            return 0
+        placeholders = ",".join("?" for _ in ids)
+        id_tuple = tuple(ids)
+        with self._connect() as con:
+            con.execute(
+                f"DELETE FROM activation_association WHERE lo IN ({placeholders}) OR hi IN ({placeholders})",
+                id_tuple + id_tuple,
+            )
+            cur = con.execute(f"DELETE FROM activation_memory WHERE id IN ({placeholders})", id_tuple)
+            deleted = int(cur.rowcount) if cur.rowcount is not None and cur.rowcount >= 0 else len(ids)
+        logger.debug("SQLiteActivationMemory.delete_records: n_ids=%s deleted=%s", len(ids), deleted)
+        return deleted
 
     def count(self, *, namespace: Optional[str] = None, kind: Optional[str] = None) -> int:
         namespace = namespace or self.default_namespace
@@ -263,13 +309,29 @@ class SQLiteActivationMemory:
         namespace: Optional[str] = None,
         kind: Optional[str] = None,
         top_k: int = 3,
+        sim_chunk_rows: int = 512,
     ) -> list[tuple[MemoryRecord, float]]:
+        """Return top cosine-similar records and bump ``access_count`` on matches.
+
+        Loads all matching SQLite rows then scores keys in-process. Similarity runs
+        in batches over ``sim_chunk_rows`` vectors to bound peak RAM; for millions
+        of rows per namespace, use an external vector index instead.
+        """
+
         records = self.load(namespace=namespace, kind=kind)
         if not records:
             return []
         q = F.normalize(query.detach().cpu().float().reshape(1, -1), dim=-1)
-        keys = F.normalize(torch.stack([r.key.float() for r in records], dim=0), dim=-1)
-        sims = (q @ keys.T).squeeze(0)
+        chunk = max(1, int(sim_chunk_rows))
+        sim_parts: list[torch.Tensor] = []
+        for off in range(0, len(records), chunk):
+            batch = records[off : off + chunk]
+            keys_b = F.normalize(
+                torch.stack([r.key.float() for r in batch], dim=0),
+                dim=-1,
+            )
+            sim_parts.append((q @ keys_b.T).squeeze(0))
+        sims = torch.cat(sim_parts, dim=0)
         vals, idxs = sims.topk(min(top_k, len(records)))
         ids = [records[int(i)].id for i in idxs]
         if ids:
@@ -290,20 +352,50 @@ class SQLiteActivationMemory:
             len(idxs),
             tops,
         )
-        return [(records[int(i)], float(v)) for v, i in zip(vals, idxs)]
+        pairs: list[tuple[MemoryRecord, float]] = []
+        for v, ti in zip(vals, idxs):
+            ix = int(ti)
+            rec = records[ix]
+            rec.access_count += 1
+            pairs.append((rec, float(v)))
+        return pairs
 
-    def load_into_graft(self, graft, *, namespace: Optional[str] = None, kind: str = "fact", clear_first: bool = True) -> int:
+    def load_into_graft(
+        self,
+        graft: ActivationMemoryGraftProtocol,
+        *,
+        namespace: Optional[str] = None,
+        kind: str = "fact",
+        clear_first: bool = True,
+    ) -> int:
+        remember = getattr(graft, "remember", None)
+        if not callable(remember):
+            raise TypeError(
+                "SQLiteActivationMemory.load_into_graft requires graft.remember to be callable; "
+                f"got graft type={type(graft).__name__!r}",
+            )
         records = self.load(namespace=namespace, kind=kind)
         if clear_first and hasattr(graft, "clear"):
-            graft.clear()
+            clr = getattr(graft, "clear", None)
+            if clr is None or not callable(clr):
+                raise TypeError(
+                    "SQLiteActivationMemory.load_into_graft: graft declares clear but graft.clear "
+                    "is not callable — provide a callable clear(), or pass clear_first=False",
+                )
+            clr()
         for rec in records:
             meta = dict(rec.metadata)
             meta["memory_id"] = rec.id
             meta["confidence"] = rec.confidence
-            graft.remember(rec.key.reshape(1, -1), rec.value.reshape(1, -1), metadata=meta)
+            remember(rec.key.reshape(1, -1), rec.value.reshape(1, -1), metadata=meta)
         spread = self.normalized_spread_matrix([rec.id for rec in records])
         setter = getattr(graft, "set_spread_matrix", None)
-        if callable(setter):
+        if setter is not None:
+            if not callable(setter):
+                raise TypeError(
+                    "SQLiteActivationMemory.load_into_graft: graft.set_spread_matrix must be callable when present "
+                    f"(graft={type(graft).__name__!r})",
+                )
             setter(spread if spread.numel() else None)
 
         logger.debug(

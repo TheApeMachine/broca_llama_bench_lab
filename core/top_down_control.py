@@ -35,7 +35,6 @@ from __future__ import annotations
 
 import logging
 import math
-from contextlib import nullcontext
 from dataclasses import dataclass, field
 from typing import Any, Callable, Mapping, Optional, Sequence
 
@@ -45,16 +44,31 @@ import torch.nn.functional as F
 
 from .grafts import (
     BaseGraft,
-    DEFAULT_GRAFT_TARGET_SNR,
     KVMemoryGraft,
     _state_confidence,
     _state_inertia,
-    host_rms,
     snr_magnitude,
 )
 
 
 logger = logging.getLogger(__name__)
+
+
+def _infer_host_device(host: Any) -> torch.device:
+    """Resolve a training device without assuming ``host`` has parameters."""
+
+    p = next(host.parameters(), None)
+    if p is not None:
+        return p.device
+    dv = getattr(host, "device", None)
+    if isinstance(dv, torch.device):
+        return dv
+    if isinstance(dv, str) and dv:
+        try:
+            return torch.device(dv)
+        except (TypeError, ValueError):
+            pass
+    return torch.device("cpu")
 
 
 # ---------------------------------------------------------------------------
@@ -166,14 +180,34 @@ class HypothesisMaskingGraft(BaseGraft):
                 merged[tid_int] = max(merged.get(tid_int, 0.0), float(p))
         if not merged:
             return x
-        last = state["last_indices"].to(x.device)
+        last_raw = state.get("last_indices")
+        if last_raw is None:
+            logger.warning(
+                "HypothesisMaskingGraft: missing state key 'last_indices'; skipping logits penalty"
+            )
+            return x
+        last = last_raw.to(x.device).long()
         rows = torch.arange(x.shape[0], device=x.device)
         out = x.clone()
         vocab = out.shape[-1]
+        tids = []
+        pens = []
         for tid, penalty in merged.items():
-            if tid < 0 or tid >= vocab:
+            tid_int = int(tid)
+            if tid_int < 0 or tid_int >= vocab:
                 continue
-            out[rows, last, tid] = out[rows, last, tid] - float(penalty)
+            tids.append(tid_int)
+            pens.append(float(penalty))
+        if not tids:
+            return x
+        tid_tensor = torch.tensor(tids, device=x.device, dtype=torch.long)
+        pen_tensor = torch.tensor(pens, device=x.device, dtype=out.dtype)
+        ncol = tid_tensor.numel()
+        br = rows.unsqueeze(1).expand(-1, ncol).reshape(-1)
+        lc = last.unsqueeze(1).expand(-1, ncol).reshape(-1)
+        tk = tid_tensor.unsqueeze(0).expand(rows.shape[0], -1).reshape(-1)
+        pv = pen_tensor.unsqueeze(0).expand(rows.shape[0], -1).reshape(-1)
+        out[br, lc, tk] = out[br, lc, tk] - pv
         return out
 
 
@@ -259,14 +293,15 @@ class IterativeHypothesisSearch:
         grafts = getattr(self.host, "grafts", None)
         if grafts is None:
             return  # Stub host without slot bookkeeping; trust the caller.
-        for slot_key, modules in grafts.items():
-            for m in modules:
+        logits_slots = grafts.get("logits")
+        if logits_slots:
+            for m in logits_slots:
                 if m is self.masking_graft:
                     return
         raise RuntimeError(
-            "HypothesisMaskingGraft must be attached to the host's 'logits' slot via "
-            "host.add_graft('logits', graft) before driving the search; without that "
-            "attachment the bans never reach the model's logits."
+            "HypothesisMaskingGraft must be attached specifically to host.grafts['logits'] "
+            "(e.g. host.add_graft('logits', graft)) before driving IterativeHypothesisSearch; "
+            "otherwise bans never reach logits."
         )
 
     @torch.no_grad()
@@ -284,7 +319,7 @@ class IterativeHypothesisSearch:
         if clear_bans:
             self.masking_graft.clear()
 
-        device = next(self.host.parameters()).device
+        device = _infer_host_device(self.host)
         prompt = list(int(t) for t in prompt_ids)
         history: list[HypothesisAttempt] = []
         last_attempt: HypothesisAttempt | None = None
@@ -485,7 +520,7 @@ class EpistemicInterruptionMonitor:
         if max_new_tokens < 1:
             raise ValueError("max_new_tokens must be >= 1")
 
-        device = next(self.host.parameters()).device
+        device = _infer_host_device(self.host)
         prompt = list(int(t) for t in prompt_ids)
         generated: list[int] = []
         interventions: list[InterruptionEvent] = []
@@ -734,7 +769,13 @@ class ModalityShiftGraft(BaseGraft):
 
         out = x.clone()
         if self.position_mode == "last":
-            last = state["last_indices"].to(x.device)
+            last_raw = state.get("last_indices")
+            if last_raw is None:
+                raise ValueError(
+                    "ModalityShiftGraft(position_mode='last') requires state['last_indices']; "
+                    "the host must populate it for TopDownControl grafts."
+                )
+            last = last_raw.to(x.device).long()
             rows = torch.arange(bsz, device=x.device)
             host_at_last = x[rows, last]
             magnitude = snr_magnitude(
@@ -908,10 +949,14 @@ class CausalConstraintGraft(KVMemoryGraft):
                         {outcome: v}, interventions={treatment: treatment_value}
                     )
                 )
-            except Exception:
+            except (ValueError, KeyError, TypeError):
                 logger.exception(
-                    "CausalConstraintGraft.encode_treatment_effect: SCM probability failed for value=%s",
+                    "CausalConstraintGraft.encode_treatment_effect: scm.probability failed for "
+                    "treatment_value=%r outcome=%r value=%r distribution=%s",
+                    treatment_value,
+                    outcome,
                     v,
+                    getattr(scm, "domains", {}).get(outcome),
                 )
                 p = 0.0
             distribution[v] = p
@@ -1072,6 +1117,13 @@ def _resolve_token_id(tokenizer: Any, surface: str) -> Optional[int]:
     if callable(encode):
         try:
             ids = list(encode(surface))
+            if len(ids) > 1:
+                logger.warning(
+                    "_resolve_token_id: surface %r tokenized to multiple ids %s via tokenizer.encode; "
+                    "using first id only",
+                    surface,
+                    ids,
+                )
             if ids:
                 return int(ids[0])
         except Exception:
@@ -1080,6 +1132,13 @@ def _resolve_token_id(tokenizer: Any, surface: str) -> Optional[int]:
     if inner is not None and callable(getattr(inner, "encode", None)):
         try:
             ids = inner.encode(surface, add_special_tokens=False)
+            if len(ids) > 1:
+                logger.warning(
+                    "_resolve_token_id: surface %r tokenized to multiple ids %s via inner.encode; "
+                    "using first id only",
+                    surface,
+                    list(ids),
+                )
             if ids:
                 return int(ids[0])
         except Exception:

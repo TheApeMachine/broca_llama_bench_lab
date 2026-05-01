@@ -102,13 +102,29 @@ class RegexTokenizer:
             toks = toks + [self.EOS]
         return [self.token_to_id.get(tok, self.unk_id) for tok in toks]
 
-    def encode_plan_words(self, words: Iterable[str]) -> list[int]:
-        """Token IDs for a planned utterance (one ID per regex token, used by Broca grafts)."""
+    def encode_plan_words(self, words: Iterable[str], *, lowercase: bool = True) -> list[int]:
+        """Token IDs for a planned utterance (one ID per regex token, used by Broca grafts).
 
-        return [self.token_to_id.get(str(w).lower(), self.unk_id) for w in words]
+        ``lowercase`` defaults to True to match this tokenizer's lowercased vocab;
+        set False only when plan tokens are already normalized to vocab case.
+        """
+
+        return [
+            self.token_to_id.get(str(w).lower() if lowercase else str(w), self.unk_id)
+            for w in words
+        ]
 
     def batch_encode(self, texts: Sequence[str], *, device: torch.device | str | None = None) -> Batch:
         encoded = [self.encode(t) for t in texts]
+        if not encoded:
+            z_ids = torch.zeros(0, 1, dtype=torch.long)
+            z_mask = torch.zeros(0, 1, dtype=torch.bool)
+            z_lens = torch.zeros(0, dtype=torch.long)
+            if device is not None:
+                z_ids = z_ids.to(device)
+                z_mask = z_mask.to(device)
+                z_lens = z_lens.to(device)
+            return Batch(ids=z_ids, attention_mask=z_mask, lengths=z_lens)
         max_len = max(1, max(len(row) for row in encoded))
         ids = torch.full((len(encoded), max_len), self.pad_id, dtype=torch.long)
         mask = torch.zeros((len(encoded), max_len), dtype=torch.bool)

@@ -23,6 +23,8 @@ across runs.
 
 from __future__ import annotations
 
+import base64
+import binascii
 import json
 import logging
 import sqlite3
@@ -32,10 +34,46 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Sequence
 
+import numpy as np
 import torch
 import torch.nn.functional as F
 
 logger = logging.getLogger(__name__)
+
+
+def _encode_fp32_flat(tensor: torch.Tensor) -> str:
+    arr = np.ascontiguousarray(
+        tensor.detach().cpu().numpy().astype("<f4", copy=False).reshape(-1)
+    )
+    return base64.standard_b64encode(arr.tobytes()).decode("ascii")
+
+
+def _decode_fp32_flat(serialized: str, *, expected_nelem: int, field: str) -> torch.Tensor:
+    s = serialized.strip()
+    if expected_nelem <= 0:
+        raise ValueError(f"{field}: expected_nelem must be positive, got {expected_nelem}")
+
+    def _legacy_from_json(text: str) -> torch.Tensor:
+        t = torch.tensor(json.loads(text), dtype=torch.float32)
+        if t.numel() != expected_nelem:
+            raise ValueError(
+                f"{field}: JSON vector length {t.numel()} != registry dim {expected_nelem}",
+            )
+        return t.reshape(expected_nelem).contiguous()
+
+    if s.startswith("["):
+        return _legacy_from_json(serialized)
+    try:
+        raw = base64.standard_b64decode(s.encode("ascii"))
+    except (binascii.Error, ValueError):
+        return _legacy_from_json(serialized)
+    want = expected_nelem * 4
+    if len(raw) != want:
+        raise ValueError(
+            f"{field}: decoded {len(raw)} bytes but expected {want} for dim={expected_nelem}",
+        )
+    vec = torch.from_numpy(np.frombuffer(raw, dtype=np.dtype("<f4")).copy()).float()
+    return vec.reshape(expected_nelem).contiguous()
 
 
 @dataclass
@@ -69,6 +107,18 @@ def gram_schmidt_orthogonalize(
         # Original target lay in span(basis); produce a fresh orthogonal vector
         # by perturbing along deterministic directions and re-orthogonalizing.
         basis_dim_note = len(basis)
+        d_full = int(v.numel())
+        if len(basis) >= d_full:
+            logger.warning(
+                "gram_schmidt_orthogonalize: failed to escape span(basis) after perturb retries "
+                "(norm=%s, len(basis)=%d)",
+                norm,
+                basis_dim_note,
+            )
+            raise ValueError(
+                f"gram_schmidt_orthogonalize: cannot produce orthogonal direction "
+                f"(norm={norm}, len(basis)={basis_dim_note})",
+            )
         perturbed_ok = False
         base_seed = (
             int(target.detach().to(torch.float32).abs().sum().item() * 1e6)
@@ -131,8 +181,8 @@ class OntologicalRegistry:
     def basis(self) -> list[torch.Tensor]:
         with self._lock:
             if self._basis_cache is None:
-                self._basis_cache = [c.axis for c in self.promoted.values()]
-            return list(self._basis_cache)
+                self._basis_cache = [c.axis.clone() for c in self.promoted.values()]
+            return [t.clone() for t in self._basis_cache]
 
     def maybe_promote(
         self, name: str, base_sketch: torch.Tensor
@@ -238,21 +288,27 @@ class PersistentOntologicalRegistry:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.namespace = namespace
         self._conn: sqlite3.Connection | None = None
+        self._conn_lock = threading.RLock()
         self._init_schema()
 
-    def _connect(self) -> sqlite3.Connection:
+    def _open_if_needed_unlocked(self) -> sqlite3.Connection:
         if self._conn is None:
-            self._conn = sqlite3.connect(str(self.path), timeout=30.0)
+            self._conn = sqlite3.connect(
+                str(self.path), timeout=30.0, check_same_thread=False
+            )
             self._conn.execute("PRAGMA journal_mode=WAL")
+            self._conn.isolation_level = None
         return self._conn
 
     def close(self) -> None:
-        if self._conn is not None:
-            self._conn.close()
-            self._conn = None
+        with self._conn_lock:
+            if self._conn is not None:
+                self._conn.close()
+                self._conn = None
 
     def _init_schema(self) -> None:
-        with self._connect() as con:
+        with self._conn_lock:
+            con = self._open_if_needed_unlocked()
             con.execute(
                 """
                 CREATE TABLE IF NOT EXISTS ontological_registry (
@@ -282,7 +338,8 @@ class PersistentOntologicalRegistry:
         now = time.time()
         promoted_names = set(registry.promoted.keys())
         access_names = set(registry.access_counts.keys())
-        with self._connect() as con:
+        with self._conn_lock:
+            con = self._open_if_needed_unlocked()
             if promoted_names:
                 placeholders = ",".join("?" * len(promoted_names))
                 con.execute(
@@ -319,8 +376,8 @@ class PersistentOntologicalRegistry:
                     (
                         self.namespace,
                         name,
-                        json.dumps(c.axis.tolist()),
-                        json.dumps(c.base_sketch.tolist()),
+                        _encode_fp32_flat(c.axis),
+                        _encode_fp32_flat(c.base_sketch),
                         float(c.promoted_at),
                         int(c.access_count),
                     ),
@@ -337,7 +394,8 @@ class PersistentOntologicalRegistry:
 
     def load(self, *, dim: int, frequency_threshold: int = 8) -> OntologicalRegistry:
         registry = OntologicalRegistry(dim=dim, frequency_threshold=frequency_threshold)
-        with self._connect() as con:
+        with self._conn_lock:
+            con = self._open_if_needed_unlocked()
             counts = con.execute(
                 "SELECT name, count FROM ontological_counts WHERE namespace=?",
                 (self.namespace,),
@@ -349,8 +407,17 @@ class PersistentOntologicalRegistry:
         for name, count in counts:
             registry.access_counts[str(name)] = int(count)
         for name, axis_json, base_json, promoted_at, access_count in promoted_rows:
-            axis = torch.tensor(json.loads(axis_json), dtype=torch.float32)
-            base = torch.tensor(json.loads(base_json), dtype=torch.float32)
+            axis = _decode_fp32_flat(
+                str(axis_json), expected_nelem=dim, field="axis"
+            )
+            base = _decode_fp32_flat(
+                str(base_json), expected_nelem=dim, field="base_sketch"
+            )
+            if axis.shape[-1] != dim or base.shape[-1] != dim:
+                raise ValueError(
+                    f"load: tensor trailing dim mismatch for {name!r}: "
+                    f"axis.shape={tuple(axis.shape)} base.shape={tuple(base.shape)} expected dim={dim}",
+                )
             registry.promoted[str(name)] = PromotedConcept(
                 name=str(name),
                 axis=axis,

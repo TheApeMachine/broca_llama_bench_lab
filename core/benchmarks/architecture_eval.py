@@ -9,6 +9,7 @@ faculty result.
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
 from dataclasses import asdict, dataclass
@@ -17,8 +18,26 @@ from typing import Any, Sequence
 
 from core.broca import BrocaMind, generate_without_broca
 
+logger = logging.getLogger(__name__)
+
 
 _WORD_RE = re.compile(r"[a-z0-9_]+")
+
+# Actions (and related tokens) accepted when scoring ``task_type == "active_inference"`` outputs.
+ACTIVE_INFERENCE_ACTION_VOCAB: frozenset[str] = frozenset(
+    {
+        "listen",
+        "open_left",
+        "open_right",
+        "observe_association",
+        "run_intervention_readout",
+        "observational",
+        "intervention",
+        "check",
+        "evidence",
+        "readout",
+    }
+)
 
 
 @dataclass(frozen=True)
@@ -69,20 +88,16 @@ def _score_output(output: str, *, expected_answer: str, expected_speech: str, ta
     answer_present = _contains_answer(output, expected_answer)
     if task_type == "active_inference":
         nt = _normalized_text(output)
-        action_vocab = {
-            "listen",
-            "open_left",
-            "open_right",
-            "observe_association",
-            "run_intervention_readout",
-            "observational",
-            "intervention",
-            "check",
-            "evidence",
-            "readout",
-        }
         toks = set(nt.split())
-        answer_present = bool(toks & action_vocab)
+        normalized_expected = _normalized_text(expected_answer)
+        if normalized_expected and normalized_expected not in ACTIVE_INFERENCE_ACTION_VOCAB:
+            logger.warning(
+                "active_inference expected_answer %r is not in ACTIVE_INFERENCE_ACTION_VOCAB; treating answer_present as False",
+                expected_answer,
+            )
+            answer_present = False
+        else:
+            answer_present = bool(normalized_expected) and normalized_expected in toks
         speech_exact = nt.startswith("i should") and answer_present
     return {
         "speech_exact": speech_exact,
@@ -127,7 +142,7 @@ def run_broca_architecture_eval(
     mid = llama_model_id or os.environ.get("MODEL_ID", "meta-llama/Llama-3.2-1B-Instruct")
 
     rows: list[dict[str, Any]] = []
-    graft_report = ""
+    graft_reports_by_case: dict[str, str] = {}
     for case in cases:
         mind = BrocaMind(
             seed=seed,
@@ -137,7 +152,7 @@ def run_broca_architecture_eval(
             device=device,
             hf_token=hf_token,
         )
-        graft_report = mind.host.graft_report()
+        graft_reports_by_case[case.id] = mind.host.graft_report()
         for setup in case.setup_prompts:
             mind.comprehend(setup)
         max_new_tokens = _encode_len(mind.tokenizer, case.expected_speech)
@@ -150,7 +165,7 @@ def run_broca_architecture_eval(
                 max_new_tokens=max_new_tokens,
             )
 
-        frame, enhanced_output = mind.answer(case.prompt)
+        frame, enhanced_output = mind.answer(case.prompt, max_new_tokens=max_new_tokens)
         rows.append(
             {
                 "id": case.id,
@@ -199,7 +214,7 @@ def run_broca_architecture_eval(
         "device": device,
         "seed": seed,
         "primary_metric": "speech_exact_accuracy",
-        "graft_report": graft_report,
+        "graft_reports_by_case": graft_reports_by_case,
         "cases": rows,
         "metrics": {
             "baseline_bare_language_host": {

@@ -2,15 +2,18 @@ from __future__ import annotations
 
 import itertools
 import logging
-import math
 import random
 from dataclasses import dataclass, field
-from typing import Callable, Iterable, Mapping, Sequence
+from typing import Callable, Iterable, Literal, Mapping, Sequence
 
 
 _EPS = 1e-12
 
 logger = logging.getLogger(__name__)
+
+
+class SimplePathEnumerationCap(RuntimeError):
+    """Too many simple paths between two nodes (used when ``on_path_cap='raise'``)."""
 
 
 @dataclass
@@ -46,6 +49,8 @@ class FiniteSCM:
             p = {x: 1.0 / len(dom) for x in dom}
         else:
             z = float(sum(probs.values()))
+            if z == 0.0:
+                raise ValueError(f"probs for exogenous variable {name!r} sum to zero")
             p = {x: float(probs.get(x, 0.0)) / z for x in dom}
         self.domains[name] = dom
         self.exogenous[name] = p
@@ -54,6 +59,24 @@ class FiniteSCM:
         self.domains[name] = tuple(domain)
         self.equations[name] = EndogenousEquation(name, tuple(parents), fn)
         self.order.append(name)
+
+    def update_endogenous(
+        self,
+        name: str,
+        *,
+        fn: Callable[[dict], object],
+        domain: Sequence | None = None,
+        parents: Sequence[str] | None = None,
+    ) -> None:
+        """Replace the structural equation for an existing variable (same API as hand patches)."""
+
+        if name not in self.equations:
+            raise ValueError(f"FiniteSCM.update_endogenous: unknown endogenous variable {name!r}")
+        cur = self.equations[name]
+        new_parents = tuple(parents) if parents is not None else cur.parents
+        if domain is not None:
+            self.domains[name] = tuple(domain)
+        self.equations[name] = EndogenousEquation(name=name, parents=new_parents, fn=fn)
 
     @property
     def endogenous_names(self) -> tuple[str, ...]:
@@ -322,8 +345,7 @@ class FiniteSCM:
             if all(cf.get(k) == v for k, v in query_event_d.items()):
                 num += 1
 
-        if den <= 0:
-            return 0.0
+        assert den > 0
         return num / den
 
     def _gibbs_resample(
@@ -450,7 +472,18 @@ class FiniteSCM:
                 nb[child].add(p)
         return nb
 
-    def _all_simple_paths(self, start: str, end: str, parents: Mapping[str, Sequence[str]], max_len: int | None = None) -> list[list[str]]:
+    def _all_simple_paths(
+        self,
+        start: str,
+        end: str,
+        parents: Mapping[str, Sequence[str]],
+        max_len: int | None = None,
+        *,
+        max_paths: int | None = None,
+        on_path_cap: Literal["return", "raise"] = "return",
+    ) -> tuple[list[list[str]], bool]:
+        """Enumerate simple paths; returns ``(paths, capped)`` when ``max_paths`` truncates."""
+
         nb = self._neighbors(parents)
         max_len = max_len or len(nb) + 1
         paths: list[list[str]] = []
@@ -461,11 +494,17 @@ class FiniteSCM:
                 continue
             if cur == end:
                 paths.append(path)
+                if max_paths is not None and len(paths) >= max_paths:
+                    if on_path_cap == "raise":
+                        raise SimplePathEnumerationCap(
+                            f"simple path enumeration exceeded max_paths={max_paths} between {start!r} and {end!r}",
+                        )
+                    return paths, True
                 continue
             for nxt in nb.get(cur, ()):
                 if nxt not in path:
                     stack.append((nxt, path + [nxt]))
-        return paths
+        return paths, False
 
     @staticmethod
     def _has_arrow(parents: Mapping[str, Sequence[str]], src: str, dst: str) -> bool:
@@ -493,6 +532,8 @@ class FiniteSCM:
         z: Iterable[str] = (),
         *,
         parents: Mapping[str, Sequence[str]] | None = None,
+        max_simple_paths: int | None = None,
+        on_simple_path_cap: Literal["assume_not_separated", "raise"] = "assume_not_separated",
     ) -> bool:
         parents = {k: list(v) for k, v in (parents or self.graph_parents(include_exogenous=True)).items()}
         xs = {x} if isinstance(x, str) else set(x)
@@ -500,7 +541,14 @@ class FiniteSCM:
         conditioned = set(z)
         for a in xs:
             for b in ys:
-                for path in self._all_simple_paths(a, b, parents):
+                paths, capped = self._all_simple_paths(a, b, parents, max_paths=max_simple_paths, on_path_cap="return")
+                if capped:
+                    if on_simple_path_cap == "raise":
+                        raise SimplePathEnumerationCap(
+                            f"d_separation path search truncated at max_simple_paths={max_simple_paths}",
+                        )
+                    return False
+                for path in paths:
                     if len(path) > 1 and self._path_active(path, conditioned, parents):
                         return False
         return True

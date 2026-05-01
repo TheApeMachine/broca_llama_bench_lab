@@ -42,8 +42,6 @@ def quiet_transformers_benchmark_log_warnings() -> None:
     property logs a one-shot warning via ``logging`` that dominates benchmark output.
     This does not change model behavior."""
     try:
-        import logging
-
         for name in ("transformers.configuration_utils", "transformers.modeling_utils"):
             logging.getLogger(name).setLevel(logging.ERROR)
     except Exception:  # pragma: no cover
@@ -311,12 +309,24 @@ class LlamaBrocaHost(nn.Module):
             mask = torch.ones_like(idx, dtype=torch.bool)
         else:
             mask = attention_mask.bool()
-        last_indices = mask.long().sum(dim=1).clamp_min(1) - 1
         attn = mask.long()
 
         tokenizer = None
         if extra_state:
             tokenizer = extra_state.get("tokenizer")
+        past_key_values = None
+        return_past_key_values = False
+        if extra_state:
+            past_key_values = extra_state.get("past_key_values")
+            return_past_key_values = bool(extra_state.get("return_past_key_values", False))
+
+        if past_key_values is None:
+            last_indices = mask.long().sum(dim=1).clamp_min(1) - 1
+        else:
+            # With KV cache, hidden/logits cover only the new tokens; grafts index that slice.
+            seq_new = idx.shape[1]
+            last_indices = torch.full((idx.shape[0],), max(0, seq_new - 1), device=idx.device, dtype=torch.long)
+
         state: dict[str, Any] = {
             "model": self,
             "tokenizer": tokenizer,
@@ -325,7 +335,10 @@ class LlamaBrocaHost(nn.Module):
             "last_indices": last_indices,
         }
         if extra_state:
-            state.update(extra_state)
+            for _k, _v in extra_state.items():
+                if _k in ("past_key_values", "return_past_key_values"):
+                    continue
+                state[_k] = _v
 
         if logger.isEnabledFor(logging.DEBUG) and extra_state and self._grafts_enabled:
             broca_hints = tuple(
@@ -348,7 +361,15 @@ class LlamaBrocaHost(nn.Module):
         self._active_state = state
         self._active_cache = cache
         try:
-            out = lm.model(input_ids=idx, attention_mask=attn, return_dict=True)
+            model_kwargs: dict[str, Any] = {
+                "input_ids": idx,
+                "attention_mask": attn,
+                "return_dict": True,
+                "use_cache": True,
+            }
+            if past_key_values is not None:
+                model_kwargs["past_key_values"] = past_key_values
+            out = lm.model(**model_kwargs)
         finally:
             self._active_state = None
             self._active_cache = None
@@ -363,6 +384,8 @@ class LlamaBrocaHost(nn.Module):
         if return_cache:
             assert cache is not None
             return logits, cache
+        if return_past_key_values:
+            return logits, out.past_key_values
         return logits
 
 
@@ -399,7 +422,7 @@ def load_llama_broca_host(
     attn_impl = "eager" if dev.type == "mps" else "sdpa"
 
     model_kwargs = dict(
-        dtype=dtype,
+        torch_dtype=dtype,
         low_cpu_mem_usage=True,
         token=tk,
         attn_implementation=attn_impl,

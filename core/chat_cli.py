@@ -16,6 +16,7 @@ Logs: ``core`` sets DEBUG stderr logging when the package is imported unless
 from __future__ import annotations
 
 import argparse
+import logging
 import os
 import sys
 import threading
@@ -29,6 +30,8 @@ from .device_utils import pick_torch_device
 from .llama_broca_host import load_llama_broca_host, quiet_transformers_benchmark_log_warnings, resolve_hf_hub_token
 from .logging_setup import configure_lab_logging
 
+logger = logging.getLogger(__name__)
+
 
 def _stream_reply(
     model: Any,
@@ -41,7 +44,7 @@ def _stream_reply(
     top_p: float,
 ) -> str:
     try:
-        from transformers import TextIteratorStreamer
+        from transformers import StoppingCriteria, StoppingCriteriaList, TextIteratorStreamer
     except ImportError as e:  # pragma: no cover
         raise ImportError("Streaming chat requires transformers; pip install -r requirements-benchmark.txt") from e
 
@@ -65,6 +68,16 @@ def _stream_reply(
         gen_kwargs["do_sample"] = False
 
     chunks: list[str] = []
+    stop_event = threading.Event()
+
+    class _StopOnEvent(StoppingCriteria):
+        def __init__(self, ev: threading.Event) -> None:
+            self._ev = ev
+
+        def __call__(self, input_ids: Any, scores: Any, **kwargs: Any) -> bool:  # noqa: ARG002
+            return self._ev.is_set()
+
+    gen_kwargs["stopping_criteria"] = StoppingCriteriaList([_StopOnEvent(stop_event)])
 
     def _worker() -> None:
         with torch.inference_mode():
@@ -77,10 +90,18 @@ def _stream_reply(
             chunks.append(text)
             sys.stdout.write(text)
             sys.stdout.flush()
+            if stop_event.is_set():
+                break
     except KeyboardInterrupt:
+        stop_event.set()
         sys.stdout.write("\n[generation interrupted]\n")
         sys.stdout.flush()
     thread.join(timeout=600.0)
+    if thread.is_alive():
+        logger.warning(
+            "Vanilla HF stream: background generation thread still alive after join timeout (600s); "
+            "model.generate may continue until completion."
+        )
     return "".join(chunks)
 
 
@@ -161,15 +182,27 @@ def main() -> None:
             validated_interval = max(0.1, float(args.background_interval))
             mind.start_background(interval_s=validated_interval)
             print(f"Background consolidation: every {validated_interval:.1f}s", flush=True)
-        if args.system:
-            print("(Note: --system applies only to vanilla HF chat mode, not --broca routing.)", flush=True)
         print("Substrate biases the LLM via grafts; the LLM still chooses the surface form.", flush=True)
         print("Commands: /quit /exit — leave.", flush=True)
         print(flush=True)
 
         messages: list[dict[str, str]] = []
+        supports_system_messages = getattr(mind, "supports_system_messages", None)
+        if supports_system_messages is None:
+            supports_system_messages = not isinstance(mind, BrocaMind)
         if args.system:
-            messages.append({"role": "system", "content": args.system.strip()})
+            stripped = args.system.strip()
+            if stripped and supports_system_messages:
+                messages.append({"role": "system", "content": stripped})
+            elif stripped:
+                print(
+                    "(Note: BrocaMind does not use HF-style system prompts in routing; omit --system or use vanilla mode.)",
+                    flush=True,
+                )
+
+        def _on_token(piece: str) -> None:
+            sys.stdout.write(piece)
+            sys.stdout.flush()
 
         try:
             while True:
@@ -188,10 +221,6 @@ def main() -> None:
                 messages.append({"role": "user", "content": line})
                 sys.stdout.write("Assistant> ")
                 sys.stdout.flush()
-
-                def _on_token(piece: str) -> None:
-                    sys.stdout.write(piece)
-                    sys.stdout.flush()
 
                 try:
                     frame, reply = mind.chat_reply(

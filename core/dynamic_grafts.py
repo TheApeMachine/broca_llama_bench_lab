@@ -231,14 +231,29 @@ def _resolve_target_token_id(tokenizer: Any, target_token: str) -> int | None:
     encode = getattr(tokenizer, "encode", None)
     if callable(encode):
         try:
-            ids = list(encode(target_token))
+            raw = encode(target_token)
+            ids = list(raw)
+            if len(ids) > 1:
+                logger.warning(
+                    "_resolve_target_token_id: target_token=%r split into %d subtokens %s; using first id only",
+                    target_token,
+                    len(ids),
+                    ids,
+                )
             if ids:
                 return int(ids[0])
         except Exception:
             logger.debug("_resolve_target_token_id: tokenizer.encode failed", exc_info=True)
     inner = getattr(tokenizer, "inner", None)
     if inner is not None and callable(getattr(inner, "encode", None)):
-        ids = inner.encode(target_token, add_special_tokens=False)
+        ids = list(inner.encode(target_token, add_special_tokens=False))
+        if len(ids) > 1:
+            logger.warning(
+                "_resolve_target_token_id: target_token=%r split into %d subtokens %s; using first id only",
+                target_token,
+                len(ids),
+                ids,
+            )
         if ids:
             return int(ids[0])
     return None
@@ -368,12 +383,7 @@ class DynamicGraftSynthesizer:
         ids_to_delete = [r.id for r in records if str(r.metadata.get("name", "")) == name]
         if not ids_to_delete:
             return 0
-        with self.store._connect() as con:
-            placeholders = ",".join("?" for _ in ids_to_delete)
-            con.execute(
-                f"DELETE FROM activation_memory WHERE id IN ({placeholders})",
-                tuple(ids_to_delete),
-            )
+        self.store.delete_records(ids_to_delete)
         return len(ids_to_delete)
 
     def count(self) -> int:

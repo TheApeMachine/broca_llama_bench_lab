@@ -75,10 +75,27 @@ class MultivariateHawkesProcess:
     ) -> None:
         """Replace channel order and intensity parameters; reset per-channel caches."""
 
+        chan_list = list(channels)
+        n = len(chan_list)
+        if len(mu) != n:
+            raise ValueError(
+                f"refit: len(mu)={len(mu)} must equal len(channels)={n}",
+            )
+        alpha_rows = [[float(x) for x in row] for row in alpha]
+        if len(alpha_rows) != n:
+            raise ValueError(
+                f"refit: alpha has {len(alpha_rows)} rows; expected {n} to match channels",
+            )
+        for ri, row in enumerate(alpha_rows):
+            if len(row) != n:
+                raise ValueError(
+                    f"refit: alpha row {ri} has length {len(row)}; expected square matrix {n}x{n}",
+                )
+
         now = time.time()
-        self.channels = list(channels)
+        self.channels = chan_list
         self.mu = [float(m) for m in mu]
-        self.alpha = [[float(x) for x in row] for row in alpha]
+        self.alpha = alpha_rows
         self._states = [HawkesState(last_t=now) for _ in self.channels]
 
     # ------------------------------------------------------------------ schema
@@ -171,8 +188,7 @@ class MultivariateHawkesProcess:
         when = float(t) if t is not None else time.time()
         self._decay_all(when)
         return {
-            name: self._intensity_no_decay(self.channels.index(name))
-            for name in self.channels
+            name: self._intensity_no_decay(i) for i, name in enumerate(self.channels)
         }
 
     # ------------------------------------------------------------------ learning
@@ -206,15 +222,19 @@ class MultivariateHawkesProcess:
             local.observe(ch, t=t)
         T = float(horizon if horizon is not None else sorted_events[-1][1])
         T0 = float(sorted_events[0][1])
-        compensator = sum(self.mu) * (T - T0)
+        # Compensator must use the same channel set / parameters as ``local``
+        # (which may auto-register channels during intensity/observe).
+        compensator = sum(local.mu) * (T - T0)
         # Per-channel α_{ij} contributions to compensator.
-        for j, name in enumerate(self.channels):
+        for j, name in enumerate(local.channels):
             arrivals = [t for c, t in sorted_events if c == name]
             for s in arrivals:
                 tail = max(0.0, T - s)
-                kernel_int = (1.0 - math.exp(-self.beta * tail)) / max(self.beta, 1e-9)
-                for i in range(len(self.channels)):
-                    compensator += float(self.alpha[i][j]) * kernel_int
+                kernel_int = (1.0 - math.exp(-local.beta * tail)) / max(
+                    local.beta, 1e-9,
+                )
+                for i in range(len(local.channels)):
+                    compensator += float(local.alpha[i][j]) * kernel_int
         nll = compensator - log_intensity_sum
         logger.debug(
             "MultivariateHawkesProcess.NLL: events=%d horizon=%.3f nll=%.4f",
@@ -296,14 +316,61 @@ class PersistentHawkes:
             ).fetchone()
         if row is None:
             return None
-        proc = MultivariateHawkesProcess(beta=float(row[0]), baseline=float(row[1]))
-        proc.channels = list(json.loads(row[2]))
-        proc.mu = list(json.loads(row[3]))
-        proc.alpha = [list(r) for r in json.loads(row[4])]
-        proc._states = [
-            HawkesState(last_t=float(s["last_t"]), cache=list(s["cache"]))
-            for s in json.loads(row[5])
-        ]
+        beta_v = float(row[0])
+        baseline_v = float(row[1])
+        channels = list(json.loads(row[2]))
+        mu = list(json.loads(row[3]))
+        alpha = [list(r) for r in json.loads(row[4])]
+        states_raw = json.loads(row[5])
+        n = len(channels)
+        if len(mu) != n:
+            raise ValueError(
+                f"PersistentHawkes.load: len(mu)={len(mu)} != len(channels)={n}",
+            )
+        if len(alpha) != n:
+            raise ValueError(
+                f"PersistentHawkes.load: alpha has {len(alpha)} rows; expected {n}",
+            )
+        for ri, r in enumerate(alpha):
+            if len(r) != n:
+                raise ValueError(
+                    f"PersistentHawkes.load: alpha row {ri} has length {len(r)}; expected {n}",
+                )
+        if len(states_raw) != n:
+            raise ValueError(
+                f"PersistentHawkes.load: len(states)={len(states_raw)} != n_channels={n}",
+            )
+        states: list[HawkesState] = []
+        for si, s in enumerate(states_raw):
+            if not isinstance(s, dict):
+                raise ValueError(
+                    f"PersistentHawkes.load: states[{si}] must be an object/dict",
+                )
+            if "last_t" not in s or "cache" not in s:
+                raise ValueError(
+                    f"PersistentHawkes.load: states[{si}] missing required keys 'last_t' and/or 'cache'",
+                )
+            if not isinstance(s["last_t"], (int, float)):
+                raise ValueError(
+                    f"PersistentHawkes.load: states[{si}]['last_t'] must be numeric",
+                )
+            if not isinstance(s["cache"], list):
+                raise ValueError(
+                    f"PersistentHawkes.load: states[{si}]['cache'] must be a list",
+                )
+            try:
+                cache_list = [float(x) for x in s["cache"]]
+            except (TypeError, ValueError) as e:
+                raise ValueError(
+                    f"PersistentHawkes.load: states[{si}]['cache'] must be numeric list",
+                ) from e
+            states.append(HawkesState(last_t=float(s["last_t"]), cache=cache_list))
+
+        proc = MultivariateHawkesProcess(beta=beta_v, baseline=baseline_v)
+        proc.channels = channels
+        proc.mu = [float(x) for x in mu]
+        proc.alpha = [[float(x) for x in row] for row in alpha]
+        proc._states = states
         return proc
 
 
@@ -359,9 +426,8 @@ def fit_excitation_em(
                 kj = types[j]
                 tj = times[j]
                 w = alpha[ki][kj] * math.exp(-beta * (ti - tj))
-                if w > 0:
-                    weights.append(w)
-                    sources.append(j)
+                weights.append(w)
+                sources.append(j)
             total = sum(weights)
             if total <= 0.0:
                 logger.warning(

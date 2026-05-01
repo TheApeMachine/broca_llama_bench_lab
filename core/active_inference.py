@@ -4,6 +4,7 @@ import itertools
 import logging
 import math
 import random
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 from typing import Sequence
 
@@ -11,6 +12,10 @@ logger = logging.getLogger(__name__)
 
 
 _EPS = 1e-12
+
+# Cap for ``n_actions ** horizon`` full policy enumeration; above this, :meth:`CategoricalPOMDP.enumerate_policies`
+# logs a warning and returns a lazy ``itertools.product`` iterator instead of a concrete ``list``.
+MAX_POLICY_ENUMERATION = 500_000
 
 
 def normalize(xs: Sequence[float]) -> list[float]:
@@ -152,8 +157,42 @@ class CategoricalPOMDP:
         G = risk + ambiguity_value - epistemic
         return PolicyEvaluation(tuple(policy), G, risk, ambiguity_value, epistemic)
 
-    def enumerate_policies(self, horizon: int) -> list[tuple[int, ...]]:
-        return list(itertools.product(range(self.n_actions), repeat=int(horizon)))
+    def enumerate_policies(
+        self,
+        horizon: int,
+        *,
+        max_policies: int | None = None,
+    ) -> Iterable[tuple[int, ...]]:
+        """Yield all action sequences of length ``horizon``.
+
+        For small problems (``n_actions ** horizon <= max_policies``), returns a
+        concrete list; for larger horizons, logs a warning and returns an
+        ``itertools.product`` iterator so callers can stream without holding
+        every tuple in memory at once. Prefer horizons that keep the count within
+        a few hundred thousand for interactive agents; raise ``horizon`` only
+        when ``n_actions`` is tiny or use custom planners for long horizons.
+
+        ``max_policies`` defaults to :data:`MAX_POLICY_ENUMERATION`.
+        """
+        h = int(horizon)
+        if h < 0:
+            raise ValueError("horizon must be non-negative")
+        na = int(self.n_actions)
+        cap = int(MAX_POLICY_ENUMERATION if max_policies is None else max_policies)
+        if cap < 1:
+            raise ValueError("max_policies must be >= 1")
+        total = na**h if h > 0 else 1
+        prod = itertools.product(range(na), repeat=h)
+        if total > cap:
+            logger.warning(
+                "enumerate_policies: n_actions=%d horizon=%d yields %d policies (>%d); returning iterator not list",
+                na,
+                h,
+                total,
+                cap,
+            )
+            return prod
+        return list(prod)
 
     def learn_A(self, action: int, obs: int, qs_post: Sequence[float], lr: float = 1.0) -> None:
         for s, mass in enumerate(qs_post):
@@ -239,7 +278,10 @@ class ActiveInferenceAgent:
         self.qs = list(self.pomdp.D)
 
     def decide(self) -> Decision:
-        assert self.qs is not None
+        if self.qs is None:
+            raise RuntimeError(
+                "ActiveInferenceAgent.qs is not initialized; cannot run decide() (evaluate_policy / enumerate_policies require beliefs)."
+            )
         evals = [self.pomdp.evaluate_policy(pol, self.qs) for pol in self.pomdp.enumerate_policies(self.horizon)]
         g_vals = [e.expected_free_energy for e in evals]
         spread = float(max(g_vals) - min(g_vals))
@@ -260,7 +302,8 @@ class ActiveInferenceAgent:
         return Decision(action, self.pomdp.action_names[action], list(self.qs), evals, posterior)
 
     def update(self, action: int, obs: int, lr: float = 1.0) -> list[float]:
-        assert self.qs is not None
+        if self.qs is None:
+            raise RuntimeError("ActiveInferenceAgent.qs is not initialized; cannot run update().")
         before = list(self.qs)
         pred = self.pomdp.predict_state(before, action)
         po = self.pomdp.observation_distribution(pred, action)
@@ -272,8 +315,6 @@ class ActiveInferenceAgent:
             self.qs = self.pomdp.expand_state(label, qs=before, predictive_mass_obs=float(po[obs]))
             pred = self.pomdp.predict_state(self.qs, action)
             expanded = True
-        else:
-            self.qs = before
         post = self.pomdp.posterior_after_observation(pred, action, obs)
         if self.learn:
             self.pomdp.learn_A(action, obs, post, lr=lr)
@@ -430,13 +471,13 @@ def build_tiger_pomdp() -> CategoricalPOMDP:
     open_left = [
         [0.0, 0.0],
         [0.0, 0.0],
-        [1.0, 0.0],         # reward if treasure/tiger state is left
+        [1.0, 0.0],         # reward if treasure (safe door) is left — matches TigerDoorEnv.open_left (s==0)
         [0.0, 1.0],
     ]
     open_right = [
         [0.0, 0.0],
         [0.0, 0.0],
-        [0.0, 1.0],
+        [0.0, 1.0],         # reward if treasure (safe door) is right — matches TigerDoorEnv.open_right (s==1)
         [1.0, 0.0],
     ]
     B = identity_transition(3, 2)
@@ -648,7 +689,7 @@ def extend_pomdp_with_synthesize_tool(
     # Build likelihood for the new action: spread mass across observations such that
     # for each existing state, prefer the *highest-mass observation* of any existing
     # action (i.e., synthesizing reproduces "the best known sensor" once it succeeds).
-    new_a_obs_by_state: list[float] = []
+    new_a_obs_by_state: list[list[float]] = []
     coverage = 1.0 - 1.0 / (1.0 + int(max(0, n_existing_tools)))
     for s in range(n_states):
         # Find each observation's max likelihood across existing actions for this state.

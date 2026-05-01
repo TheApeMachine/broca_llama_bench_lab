@@ -93,10 +93,11 @@ def hopfield_update(
     lse = torch.logsumexp(b * (keys @ q.flatten().to(keys.dtype)), dim=-1) / max(
         b, 1e-12
     )
+    max_key_norm_sq = 0.5 * float(keys.norm(dim=-1).pow(2).max().item())
     half_q_norm = 0.5 * float(
         (q.flatten().to(torch.float32) @ q.flatten().to(torch.float32)).item()
     )
-    energy = float(half_q_norm - float(lse.item()))
+    energy = half_q_norm - float(lse.item()) + max_key_norm_sq
     logger.debug(
         "hopfield_update: beta=%.4f iters=%d N=%d d=%d energy=%.4f weight_max=%.4f",
         b,
@@ -126,8 +127,14 @@ class HopfieldAssociativeMemory:
         dtype: torch.dtype = torch.float32,
         device: torch.device | str | None = None,
     ):
-        self.d_model = int(d_model)
-        self.max_items = int(max_items)
+        dm = int(d_model)
+        mi = int(max_items)
+        if dm <= 0:
+            raise ValueError(f"d_model must be a positive integer, got {d_model}")
+        if mi <= 0:
+            raise ValueError(f"max_items must be a positive integer, got {max_items}")
+        self.d_model = dm
+        self.max_items = mi
         self.dtype = dtype
         self.device = (
             torch.device(device) if device is not None else torch.device("cpu")
@@ -199,11 +206,23 @@ class HopfieldAssociativeMemory:
         md = dict(metadata or {})
         with self._lock:
             start = self._write_pos
-            for i in range(b):
-                slot = (start + i) % self.max_items
-                self._buf_keys[slot] = k[i].to(self._buf_keys.dtype)
-                self._buf_values[slot] = v[i].to(self._buf_values.dtype)
-                self._meta_ring[slot] = dict(md)
+            end_excl = start + b
+            if end_excl <= self.max_items:
+                self._buf_keys[start:end_excl] = k
+                self._buf_values[start:end_excl] = v
+                for ii in range(b):
+                    self._meta_ring[start + ii] = dict(md)
+            else:
+                first = self.max_items - start
+                self._buf_keys[start:] = k[:first]
+                self._buf_values[start:] = v[:first]
+                rest = b - first
+                self._buf_keys[:rest] = k[first:]
+                self._buf_values[:rest] = v[first:]
+                for ii in range(first):
+                    self._meta_ring[start + ii] = dict(md)
+                for ii in range(rest):
+                    self._meta_ring[ii] = dict(md)
             self._write_pos = (start + b) % self.max_items
             self._count = min(self.max_items, self._count + b)
             total_rows = self._count

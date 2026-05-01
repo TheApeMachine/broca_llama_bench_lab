@@ -135,6 +135,8 @@ class KVMemoryGraft(BaseGraft):
         self.metadata: list[dict] = []
         self.last_debug: dict = {}
         self.spread_matrix: torch.Tensor | None = None
+        self._manifold_tau: float | None = None
+        self._manifold_sigma: float | None = None
 
     def clear(self) -> None:
         self.keys = self.keys.new_empty(0, self.d_model)
@@ -142,6 +144,8 @@ class KVMemoryGraft(BaseGraft):
         self.metadata.clear()
         self.last_debug = {}
         self.spread_matrix = None
+        self._manifold_tau = None
+        self._manifold_sigma = None
 
     def set_spread_matrix(self, mat: torch.Tensor | None) -> None:
         """Row-stochastic operator indexed like ``remember`` order (from activation store)."""
@@ -174,6 +178,25 @@ class KVMemoryGraft(BaseGraft):
             int(self.keys.shape[0]),
             self.d_model,
         )
+        self._recompute_manifold_cache()
+
+    def _recompute_manifold_cache(self) -> None:
+        """Refresh inter-key manifold stats (O(n^2)); call only when the key store changes."""
+
+        nk = int(self.keys.shape[0])
+        if nk < 2:
+            self._manifold_tau = None
+            self._manifold_sigma = None
+            return
+        k = F.normalize(self.keys, dim=-1)
+        gram = k @ k.T
+        eye = torch.eye(nk, device=gram.device, dtype=torch.bool)
+        masked = gram.masked_fill(eye, torch.finfo(gram.dtype).min)
+        neighbor_max = masked.max(dim=-1).values
+        tau = neighbor_max.median()
+        sigma = neighbor_max.std(unbiased=False).clamp_min(1e-6)
+        self._manifold_tau = float(tau.detach().cpu())
+        self._manifold_sigma = float(sigma.detach().cpu())
 
     def _retrieve(
         self,
@@ -197,17 +220,25 @@ class KVMemoryGraft(BaseGraft):
         gate_peak = torch.sigmoid(z_peak * sqrt_d)
 
         if nk >= 2:
-            gram = k @ k.T
-            eye = torch.eye(nk, device=gram.device, dtype=torch.bool)
-            masked = gram.masked_fill(eye, torch.finfo(gram.dtype).min)
-            neighbor_max = masked.max(dim=-1).values
-            tau = neighbor_max.median()
-            sigma = neighbor_max.std(unbiased=False).clamp_min(1e-6)
-            gate_manifold = torch.sigmoid((max_raw - tau) / sigma * sqrt_d)
-            manifold_dbg = {
-                "tau_key_manifold": float(tau.detach().cpu()),
-                "sigma_key_manifold": float(sigma.detach().cpu()),
-            }
+            tau_f = self._manifold_tau
+            sigma_f = self._manifold_sigma
+            if tau_f is None or sigma_f is None:
+                self._recompute_manifold_cache()
+                tau_f = self._manifold_tau
+                sigma_f = self._manifold_sigma
+            if tau_f is None or sigma_f is None:
+                gate_manifold = torch.ones(
+                    raw_sims.shape[0], device=x.device, dtype=raw_sims.dtype
+                )
+                manifold_dbg = {"tau_key_manifold": 0.0, "sigma_key_manifold": 1.0}
+            else:
+                gate_manifold = torch.sigmoid(
+                    (max_raw - tau_f) / sigma_f * sqrt_d
+                )
+                manifold_dbg = {
+                    "tau_key_manifold": tau_f,
+                    "sigma_key_manifold": sigma_f,
+                }
         else:
             gate_manifold = torch.ones(
                 raw_sims.shape[0], device=x.device, dtype=raw_sims.dtype
@@ -624,15 +655,21 @@ def extract_next_token_memory(
     if target_token not in tokenizer.token_to_id:
         raise KeyError(f"target token {target_token!r} not in tokenizer vocabulary")
     batch = tokenizer.batch_encode([prompt], device=next(model.parameters()).device)
+    if batch.attention_mask.shape[0] != 1:
+        raise ValueError(
+            f"extract_next_token_memory expects a single prompt (batch size 1); got batch={batch.attention_mask.shape[0]}"
+        )
     model.eval()
     with model.grafts_enabled(False):
         _, cache = model(batch.ids, batch.attention_mask, return_cache=True)
     hidden = cache[f"{slot}.pre"]
     if query_mode == "sequence_mean":
         mask = batch.attention_mask.to(hidden.dtype).unsqueeze(-1)
-        key = (hidden * mask).sum(dim=1)[0] / mask.sum(dim=1).clamp_min(1.0)[0]
+        seq_len_sum = mask.sum(dim=1).clamp_min(1.0)
+        key = (hidden * mask).sum(dim=1)[0] / seq_len_sum[0]
     elif query_mode == "token":
-        key = hidden[0, batch.lengths.item() - 1]
+        last_pos = int(batch.lengths[0].item()) - 1
+        key = hidden[0, last_pos]
     else:
         raise ValueError("query_mode must be 'token' or 'sequence_mean'")
     target_id = tokenizer.token_to_id[target_token]

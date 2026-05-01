@@ -33,6 +33,7 @@ from __future__ import annotations
 import argparse
 import datetime as _dt
 import json
+import logging
 import os
 import sys
 import tempfile
@@ -48,6 +49,8 @@ from core.benchmarks.hf_datasets_eval import (
 )
 from core.benchmarks.lm_eval_pair import run_paired_lm_eval
 from core.device_utils import normalize_device_arg, pick_torch_device
+
+logger = logging.getLogger(__name__)
 
 DEFAULT_BENCHMARK_MODEL = DEFAULT_LLAMA_MODEL
 
@@ -99,6 +102,81 @@ def normalize_limit_override(limit_override: str | int | None) -> str | None:
         return None
     stripped = str(limit_override).strip()
     return stripped if stripped else None
+
+
+def _benchmark_seed(args: argparse.Namespace) -> int:
+    if args.seed is not None:
+        return int(args.seed)
+    raw = os.environ.get("BENCHMARK_SEED", "0")
+    try:
+        return int(str(raw).strip())
+    except ValueError:
+        print(f"Invalid BENCHMARK_SEED={raw!r} (expected integer).", file=sys.stderr)
+        raise SystemExit(2) from None
+
+
+def _resolved_limit_strings_and_native_int(args: argparse.Namespace) -> tuple[str | None, int | None]:
+    if args.limit is not None:
+        limit_s = str(int(args.limit))
+    else:
+        limit_s = normalize_limit_override(os.environ.get("BENCHMARK_LIMIT"))
+    if limit_s is None:
+        native_limit = 50
+    else:
+        try:
+            native_limit = int(limit_s)
+        except ValueError:
+            print(f"Invalid --limit / BENCHMARK_LIMIT value {limit_s!r} (expected integer).", file=sys.stderr)
+            raise SystemExit(2) from None
+    if native_limit < 0:
+        return limit_s, None
+    return limit_s, native_limit
+
+
+def _try_print_architecture_suite_metrics(result: dict[str, Any], *, artifact_path: Path) -> None:
+    """Log/print summary when ``artifact_path`` result carries the expected ``metrics`` tree."""
+
+    if not isinstance(result, dict):
+        logger.error("Broca architecture eval returned non-dict result: %r", result)
+        return
+    metrics = result.get("metrics")
+    if not isinstance(metrics, dict):
+        logger.error("Broca architecture eval result missing dict 'metrics': keys=%s", list(result.keys()))
+        return
+    arms = (
+        "baseline_bare_language_host",
+        "enhanced_broca_architecture",
+        "delta_enhanced_minus_baseline",
+    )
+    subkeys = ("speech_exact_accuracy", "answer_present_accuracy")
+    try:
+        for arm in arms:
+            block = metrics[arm]
+            for sk in subkeys:
+                block[sk]
+    except KeyError as exc:
+        logger.error(
+            "Broca architecture eval metrics missing expected nested keys (%s); metrics=%r full_result=%r",
+            exc,
+            metrics,
+            result,
+        )
+        return
+
+    base = metrics["baseline_bare_language_host"]["speech_exact_accuracy"]
+    enhanced = metrics["enhanced_broca_architecture"]["speech_exact_accuracy"]
+    delta = metrics["delta_enhanced_minus_baseline"]["speech_exact_accuracy"]
+    base_ans = metrics["baseline_bare_language_host"]["answer_present_accuracy"]
+    enh_ans = metrics["enhanced_broca_architecture"]["answer_present_accuracy"]
+    d_ans = metrics["delta_enhanced_minus_baseline"]["answer_present_accuracy"]
+    print("\n--- Broca architecture eval (baseline vs enhanced) ---", flush=True)
+    print(
+        "  (speech_exact_* = verbatim match vs Broca's scripted reference line; bare LM baseline is usually 0.)",
+        flush=True,
+    )
+    print(f"  speech_exact_accuracy: baseline={base:.3f} enhanced={enhanced:.3f} delta={delta:+.3f}", flush=True)
+    print(f"  answer_present_accuracy: baseline={base_ans:.3f} enhanced={enh_ans:.3f} delta={d_ans:+.3f}", flush=True)
+    print(f"  wrote {artifact_path}", flush=True)
 
 
 def resolve_cli_device(device: str | None) -> tuple[str, str]:
@@ -214,21 +292,7 @@ def run_broca_architecture_benchmark(
             print(f"Broca architecture eval: could not load Llama Broca stack ({exc})", file=sys.stderr)
             return result
 
-    metrics = result["metrics"]
-    base = metrics["baseline_bare_language_host"]["speech_exact_accuracy"]
-    enhanced = metrics["enhanced_broca_architecture"]["speech_exact_accuracy"]
-    delta = metrics["delta_enhanced_minus_baseline"]["speech_exact_accuracy"]
-    base_ans = metrics["baseline_bare_language_host"]["answer_present_accuracy"]
-    enh_ans = metrics["enhanced_broca_architecture"]["answer_present_accuracy"]
-    d_ans = metrics["delta_enhanced_minus_baseline"]["answer_present_accuracy"]
-    print("\n--- Broca architecture eval (baseline vs enhanced) ---", flush=True)
-    print(
-        "  (speech_exact_* = verbatim match vs Broca's scripted reference line; bare LM baseline is usually 0.)",
-        flush=True,
-    )
-    print(f"  speech_exact_accuracy: baseline={base:.3f} enhanced={enhanced:.3f} delta={delta:+.3f}", flush=True)
-    print(f"  answer_present_accuracy: baseline={base_ans:.3f} enhanced={enh_ans:.3f} delta={d_ans:+.3f}", flush=True)
-    print(f"  wrote {path}", flush=True)
+    _try_print_architecture_suite_metrics(result, artifact_path=path)
     return result
 
 
@@ -265,14 +329,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help=f"HF model id (default {DEFAULT_BENCHMARK_MODEL}).",
     )
     parser.add_argument("--device", default=None, help="Torch device (cpu, mps, cuda:0). Default: auto.")
-    parser.add_argument("--limit", default=os.environ.get("BENCHMARK_LIMIT"), help="Examples per task. Use -1 for full native split.")
+    parser.add_argument("--limit", type=int, default=None, help="Examples per task. Use -1 for full native split.")
     parser.add_argument("--split", default=None, help="Native HF split override.")
     parser.add_argument("--output-dir", type=Path, default=Path(os.environ.get("BENCHMARK_OUTPUT_DIR", "runs/benchmarks")))
     parser.add_argument("--skip-smoke", action="store_true")
     parser.add_argument("--skip-architecture-eval", "--no-broca-probes", dest="skip_architecture_eval", action="store_true")
     parser.add_argument("--streaming", action="store_true", help="Native HF streaming.")
     parser.add_argument("--shuffle", action="store_true", help="Native shuffle before limit.")
-    parser.add_argument("--seed", type=int, default=int(os.environ.get("BENCHMARK_SEED", "0")))
+    parser.add_argument("--seed", type=int, default=None, help="RNG seed (default: BENCHMARK_SEED env or 0).")
     parser.add_argument("--chat-template", action="store_true", help="Native HF benchmark: use tokenizer chat template.")
     parser.add_argument("--max-seq-len", type=int, default=None)
     parser.add_argument("--generation-max-new-tokens", type=int, default=128)
@@ -290,12 +354,8 @@ def main() -> None:
     os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 
     bench_device = args.device if args.device is not None else normalize_device_arg(os.environ.get("BENCHMARK_DEVICE"))
-    limit_s = normalize_limit_override(args.limit)
-    native_limit = 50 if limit_s is None else int(limit_s)
-    if native_limit < 0:
-        native_limit_or_none = None
-    else:
-        native_limit_or_none = native_limit
+    bench_seed = _benchmark_seed(args)
+    limit_s, native_limit_or_none = _resolved_limit_strings_and_native_int(args)
 
     if not args.skip_smoke:
         hf_datasets_smoke(verbose=True)
@@ -324,7 +384,7 @@ def main() -> None:
             device=bench_device,
             hf_token=hf_token,
             streaming=args.streaming,
-            seed=args.seed,
+            seed=bench_seed,
             shuffle=args.shuffle,
             chat_template=args.chat_template,
             max_seq_len=args.max_seq_len,
