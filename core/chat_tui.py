@@ -33,7 +33,7 @@ from typing import Any
 
 try:
     from textual.app import App, ComposeResult
-    from textual.containers import Horizontal, Vertical, VerticalScroll
+    from textual.containers import Grid, Horizontal, Vertical, VerticalScroll
     from textual.reactive import reactive
     from textual.widgets import Footer, Header, Input, Label, RichLog, Sparkline, Static
     from textual.worker import Worker, WorkerState
@@ -44,6 +44,16 @@ except ImportError as exc:  # pragma: no cover
         "  uv sync --extra tui\n"
         "  # or: pip install -e \".[tui]\"\n"
     ) from exc
+
+# Mosaic brand palette. Everything else in the TUI keys off these so the visual
+# identity stays consistent across the chat and benchmark interfaces.
+BRAND = "#6c50ff"
+BRAND_SOFT = "#a995ff"
+BRAND_DEEP = "#3d1fbf"
+BRAND_BG = "#15102e"
+ONLINE = "#5fdc8b"
+OFFLINE = "#5a5a6e"
+WARNING = "#ffb648"
 
 from .broca import BrocaMind
 from .device_utils import pick_torch_device
@@ -62,17 +72,17 @@ logger = logging.getLogger(__name__)
 class StatePanel(Static):
     """A titled panel that renders a dict of key/value pairs."""
 
-    DEFAULT_CSS = """
-    StatePanel {
-        border: round $primary 60%;
+    DEFAULT_CSS = f"""
+    StatePanel {{
+        border: round {BRAND} 70%;
         padding: 0 1;
         height: auto;
         margin-bottom: 1;
-    }
-    StatePanel > .title {
+    }}
+    StatePanel > .title {{
         text-style: bold;
-        color: $accent;
-    }
+        color: {BRAND_SOFT};
+    }}
     """
 
     def __init__(self, title: str, **kwargs: Any) -> None:
@@ -81,13 +91,70 @@ class StatePanel(Static):
         self._lines: list[str] = []
 
     def render(self) -> str:
-        head = f"[b]{self._title}[/b]"
+        head = f"[b][{BRAND_SOFT}]{self._title}[/{BRAND_SOFT}][/b]"
         if not self._lines:
             return f"{head}\n[dim]—[/dim]"
         return head + "\n" + "\n".join(self._lines)
 
     def set_lines(self, lines: list[str]) -> None:
         self._lines = lines
+        self.refresh()
+
+
+class SystemsMatrix(Static):
+    """A compact label matrix showing which substrate systems are online.
+
+    Each row is one subsystem with a status dot (● online, ○ offline,
+    ◐ degraded) followed by a name and a tiny detail string. The matrix is
+    refreshed from the BrocaMind snapshot on every TUI tick.
+    """
+
+    DEFAULT_CSS = f"""
+    SystemsMatrix {{
+        border: round {BRAND} 70%;
+        padding: 0 1;
+        height: auto;
+        margin-bottom: 1;
+    }}
+    """
+
+    # status -> rich color
+    _COLORS = {
+        "on": ONLINE,
+        "off": OFFLINE,
+        "warn": WARNING,
+    }
+    _GLYPHS = {
+        "on": "●",
+        "off": "○",
+        "warn": "◐",
+    }
+
+    def __init__(self, **kwargs: Any) -> None:
+        super().__init__(**kwargs)
+        # entries: list of (status, name, detail)
+        self._entries: list[tuple[str, str, str]] = []
+
+    def render(self) -> str:
+        head = f"[b][{BRAND_SOFT}]Systems[/{BRAND_SOFT}][/b]"
+        if not self._entries:
+            return f"{head}\n[dim]—[/dim]"
+        lines = [head]
+        # Render two columns where the screen is wide enough; fall back to one.
+        rows = self._entries
+        # Build a compact two-column grid: name+dot is short, detail spills.
+        # For simplicity we render one row per system; the panel sits at the
+        # top of the left column where width is limited anyway.
+        for status, name, detail in rows:
+            color = self._COLORS.get(status, OFFLINE)
+            glyph = self._GLYPHS.get(status, "?")
+            label = f"{name:<14}"
+            tail = f" [dim]{detail}[/dim]" if detail else ""
+            lines.append(f"[{color}]{glyph}[/{color}] {label}{tail}")
+        return "\n".join(lines)
+
+    def set_entries(self, entries: list[tuple[str, str, str]]) -> None:
+        self._entries = entries
         self.refresh()
 
 
@@ -110,55 +177,69 @@ def _fmt_intent(intent: str | None) -> str:
 
 
 class BrocaChatApp(App):
-    CSS = """
-    Screen {
+    CSS = f"""
+    Screen {{
         layout: vertical;
-    }
-    #main {
+        background: $surface;
+    }}
+    Header {{
+        background: {BRAND_DEEP};
+        color: $text;
+    }}
+    Footer {{
+        background: {BRAND_DEEP};
+    }}
+    #main {{
         height: 1fr;
-    }
-    #left, #right {
-        width: 32;
-        min-width: 28;
+    }}
+    #left, #right {{
+        width: 34;
+        min-width: 30;
         padding: 1;
-        border-right: solid $primary 30%;
-    }
-    #right {
+        border-right: solid {BRAND} 40%;
+    }}
+    #right {{
         border-right: none;
-        border-left: solid $primary 30%;
-    }
-    #center {
+        border-left: solid {BRAND} 40%;
+    }}
+    #center {{
         width: 1fr;
         padding: 0 1;
-    }
-    #chatlog {
+    }}
+    #chatlog {{
         height: 1fr;
-        border: round $primary 60%;
-    }
-    #input {
+        border: round {BRAND} 70%;
+    }}
+    #input {{
         height: 3;
-        border: round $accent 60%;
-    }
-    #streaming {
+        border: round {BRAND_SOFT} 80%;
+    }}
+    #streaming {{
         height: auto;
         max-height: 8;
         padding: 0 1;
         color: $text-muted;
-    }
-    #status {
+    }}
+    #status {{
         height: 1;
-        background: $primary 20%;
+        background: {BRAND} 25%;
         color: $text;
         padding: 0 1;
-    }
-    #activity {
+    }}
+    #activity {{
         height: 8;
-        border: round $primary 30%;
-    }
-    Sparkline {
+        border: round {BRAND} 40%;
+    }}
+    Sparkline {{
         height: 3;
         margin-bottom: 1;
-    }
+    }}
+    Sparkline > .sparkline--max-color {{
+        color: {BRAND};
+    }}
+    Sparkline > .sparkline--min-color {{
+        color: {BRAND_SOFT};
+    }}
     """
 
     BINDINGS = [
@@ -201,6 +282,7 @@ class BrocaChatApp(App):
         yield Header(show_clock=True)
         with Horizontal(id="main"):
             with VerticalScroll(id="left"):
+                yield SystemsMatrix(id="panel-systems")
                 yield StatePanel("Cognitive frame", id="panel-frame")
                 yield StatePanel("Working memory", id="panel-working")
                 yield StatePanel("Intrinsic cues", id="panel-cues")
@@ -303,6 +385,67 @@ class BrocaChatApp(App):
             else:
                 activity.write(f"[dim]{ts} {topic}[/dim]  {payload}")
 
+    # -- systems matrix ------------------------------------------------
+    def _refresh_systems_matrix(self, snap: dict[str, Any]) -> None:
+        """Map the BrocaMind snapshot into an at-a-glance online/offline grid."""
+
+        sub = snap.get("substrate") or {}
+        bg = snap.get("background") or {}
+        si = snap.get("self_improve") or {}
+        ws = snap.get("workspace") or {}
+        memory = snap.get("memory") or {}
+        model = snap.get("model") or {}
+
+        def status_count(value: int | None, label: str) -> tuple[str, str, str]:
+            n = int(value or 0)
+            return ("on" if n > 0 else "off", label, f"{n}")
+
+        entries: list[tuple[str, str, str]] = []
+        # Llama host (if model id is known we treat it as online).
+        host_status = "on" if model.get("id") else "off"
+        entries.append((host_status, "llama host", str(model.get("device") or "—")))
+        # Semantic memory: online if any rows OR namespace is set.
+        mem_n = int(memory.get("count") or 0)
+        entries.append(("on" if mem_n >= 0 else "off", "semantic mem", f"{mem_n} rows"))
+        # Workspace
+        wn = int(ws.get("frames_total") or 0)
+        entries.append(("on" if wn >= 0 else "off", "workspace", f"{wn} frames"))
+        # DMN background worker
+        if bg.get("error") is not None and not bg.get("running"):
+            entries.append(("warn", "dmn worker", "err"))
+        elif bg.get("running"):
+            entries.append(("on", "dmn worker", f"{int(bg.get('iterations') or 0)} iters"))
+        else:
+            entries.append(("off", "dmn worker", "idle"))
+        # Self-improve worker
+        if not si.get("enabled"):
+            entries.append(("off", "self-improve", "disabled"))
+        elif si.get("running"):
+            entries.append(("on", "self-improve", f"{int(si.get('iterations') or 0)} iters"))
+        else:
+            entries.append(("warn", "self-improve", "stopped"))
+        # Substrate counters
+        entries.append(status_count(sub.get("vsa_atoms"), "vsa codebook"))
+        hop_stored = int(sub.get("hopfield_stored") or 0)
+        hop_max = int(sub.get("hopfield_max_items") or 0)
+        entries.append(("on" if hop_stored > 0 else "off", "hopfield", f"{hop_stored}/{hop_max}"))
+        entries.append(status_count(sub.get("hawkes_channels"), "hawkes proc"))
+        entries.append(status_count(sub.get("tools"), "tools"))
+        entries.append(status_count(sub.get("macros"), "macros"))
+        entries.append(status_count(sub.get("ontology_axes"), "ontology"))
+        entries.append((
+            "on" if sub.get("discovered_scm") else "off",
+            "scm discov.",
+            "ready" if sub.get("discovered_scm") else "—",
+        ))
+        # Event bus is always available when the TUI is running.
+        entries.append(("on", "event bus", "5Hz"))
+
+        try:
+            self.query_one("#panel-systems", SystemsMatrix).set_entries(entries)
+        except Exception:
+            logger.exception("TUI: refresh systems matrix failed")
+
     def _refresh_panels(self) -> None:
         try:
             snap = self.mind.snapshot()
@@ -314,6 +457,9 @@ class BrocaChatApp(App):
         mem = snap.get("memory") or {}
         if isinstance(mem.get("count"), int):
             self._memory_count_trend.append(float(mem["count"]))
+
+        # --- Systems matrix
+        self._refresh_systems_matrix(snap)
 
         # --- Frame
         frame_lines: list[str] = []

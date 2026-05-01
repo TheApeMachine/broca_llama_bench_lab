@@ -141,9 +141,21 @@ def run_broca_architecture_eval(
 
     mid = llama_model_id or os.environ.get("MODEL_ID", "meta-llama/Llama-3.2-1B-Instruct")
 
+    try:
+        from core.event_bus import get_default_bus
+        bus = get_default_bus()
+    except Exception:
+        bus = None
+
     rows: list[dict[str, Any]] = []
     graft_reports_by_case: dict[str, str] = {}
-    for case in cases:
+    total_cases = len(cases)
+    for ci, case in enumerate(cases, start=1):
+        if bus is not None:
+            bus.publish(
+                "bench.arch_case.start",
+                {"case_id": case.id, "task_type": case.task_type, "i": ci, "total": total_cases},
+            )
         mind = BrocaMind(
             seed=seed,
             db_path=db_path,
@@ -166,6 +178,31 @@ def run_broca_architecture_eval(
             )
 
         frame, enhanced_output = mind.answer(case.prompt, max_new_tokens=max_new_tokens)
+        if bus is not None:
+            base_scores = _score_output(
+                baseline_output,
+                expected_answer=case.expected_answer,
+                expected_speech=case.expected_speech,
+                task_type=case.task_type,
+            )
+            enh_scores = _score_output(
+                enhanced_output,
+                expected_answer=case.expected_answer,
+                expected_speech=case.expected_speech,
+                task_type=case.task_type,
+            )
+            bus.publish(
+                "bench.arch_case.complete",
+                {
+                    "case_id": case.id,
+                    "i": ci,
+                    "total": total_cases,
+                    "baseline_speech_exact": bool(base_scores.get("speech_exact")),
+                    "enhanced_speech_exact": bool(enh_scores.get("speech_exact")),
+                    "baseline_answer_present": bool(base_scores.get("answer_present")),
+                    "enhanced_answer_present": bool(enh_scores.get("answer_present")),
+                },
+            )
         rows.append(
             {
                 "id": case.id,

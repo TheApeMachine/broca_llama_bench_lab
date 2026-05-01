@@ -13,14 +13,16 @@ CHAT_ARGS ?=
 # Append to the default bench invocation (e.g. `make bench BENCH_EXTRA="--skip-smoke"`)
 BENCH_EXTRA ?=
 
-.PHONY: help install install-benchmark chat bench paper paper-bench paper-pdf
+.PHONY: help install install-benchmark chat tui bench bench-cli bench-tui paper paper-bench paper-pdf
 
 help:
 	@echo "Targets:"
 	@echo "  make install             python3 -m venv .venv; uv sync (--extra tui --extra test; tui pulls benchmark)"
 	@echo "  make install-benchmark   add/refresh benchmark extra: uv pip install -e \".[benchmark]\""
 	@echo "  make chat                streaming terminal chat with Broca substrate (--broca is always passed; extend via CHAT_ARGS)"
-	@echo "  make bench               full harness: native HF datasets + lm-eval + Broca probes"
+	@echo "  make bench               live benchmark TUI (native HF datasets + lm-eval + Broca probes)"
+	@echo "  make bench-cli           same harness without the TUI (plain stdout)"
+	@echo "  make bench-tui           alias for 'make bench'"
 	@echo "  make paper               paper-bench then PDF (needs latexmk or pdflatex)"
 	@echo "  make paper-bench         refresh paper/include/experiment/*.tex from benchmarks"
 	@echo ""
@@ -52,8 +54,17 @@ install-benchmark:
 chat:
 	$(RUN_PYTHON) -m core.chat_cli --broca $(CHAT_ARGS)
 
+tui:
+	$(RUN_PYTHON) -m core.chat_tui --broca-db runs/broca_chat.sqlite
+
 # Native (standard task preset) + Eleuther lm-eval (standard preset limits) + architecture eval.
-bench:
+# `make bench` launches the Textual dashboard. Use `make bench-cli` for plain stdout.
+bench: bench-tui
+
+bench-tui:
+	$(RUN_PYTHON) -m core.bench_tui --engine both --preset standard --limit 250 $(BENCH_EXTRA)
+
+bench-cli:
 	$(RUN_PYTHON) -m core.benchmarks --engine both --preset standard --limit 250 $(BENCH_EXTRA)
 
 # Smaller default preset/limit via env: PAPER_NATIVE_PRESET=quick PAPER_BENCH_LIMIT=50

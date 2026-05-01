@@ -804,18 +804,46 @@ def evaluate_task(
     normalize: bool = True,
     chat_template: bool = False,
     generation_max_new_tokens: int = 128,
+    progress_label: str | None = None,
 ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     examples = load_task_examples(task_name, limit=limit, split=split, streaming=streaming, seed=seed, shuffle=shuffle)
-    rows = [
-        evaluate_example(
+    # Late import keeps the benchmark module usable in environments where the
+    # optional event_bus shim is unavailable; publish() is no-op without subs.
+    try:
+        from core.event_bus import get_default_bus
+        bus = get_default_bus()
+    except Exception:
+        bus = None
+    total = len(examples)
+    label = progress_label or task_name
+    if bus is not None:
+        bus.publish("bench.task.start", {"task": task_name, "label": label, "total": total})
+    rows: list[dict[str, Any]] = []
+    correct = 0
+    for i, ex in enumerate(examples, start=1):
+        row = evaluate_example(
             backend,
             ex,
             normalize=normalize,
             chat_template=chat_template,
             generation_max_new_tokens=generation_max_new_tokens,
         )
-        for ex in examples
-    ]
+        rows.append(row)
+        if row.get("correct"):
+            correct += 1
+        if bus is not None:
+            bus.publish(
+                "bench.example",
+                {
+                    "task": task_name,
+                    "label": label,
+                    "i": i,
+                    "total": total,
+                    "correct": bool(row.get("correct")),
+                    "running_correct": correct,
+                    "running_acc": correct / max(1, i),
+                },
+            )
     summary = summarize_rows(rows)
     summary.update(
         {
@@ -845,12 +873,19 @@ def _run_hf_tasks_to_dir(
     chat_template: bool,
     generation_max_new_tokens: int,
     silent: bool = False,
+    arm_label: str | None = None,
 ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     task_out_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        from core.event_bus import get_default_bus
+        bus = get_default_bus()
+    except Exception:
+        bus = None
     per_task: dict[str, Any] = {}
     all_rows: list[dict[str, Any]] = []
     for task in tasks:
         start = time.time()
+        progress_label = f"{arm_label}:{task}" if arm_label else task
         task_summary, rows = evaluate_task(
             backend,
             task,
@@ -862,6 +897,7 @@ def _run_hf_tasks_to_dir(
             normalize=normalize,
             chat_template=chat_template,
             generation_max_new_tokens=generation_max_new_tokens,
+            progress_label=progress_label,
         )
         task_summary["seconds"] = time.time() - start
         per_task[task] = task_summary
@@ -873,6 +909,19 @@ def _run_hf_tasks_to_dir(
         rel_out = task_path.relative_to(run_root)
         if not silent:
             print(f"{task:20s} n={task_summary['n']:4d} acc={task_summary['accuracy']:.3f} wrote={rel_out}", flush=True)
+        if bus is not None:
+            bus.publish(
+                "bench.task.complete",
+                {
+                    "task": task,
+                    "arm": arm_label,
+                    "label": progress_label,
+                    "n": int(task_summary.get("n", 0)),
+                    "correct": int(task_summary.get("correct", 0)),
+                    "accuracy": float(task_summary.get("accuracy", 0.0)),
+                    "seconds": float(task_summary["seconds"]),
+                },
+            )
     return per_task, all_rows
 
 
@@ -984,6 +1033,24 @@ def run_hf_datasets_benchmark(
     else:
         print("\n--- Native HF datasets benchmark · vanilla_lm (HFLocalCausalLM) ---", flush=True)
 
+    try:
+        from core.event_bus import get_default_bus
+        bus = get_default_bus()
+    except Exception:
+        bus = None
+    if bus is not None:
+        bus.publish(
+            "bench.phase.start",
+            {
+                "phase": "native",
+                "arm": "vanilla_lm",
+                "model_id": model_id,
+                "device": str(backend.device),
+                "tasks": list(tasks),
+                "limit": limit,
+                "compare_shell": bool(do_compare),
+            },
+        )
     silent_first = bool(do_compare)
     per_task, _all_rows = _run_hf_tasks_to_dir(
         backend,
@@ -999,6 +1066,7 @@ def run_hf_datasets_benchmark(
         chat_template=chat_template,
         generation_max_new_tokens=generation_max_new_tokens,
         silent=silent_first,
+        arm_label="vanilla_lm" if do_compare else None,
     )
 
     macro = sum(float(v["accuracy"]) for v in per_task.values()) / max(1, len(per_task))
@@ -1046,6 +1114,17 @@ def run_hf_datasets_benchmark(
 
     comparison: dict[str, Any] = {}
     if do_compare:
+        if bus is not None:
+            bus.publish(
+                "bench.phase.start",
+                {
+                    "phase": "native",
+                    "arm": "broca_shell",
+                    "model_id": model_id,
+                    "tasks": list(tasks),
+                    "limit": limit,
+                },
+            )
         shell_back = HFLocalLlamaBrocaShell.wrapping_same_lm(backend)
         shell_dir = out / "broca_shell"
         per_shell, _rows_shell = _run_hf_tasks_to_dir(
@@ -1062,6 +1141,7 @@ def run_hf_datasets_benchmark(
             chat_template=chat_template,
             generation_max_new_tokens=generation_max_new_tokens,
             silent=True,
+            arm_label="broca_shell",
         )
         macro_s = sum(float(v["accuracy"]) for v in per_shell.values()) / max(1, len(per_shell))
         micro_n_s = sum(int(v["n"]) for v in per_shell.values())
@@ -1102,6 +1182,17 @@ def run_hf_datasets_benchmark(
     (out / "summary.json").write_text(json.dumps(result, indent=2, ensure_ascii=False), encoding="utf-8")
     print(f"\nWrote summary.json -> {out / 'summary.json'}", flush=True)
     generate_artifacts(result, out)
+    if bus is not None:
+        bus.publish(
+            "bench.phase.complete",
+            {
+                "phase": "native",
+                "macro_accuracy": float(macro),
+                "micro_accuracy": float(micro_acc),
+                "comparison": bool(comparison),
+                "summary_path": str(out / "summary.json"),
+            },
+        )
     return result
 
 

@@ -49,6 +49,7 @@ from core.benchmarks.hf_datasets_eval import (
 )
 from core.benchmarks.lm_eval_pair import run_paired_lm_eval
 from core.device_utils import normalize_device_arg, pick_torch_device
+from core.event_bus import get_default_bus
 
 logger = logging.getLogger(__name__)
 
@@ -225,6 +226,18 @@ def run_lm_eval_harness(
     print("\n--- EleutherAI LM Evaluation Harness (host parity check) ---", flush=True)
     print(f"preset={preset} tasks={tasks} limit={limit} device={dev_s} fewshot={num_fewshot}", flush=True)
 
+    bus = get_default_bus()
+    bus.publish(
+        "bench.phase.start",
+        {
+            "phase": "lm_eval",
+            "preset": preset,
+            "tasks": tasks,
+            "limit": limit,
+            "device": dev_s,
+            "fewshot": num_fewshot,
+        },
+    )
     try:
         run_paired_lm_eval(
             model_id=model_id,
@@ -236,8 +249,10 @@ def run_lm_eval_harness(
             num_fewshot=num_fewshot,
         )
     except Exception as exc:
+        bus.publish("bench.phase.complete", {"phase": "lm_eval", "error": str(exc)})
         print(f"lm-eval pair failed: {exc}", file=sys.stderr)
         return 3, None
+    bus.publish("bench.phase.complete", {"phase": "lm_eval", "out": str(out)})
 
     summary_path = out / "benchmark_summary.txt"
     summary_path.write_text(
@@ -271,6 +286,11 @@ def run_broca_architecture_benchmark(
 
     dev = device if (device and str(device).strip()) else str(pick_torch_device(os.environ.get("M_DEVICE")))
     path = output_run_dir / "broca_architecture_eval.json"
+    bus = get_default_bus()
+    bus.publish(
+        "bench.phase.start",
+        {"phase": "architecture_eval", "model_id": llama_model_id, "device": dev},
+    )
 
     with tempfile.TemporaryDirectory(prefix="broca_bench_mem_") as tmp:
         db_path = Path(tmp) / "benchmark.sqlite"
@@ -292,9 +312,20 @@ def run_broca_architecture_benchmark(
             }
             path.write_text(json.dumps(result, indent=2), encoding="utf-8")
             print(f"Broca architecture eval: could not load Llama Broca stack ({exc})", file=sys.stderr)
+            bus.publish("bench.phase.complete", {"phase": "architecture_eval", "error": str(exc)})
             return result
 
     _try_print_architecture_suite_metrics(result, artifact_path=path)
+    metrics = result.get("metrics") if isinstance(result, dict) else None
+    payload: dict[str, Any] = {"phase": "architecture_eval", "out": str(path)}
+    if isinstance(metrics, dict):
+        try:
+            payload["baseline_speech_acc"] = float(metrics["baseline_bare_language_host"]["speech_exact_accuracy"])
+            payload["enhanced_speech_acc"] = float(metrics["enhanced_broca_architecture"]["speech_exact_accuracy"])
+            payload["delta_speech_acc"] = float(metrics["delta_enhanced_minus_baseline"]["speech_exact_accuracy"])
+        except (KeyError, TypeError, ValueError):
+            pass
+    bus.publish("bench.phase.complete", payload)
     return result
 
 
@@ -359,8 +390,23 @@ def main() -> None:
     bench_seed = _benchmark_seed(args)
     limit_s, native_limit_or_none = _resolved_limit_strings_and_native_int(args)
 
+    bus = get_default_bus()
+    bus.publish(
+        "bench.suite.start",
+        {
+            "engine": args.engine,
+            "preset": args.preset,
+            "model": args.model,
+            "limit": native_limit_or_none,
+            "device": bench_device,
+            "seed": bench_seed,
+        },
+    )
+
     if not args.skip_smoke:
+        bus.publish("bench.phase.start", {"phase": "smoke"})
         hf_datasets_smoke(verbose=True)
+        bus.publish("bench.phase.complete", {"phase": "smoke"})
 
     hf_tok_raw = os.environ.get("HF_TOKEN")
     hf_token: str | bool | None = hf_tok_raw if hf_tok_raw and hf_tok_raw.strip() else None
@@ -437,6 +483,14 @@ def main() -> None:
         native_result=native_result,
         lm_eval_status=lm_status,
         architecture_eval=architecture_eval,
+    )
+    bus.publish(
+        "bench.suite.complete",
+        {
+            "engine": args.engine,
+            "manifest_dir": str(manifest_dir),
+            "lm_eval_status": lm_status,
+        },
     )
 
 

@@ -454,7 +454,9 @@ class NativeToolRegistry:
         """Open the shared SQLite connection once (caller holds ``self._db_lock``)."""
 
         if self._conn is None:
-            self._conn = sqlite3.connect(self.path, timeout=5.0)
+            # DMN / background workers call count()/list from non-main threads; same pattern as
+            # PersistentSemanticMemory in broca.py (check_same_thread=False + lock).
+            self._conn = sqlite3.connect(self.path, timeout=5.0, check_same_thread=False)
             self._conn.execute("PRAGMA journal_mode=WAL")
             self._conn.isolation_level = None
         return self._conn
