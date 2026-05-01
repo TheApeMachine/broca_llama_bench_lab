@@ -11,23 +11,32 @@ import asi_broca_core.broca as broca_mod
 from asi_broca_core.memory import SQLiteActivationMemory
 from asi_broca_core.substrate_graph import EpisodeAssociationGraph, merge_epistemic_evidence_dict
 
+from conftest import make_stub_llm_pair
+
 
 class FakeHost:
     cfg = types.SimpleNamespace(d_model=8)
 
     def __init__(self, track_grafts: bool = False):
         self.grafts: list | None = [] if track_grafts else None
+        self.llm, self._stub_tokenizer = make_stub_llm_pair()
 
     def add_graft(self, slot, graft):
         if self.grafts is not None:
             self.grafts.append((slot, graft))
 
 
+class FakeTokenizer:
+    def __init__(self, stub_inner):
+        self.inner = stub_inner
+
+
 @pytest.fixture
 def fake_host_loader(monkeypatch: pytest.MonkeyPatch):
     def _make(track_grafts: bool = False) -> FakeHost:
         host = FakeHost(track_grafts=track_grafts)
-        monkeypatch.setattr(broca_mod, "load_llama_broca_host", lambda *args, **kwargs: (host, object()))
+        tokenizer = FakeTokenizer(host._stub_tokenizer)
+        monkeypatch.setattr(broca_mod, "load_llama_broca_host", lambda *args, **kwargs: (host, tokenizer))
         return host
 
     return _make

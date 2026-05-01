@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import itertools
+import logging
 import math
 import random
 from dataclasses import dataclass, field
 from typing import Sequence
+
+logger = logging.getLogger(__name__)
 
 
 _EPS = 1e-12
@@ -244,6 +247,16 @@ class ActiveInferenceAgent:
         posterior = softmax_neg(g_vals, precision)
         best_index = max(range(len(evals)), key=lambda i: posterior[i])
         action = evals[best_index].policy[0]
+        min_g = min(g_vals)
+        logger.debug(
+            "ActiveInferenceAgent.decide: action=%s(%d) min_G=%.4f n_policies=%d horizon=%d qs=%s",
+            self.pomdp.action_names[action],
+            action,
+            min_g,
+            len(evals),
+            self.horizon,
+            [round(q, 4) for q in self.qs],
+        )
         return Decision(action, self.pomdp.action_names[action], list(self.qs), evals, posterior)
 
     def update(self, action: int, obs: int, lr: float = 1.0) -> list[float]:
@@ -267,6 +280,13 @@ class ActiveInferenceAgent:
             if not expanded:
                 self.pomdp.learn_B(action, before, post, lr=0.25 * lr)
         self.qs = post
+        logger.debug(
+            "ActiveInferenceAgent.update: action=%s obs=%d expanded=%s post=%s",
+            self.pomdp.action_names[action],
+            obs,
+            expanded,
+            [round(float(p), 4) for p in post],
+        )
         return post
 
 
@@ -293,7 +313,19 @@ class CoupledEFEAgent:
         gs = min(ev.expected_free_energy for ev in ds.policies)
         gc = min(ev.expected_free_energy for ev in dc.policies)
         if gs <= gc:
+            logger.debug(
+                "CoupledEFEAgent.decide: faculty=spatial action=%s G_spa=%.4f G_cau=%.4f (spatial wins tie)",
+                ds.action_name,
+                gs,
+                gc,
+            )
             return CoupledDecision("spatial", ds.action_name, ds, dc, gs, gc)
+        logger.debug(
+            "CoupledEFEAgent.decide: faculty=causal action=%s G_spa=%.4f G_cau=%.4f",
+            dc.action_name,
+            gs,
+            gc,
+        )
         return CoupledDecision("causal", dc.action_name, ds, dc, gs, gc)
 
 
@@ -356,7 +388,17 @@ def build_causal_epistemic_pomdp(
     c_match = 0.5 + 0.5 * min(1.0, margin_do)
     C = normalize([c_match, max(_EPS, 1.0 - c_match)])
     D = [0.5, 0.5]
-    return CategoricalPOMDP([observe_rows, trial_rows], B, C, D, states, actions, observations)
+    pomdp = CategoricalPOMDP([observe_rows, trial_rows], B, C, D, states, actions, observations)
+    logger.debug(
+        "build_causal_epistemic_pomdp: p_y|do(T=1)=%.4f p_y|do(T=0)=%.4f p_y|T=1=%.4f p_y|T=0=%.4f obs_grad_pos=%s margin_do=%.4f",
+        p_y_do_t1,
+        p_y_do_t0,
+        p_y_t1,
+        p_y_t0,
+        obs_positive_grad,
+        margin_do,
+    )
+    return pomdp
 
 
 def identity_transition(n_actions: int, n_states: int) -> list[list[list[float]]]:
@@ -444,6 +486,13 @@ def run_episode(agent: ActiveInferenceAgent, env: TigerDoorEnv, *, max_steps: in
         obs_name, reward, done = env.step(d.action_name)
         obs = pomdp.observation_names.index(obs_name)
         post = agent.update(d.action, obs)
+        logger.debug(
+            "run_episode: action=%s -> obs=%s reward=%.2f done=%s",
+            d.action_name,
+            obs_name,
+            reward,
+            done,
+        )
         total += reward
         if obs_name == "reward":
             success = True

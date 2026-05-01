@@ -5,20 +5,27 @@ import uuid
 from pathlib import Path
 
 import pytest
-import torch
 
 import asi_broca_core.broca as broca_mod
 from asi_broca_core.broca import (
     BrocaMind,
-    HeuristicRelationExtractor,
     LLMRelationExtractor,
     PersistentSemanticMemory,
     _claim_trust_weight,
 )
 
+from conftest import make_stub_llm_pair
+
 
 def _symbol(prefix: str) -> str:
     return f"{prefix}_{uuid.uuid4().hex[:10]}"
+
+
+def _stub_extractor_pair(extractor=None):
+    llm, hf_tok = make_stub_llm_pair(extractor)
+    host = types.SimpleNamespace(llm=llm)
+    tok = types.SimpleNamespace(inner=hf_tok)
+    return host, tok
 
 
 class FakeHost:
@@ -26,67 +33,34 @@ class FakeHost:
 
     def __init__(self):
         self.grafts: list = []
+        self.llm, self._stub_tokenizer = make_stub_llm_pair()
 
     def add_graft(self, slot, graft):
         self.grafts.append((slot, graft))
+
+
+class FakeTokenizer:
+    def __init__(self, stub_inner):
+        self.inner = stub_inner
 
 
 @pytest.fixture
 def fake_host_loader(monkeypatch: pytest.MonkeyPatch):
     def _make() -> FakeHost:
         host = FakeHost()
-        monkeypatch.setattr(broca_mod, "load_llama_broca_host", lambda *args, **kwargs: (host, object()))
+        tokenizer = FakeTokenizer(host._stub_tokenizer)
+        monkeypatch.setattr(broca_mod, "load_llama_broca_host", lambda *args, **kwargs: (host, tokenizer))
         return host
 
     return _make
 
 
-class _StubHFTokenizer:
-    """Stand-in for an HF tokenizer surface that the LLM extractor relies on."""
+def test_llm_extractor_resolves_subordinate_clause_subject_object():
+    host, tok = _stub_extractor_pair(lambda _s: ("apple", "fell from", "tree"))
+    extractor = LLMRelationExtractor(host, tok)
 
-    def __init__(self):
-        self.pad_token_id = 0
-        self.eos_token_id = 0
-
-    def __call__(self, prompt, return_tensors="pt"):
-        return {"input_ids": torch.zeros((1, 4), dtype=torch.long), "attention_mask": torch.ones((1, 4), dtype=torch.long)}
-
-    def decode(self, ids, skip_special_tokens=True):
-        return self._decoded
-
-
-class _StubLLM:
-    """Pretends to be an HF causal LM. The single output row is the extractor's answer."""
-
-    def __init__(self, decoded_json: str):
-        self._decoded_json = decoded_json
-
-    def parameters(self):
-        yield torch.zeros(1)
-
-    def generate(self, *, input_ids, attention_mask=None, max_new_tokens=64, do_sample=False, pad_token_id=None):
-        return torch.zeros((1, input_ids.shape[1] + 4), dtype=torch.long)
-
-
-def _stub_pair(decoded_json: str):
-    host = types.SimpleNamespace(llm=_StubLLM(decoded_json))
-    tok = types.SimpleNamespace(inner=_StubHFTokenizer())
-    tok.inner._decoded = decoded_json
-    return host, tok
-
-
-def test_llm_extractor_handles_subordinate_clause_that_breaks_heuristic():
     utterance = "the apple, which was incredibly red, fell from the tree ."
-    toks = utterance.split()
-
-    heuristic = HeuristicRelationExtractor().extract_claim(utterance, toks)
-    # The whitespace heuristic mis-assigns subject/object because of the relative clause;
-    # we don't pin the exact wrong values, only assert it does not recover the true triple.
-    assert heuristic is None or heuristic.subject != "apple" or heuristic.obj != "tree"
-
-    host, tok = _stub_pair('{"subject":"apple","relation":"fell from","object":"tree"}')
-    llm_extractor = LLMRelationExtractor(host, tok)
-    parsed = llm_extractor.extract_claim(utterance, toks)
+    parsed = extractor.extract_claim(utterance, utterance.split())
 
     assert parsed is not None
     assert parsed.subject == "apple"
@@ -95,39 +69,22 @@ def test_llm_extractor_handles_subordinate_clause_that_breaks_heuristic():
     assert parsed.evidence["parser"] == "llm_relation_extractor"
 
 
-def test_llm_extractor_falls_back_to_heuristic_when_host_lacks_llm():
-    host = types.SimpleNamespace()  # no .llm attribute
-    tok = types.SimpleNamespace(inner=_StubHFTokenizer())
-    extractor = LLMRelationExtractor(host, tok)
-
-    utterance = "ada is in rome ."
-    parsed = extractor.extract_claim(utterance, utterance.split())
-
-    assert parsed is not None
-    assert parsed.subject == "ada"
-    assert parsed.obj == "rome"
-    assert parsed.evidence["parser"] == "open_relation_claim"  # fallback path
-
-
-def test_llm_extractor_skips_questions():
-    host, tok = _stub_pair('{"subject":"x","relation":"y","object":"z"}')
+def test_llm_extractor_returns_none_for_questions():
+    host, tok = _stub_extractor_pair(lambda _s: ("x", "y", "z"))
     extractor = LLMRelationExtractor(host, tok)
 
     parsed = extractor.extract_claim("where is ada ?", ["where", "is", "ada", "?"])
     assert parsed is None
 
 
-def test_llm_extractor_falls_back_when_json_unparseable():
-    host, tok = _stub_pair("garbage no json at all")
+def test_llm_extractor_returns_none_when_llm_emits_unparseable_output():
+    host, tok = _stub_extractor_pair(lambda _s: None)
     extractor = LLMRelationExtractor(host, tok)
 
     utterance = "ada is in rome ."
     parsed = extractor.extract_claim(utterance, utterance.split())
 
-    assert parsed is not None
-    assert parsed.subject == "ada"
-    assert parsed.obj == "rome"
-    assert parsed.evidence["parser"] == "open_relation_claim"
+    assert parsed is None  # no heuristic fallback — extraction failure is final.
 
 
 def test_claim_trust_weight_decays_with_prediction_gap():
@@ -162,8 +119,8 @@ def test_consolidation_resists_high_surprise_repeated_claims(tmp_path: Path):
         )
 
     reflections = mem.consolidate_claims_once()
-
     revisions = [r for r in reflections if r.get("kind") == "belief_revision"]
+
     assert not revisions, (
         "high-surprise claims should not flip a belief on count alone; got revisions="
         f"{revisions}"

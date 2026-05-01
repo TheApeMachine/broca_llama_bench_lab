@@ -1,5 +1,7 @@
 __version__ = "0.5.0-llama-bench"
 
+from .logging_setup import configure_lab_logging
+
 from .active_inference import (
     ActiveInferenceAgent,
     CategoricalPOMDP,
@@ -37,6 +39,7 @@ from .continuous_frame import (
 )
 
 __all__ = [
+    "configure_lab_logging",
     "ActiveInferenceAgent",
     "CategoricalPOMDP",
     "CoupledDecision",
@@ -77,3 +80,5 @@ __all__ = [
     "semantic_subword_sketch",
     "stable_sketch",
 ]
+
+configure_lab_logging()

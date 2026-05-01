@@ -6,9 +6,12 @@ counts (no manual affinity knobs).
 
 from __future__ import annotations
 
+import logging
 import sqlite3
 import time
 from pathlib import Path
+
+logger = logging.getLogger(__name__)
 
 
 class EpisodeAssociationGraph:
@@ -60,6 +63,7 @@ class EpisodeAssociationGraph:
                 """,
                 (lo, hi, w, now),
             )
+            logger.debug("EpisodeAssociationGraph.bump: lo=%s hi=%s weight=%s", lo, hi, w)
 
     def weight(self, episode_id_a: int, episode_id_b: int) -> float:
         ia, ib = int(episode_id_a), int(episode_id_b)

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import sqlite3
 import struct
 import time
@@ -10,6 +11,8 @@ from typing import Optional
 
 import torch
 import torch.nn.functional as F
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -115,6 +118,8 @@ class SQLiteActivationMemory:
                 (lo, hi, w, now),
             )
 
+            logger.debug("SQLiteActivationMemory.bump_association: pair=(%s,%s) weight=%s", lo, hi, w)
+
     def normalized_spread_matrix(self, record_ids: list[int]) -> torch.Tensor:
         """Row-stochastic spread operator over ordered graft slots (derived self-loop + co-access mass)."""
 
@@ -142,25 +147,41 @@ class SQLiteActivationMemory:
             wf = float(w)
             accum[i, j] += wf
             accum[j, i] += wf
+
         row_sums = accum.sum(dim=-1, keepdim=True).clamp_min(1e-9)
-        return accum / row_sums
+        normed = accum / row_sums
+        logger.debug(
+            "SQLiteActivationMemory.normalized_spread_matrix: nk=%d shape=%s row_sum_range=(%.6f,%.6f)",
+            nk,
+            tuple(normed.shape),
+            float(row_sums.min().item()),
+            float(row_sums.max().item()),
+        )
+        return normed
 
     def clear(self, *, namespace: Optional[str] = None, kind: Optional[str] = None) -> None:
         namespace = namespace or self.default_namespace
+
         with self._connect() as con:
             if kind is None:
                 con.execute("DELETE FROM activation_memory WHERE namespace=?", (namespace,))
             else:
                 con.execute("DELETE FROM activation_memory WHERE namespace=? AND kind=?", (namespace, kind))
 
+        logger.debug("SQLiteActivationMemory.clear: namespace=%s kind=%s", namespace, kind)
+
     def count(self, *, namespace: Optional[str] = None, kind: Optional[str] = None) -> int:
         namespace = namespace or self.default_namespace
+
         with self._connect() as con:
             if kind is None:
                 row = con.execute("SELECT COUNT(*) FROM activation_memory WHERE namespace=?", (namespace,)).fetchone()
             else:
                 row = con.execute("SELECT COUNT(*) FROM activation_memory WHERE namespace=? AND kind=?", (namespace, kind)).fetchone()
-        return int(row[0])
+
+        n = int(row[0])
+        logger.debug("SQLiteActivationMemory.count: namespace=%s kind=%s n=%s", namespace, kind, n)
+        return n
 
     def write(
         self,
@@ -175,9 +196,12 @@ class SQLiteActivationMemory:
         namespace = namespace or self.default_namespace
         key_blob, key_dim = _tensor_to_blob(key)
         value_blob, value_dim = _tensor_to_blob(value)
+
         if key_dim != value_dim:
             raise ValueError(f"key dim {key_dim} != value dim {value_dim}")
+
         now = time.time()
+
         with self._connect() as con:
             cur = con.execute(
                 """
@@ -187,7 +211,19 @@ class SQLiteActivationMemory:
                 """,
                 (namespace, kind, key_dim, key_blob, value_blob, json.dumps(metadata or {}, sort_keys=True), float(confidence), now, now),
             )
-            return int(cur.lastrowid)
+
+            rid = int(cur.lastrowid)
+            meta = metadata or {}
+            logger.debug(
+                "SQLiteActivationMemory.write: id=%s ns=%s kind=%s dim=%s conf=%s meta_keys=%s",
+                rid,
+                namespace,
+                kind,
+                key_dim,
+                float(confidence),
+                sorted(meta.keys()),
+            )
+            return rid
 
     def load(self, *, namespace: Optional[str] = None, kind: Optional[str] = None, limit: Optional[int] = None) -> list[MemoryRecord]:
         namespace = namespace or self.default_namespace
@@ -216,6 +252,8 @@ class SQLiteActivationMemory:
                         access_count=int(access),
                     )
                 )
+
+        logger.debug("SQLiteActivationMemory.load: namespace=%s kind=%s n_records=%d", namespace, kind, len(out))
         return out
 
     def retrieve(
@@ -242,6 +280,16 @@ class SQLiteActivationMemory:
                     f"UPDATE activation_memory SET access_count=access_count+1, updated_at=? WHERE id IN ({placeholders})",
                     (now, *ids),
                 )
+
+        tops = [(int(records[int(i)].id), float(v)) for v, i in zip(vals, idxs)]
+        logger.debug(
+            "SQLiteActivationMemory.retrieve: namespace=%s kind=%s pool=%d top_k=%d tops=%s",
+            namespace,
+            kind,
+            len(records),
+            len(idxs),
+            tops,
+        )
         return [(records[int(i)], float(v)) for v, i in zip(vals, idxs)]
 
     def load_into_graft(self, graft, *, namespace: Optional[str] = None, kind: str = "fact", clear_first: bool = True) -> int:
@@ -253,11 +301,18 @@ class SQLiteActivationMemory:
             meta["memory_id"] = rec.id
             meta["confidence"] = rec.confidence
             graft.remember(rec.key.reshape(1, -1), rec.value.reshape(1, -1), metadata=meta)
-        ids = [rec.id for rec in records]
-        spread = self.normalized_spread_matrix(ids)
+        spread = self.normalized_spread_matrix([rec.id for rec in records])
         setter = getattr(graft, "set_spread_matrix", None)
         if callable(setter):
             setter(spread if spread.numel() else None)
+
+        logger.debug(
+            "SQLiteActivationMemory.load_into_graft: ns=%s kind=%s n_loaded=%s spread_shape=%s",
+            namespace,
+            kind,
+            len(records),
+            tuple(spread.shape) if spread.numel() else None,
+        )
         return len(records)
 
 

@@ -102,52 +102,35 @@ def _is_question(toks: Sequence[str]) -> bool:
     return any(t == "?" for t in toks)
 
 
-def _predicate_from_words(words: Sequence[str]) -> str:
-    return " ".join(str(w).lower() for w in words if str(w).strip())
-
-
-def _location_assertion_from_tokens(toks: Sequence[str]) -> tuple[str, str] | None:
-    """Backward-compatible shim over the open vocabulary claim parser."""
-
-    claim = _claim_from_tokens(toks)
-    if claim is not None:
-        return claim.subject, claim.obj
-    return None
-
-
 class RelationExtractor:
     """Pluggable subject/predicate/object extractor for declarative utterances.
 
-    Implementations should return ``None`` for non-declarative input (questions,
-    fragments) and a ``ParsedClaim`` otherwise. Extractors are called per
-    routing decision, so they are expected to be cheap or short-circuit on
-    obviously inapplicable input.
+    Implementations return ``None`` for non-declarative input (questions,
+    fragments, or anything the LLM cannot resolve into a triple) and a
+    ``ParsedClaim`` otherwise. Extractors are called per routing decision.
     """
 
     def extract_claim(self, utterance: str, toks: Sequence[str]) -> "ParsedClaim | None":  # pragma: no cover - protocol
+        logger.debug(f"extract_claim: {utterance} {toks}")
         raise NotImplementedError
 
 
-class HeuristicRelationExtractor(RelationExtractor):
-    """Whitespace/regex SVO heuristic. Brittle on subordinate clauses and passive voice."""
-
-    def extract_claim(self, utterance: str, toks: Sequence[str]) -> "ParsedClaim | None":
-        return _claim_from_tokens(toks)
-
-
 class LLMRelationExtractor(RelationExtractor):
-    """Few-shot SVO extraction via the host LLM, with heuristic fallback.
+    """Few-shot SVO extraction via the host LLM. There is no heuristic fallback.
 
     Uses ``host.llm.generate`` with a JSON few-shot prompt so subordinate
-    clauses, passive voice, and stripped determiners are handled by the
-    language model instead of a regex. If the host does not expose ``.llm``
-    (test fakes), or the LLM emits unparseable output, this delegates to
-    ``HeuristicRelationExtractor`` so behavior degrades gracefully.
+    clauses, passive voice, and stripped determiners are resolved by the
+    language model rather than by a brittle regex. Out-of-distribution
+    sentences that the LLM cannot turn into a clean ``{subject, relation,
+    object}`` triple yield ``None``; the router then routes the utterance to
+    the remaining faculties (active inference, causal effect) instead of
+    fabricating a triple from string-splitting.
 
-    Why: the open-vocabulary regex extractor mis-routes claims whose surface
-    form is anything more interesting than ``<subject> <verb> <object>``;
-    re-using the frozen LLM as a parser fixes a whole class of mis-assigned
-    triples without an extra model.
+    The host must expose ``host.llm.generate`` and the tokenizer must expose
+    ``tokenizer.inner`` with the standard HuggingFace surface (``__call__``
+    returning ``input_ids``/``attention_mask``, plus ``decode``); production
+    use is wired up by :class:`BrocaMind`. Tests should provide an HF-shaped
+    stub LLM with the desired generation behavior.
     """
 
     PROMPT_TEMPLATE = (
@@ -167,22 +150,30 @@ class LLMRelationExtractor(RelationExtractor):
         self.host = host
         self.tokenizer = tokenizer
         self.max_new_tokens = int(max_new_tokens)
-        self._fallback = HeuristicRelationExtractor()
         self._cache: dict[str, tuple[str, str, str] | None] = {}
         self._cache_size = max(0, int(cache_size))
 
     def extract_claim(self, utterance: str, toks: Sequence[str]) -> "ParsedClaim | None":
         if _is_question(toks):
+            logger.debug(f"extract_claim: {utterance} {toks} is question")
             return None
+        
         words = list(_word_tokens(toks))
+        
         if len(words) < 3:
+            logger.debug(f"extract_claim: {utterance} {toks} too few words")
             return None
+        
         triple = self._llm_extract(utterance)
+        
         if triple is None:
-            return self._fallback.extract_claim(utterance, toks)
+            logger.debug(f"extract_claim: {utterance} {toks} no triple")
+            return None
+        
         subject, predicate, obj = triple
-        if not subject or not predicate or not obj:
-            return self._fallback.extract_claim(utterance, toks)
+        
+        logger.debug(f"extract_claim: {utterance} {toks} {triple}")
+        
         return ParsedClaim(
             subject=subject.lower(),
             predicate=predicate.lower(),
@@ -198,44 +189,48 @@ class LLMRelationExtractor(RelationExtractor):
 
     def _llm_extract(self, utterance: str) -> tuple[str, str, str] | None:
         key = utterance.strip()
+        
         if key in self._cache:
+            logger.debug(f"_llm_extract: {utterance} {key} in cache")
             return self._cache[key]
+        
         result = self._llm_extract_uncached(key)
+
         if self._cache_size > 0:
             if len(self._cache) >= self._cache_size:
                 self._cache.pop(next(iter(self._cache)))
+        
             self._cache[key] = result
+        
+        logger.debug(f"_llm_extract: {utterance} {key} {result}")
         return result
 
     def _llm_extract_uncached(self, utterance: str) -> tuple[str, str, str] | None:
-        llm = getattr(self.host, "llm", None)
-        if llm is None or not callable(getattr(llm, "generate", None)):
-            return None
-        hf_tok = getattr(self.tokenizer, "inner", None)
-        if hf_tok is None or not callable(getattr(hf_tok, "decode", None)):
-            return None
+        llm = self.host.llm
+        hf_tok = self.tokenizer.inner
         prompt = self.PROMPT_TEMPLATE.replace("<SENTENCE>", utterance)
-        try:
-            params = getattr(llm, "parameters", None)
-            device = next(params()).device if callable(params) else torch.device("cpu")
-            encoded = hf_tok(prompt, return_tensors="pt")
-            input_ids = encoded["input_ids"].to(device)
-            attention_mask = encoded.get("attention_mask")
-            if attention_mask is not None:
-                attention_mask = attention_mask.to(device)
-            pad_id = getattr(hf_tok, "pad_token_id", None) or getattr(hf_tok, "eos_token_id", None)
-            with torch.no_grad():
-                output = llm.generate(
-                    input_ids=input_ids,
-                    attention_mask=attention_mask,
-                    max_new_tokens=self.max_new_tokens,
-                    do_sample=False,
-                    pad_token_id=pad_id,
-                )
-            generated = output[0, input_ids.shape[1]:]
-            new_text = hf_tok.decode(generated, skip_special_tokens=True)
-        except (RuntimeError, ValueError, AttributeError, TypeError, IndexError, KeyError, StopIteration):
-            return None
+        device = next(llm.parameters()).device
+        encoded = hf_tok(prompt, return_tensors="pt")
+        input_ids = encoded["input_ids"].to(device)
+        attention_mask = encoded.get("attention_mask")
+        
+        if attention_mask is not None:
+            attention_mask = attention_mask.to(device)
+        
+        pad_id = getattr(hf_tok, "pad_token_id", None) or getattr(hf_tok, "eos_token_id", None)
+        
+        with torch.no_grad():
+            output = llm.generate(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                max_new_tokens=self.max_new_tokens,
+                do_sample=False,
+                pad_token_id=pad_id,
+            )
+        generated = output[0, input_ids.shape[1]:]
+        new_text = hf_tok.decode(generated, skip_special_tokens=True)
+        
+        logger.debug("_llm_extract_uncached: utterance=%r raw_json_fragment=%r", utterance, new_text[:512] if len(new_text) > 512 else new_text)
         return self._parse_json_triple(new_text)
 
     @staticmethod
@@ -271,68 +266,6 @@ class LLMRelationExtractor(RelationExtractor):
         if not s or not p or not o:
             return None
         return s, p, o
-
-
-def _claim_from_tokens(toks: Sequence[str]) -> ParsedClaim | None:
-    """Parse an observed relational claim without fixed entity/value slots.
-
-    A declarative observation is treated as ``subject`` + free-form relation
-    phrase + ``object``. The relation is not canonicalized through a built-in
-    ontology; later queries recover it through the persisted subject/predicate
-    records.
-
-    **Limitation:** This assumes a simple contiguous ``subject + relation +
-    object`` layout over alphanumeric word tokens (after light cleanup). It does
-    not handle nested clauses, coordinated subjects, or non-adjacent arguments;
-    compound or complex sentences will often mis-assign head or tail tokens.
-    Production callers should prefer :class:`LLMRelationExtractor`, which falls
-    back to this only when the host LLM is unavailable.
-
-    Leading determiners (``the``, ``a``, ``an``) are skipped when picking the
-    subject head. Trailing copula tokens that would incorrectly sit in the object
-    slot are stripped. If the middle phrase is only a linking verb (e.g. ``cat is
-    fluffy``), the predicate is folded to ``state`` so the copula is not stored
-    as the sole relation string.
-    """
-
-    words = list(_word_tokens(toks))
-    evidence_extra: dict[str, Any] = {}
-    determiners = {"the", "a", "an"}
-    if words and words[0].lower() in determiners:
-        evidence_extra["skipped_leading_determiners"] = True
-        while words and words[0].lower() in determiners:
-            words.pop(0)
-    if len(words) < 3 or _is_question(toks):
-        return None
-    copulas = {"is", "are", "was", "were", "be"}
-    core = list(words)
-    trimmed_copula_tail = 0
-    while len(core) >= 3 and core[-1].lower() in copulas:
-        core.pop()
-        trimmed_copula_tail += 1
-    if trimmed_copula_tail:
-        evidence_extra["stripped_trailing_copula_tokens"] = trimmed_copula_tail
-    if len(core) < 3:
-        return None
-    predicate = _predicate_from_words(core[1:-1])
-    if not predicate:
-        return None
-    pred_norm = predicate.strip().lower()
-    if pred_norm in copulas and len(core) == 3:
-        predicate = "state"
-        evidence_extra["linking_verb_folded"] = pred_norm
-    return ParsedClaim(
-        subject=core[0],
-        predicate=predicate,
-        obj=core[-1],
-        confidence=1.0,
-        evidence={
-            "parser": "open_relation_claim",
-            "source_words": words,
-            "predicate_surface": predicate,
-            **evidence_extra,
-        },
-    )
 
 
 def _choose_subject(words: Sequence[str], known_subjects: Sequence[str]) -> str | None:
@@ -380,14 +313,18 @@ def _query_from_tokens(
         return None
     words = _word_tokens(toks)
     if not words:
+        logger.debug("_query_from_tokens: empty words utterance=%r", utterance)
         return None
     subject = _choose_subject(words, known_subjects)
     if subject is None or not str(subject).strip():
+        logger.debug("_query_from_tokens: no subject utterance=%r words=%s", utterance, words)
         return None
     records = list(records_for_subject(subject))
     predicate = _choose_predicate(utterance, records, text_encoder)
     if not predicate:
+        logger.debug("_query_from_tokens: no predicate utterance=%r subject=%r n_records=%d", utterance, subject, len(records))
         return None
+    logger.debug("_query_from_tokens: utterance=%r subject=%r predicate=%r", utterance, subject, predicate)
     return ParsedQuery(
         subject=subject,
         predicate=predicate,
@@ -435,8 +372,10 @@ def _claim_prediction_gap(mind: "BrocaMind", utterance: str, claim: ParsedClaim)
             plan_words=plan_words,
             broca_features=broca_features,
         )
+        logger.debug("_claim_prediction_gap: gap=%s subject=%r pred=%r obj=%r", gap, claim.subject, claim.predicate, claim.obj)
         return float(gap)
     except (AttributeError, RuntimeError, TypeError, ValueError, StopIteration, IndexError):
+        logger.debug("_claim_prediction_gap: unavailable host path utterance=%r", utterance[:200])
         return None
 
 
@@ -627,6 +566,7 @@ class PersistentSemanticMemory:
                 """,
                 row,
             )
+            logger.debug("PersistentSemanticMemory.upsert: ns=%s %s.%s -> %s conf=%s", self.namespace, subject.lower(), predicate.lower(), obj.lower(), confidence)
             return
         with self._connect() as c:
             c.execute(
@@ -639,6 +579,7 @@ class PersistentSemanticMemory:
                 """,
                 row,
             )
+            logger.debug("PersistentSemanticMemory.upsert: ns=%s %s.%s -> %s conf=%s", self.namespace, subject.lower(), predicate.lower(), obj.lower(), confidence)
 
     def record_claim(
         self,
@@ -668,7 +609,9 @@ class PersistentSemanticMemory:
                     now,
                 ),
             )
-            return int(cur.lastrowid)
+            cid = int(cur.lastrowid)
+            logger.debug("PersistentSemanticMemory.record_claim: id=%s %s.%s=%s status=%s", cid, subject.lower(), predicate.lower(), obj.lower(), status)
+            return cid
 
     def claims(self, subject: str | None = None, predicate: str | None = None, *, status: str | None = None) -> list[dict]:
         clauses = ["namespace=?"]
@@ -839,6 +782,14 @@ class PersistentSemanticMemory:
                                 con=con,
                             )
                             reflections.append({"id": reflection_id, "kind": "belief_revision", **evidence})
+                            logger.debug(
+                                "consolidate_claims_once: belief_revision reflection_id=%s %s.%s %s -> %s",
+                                reflection_id,
+                                subject,
+                                predicate,
+                                current_obj,
+                                best_obj,
+                            )
                         con.commit()
                     except Exception:
                         con.rollback()
@@ -855,6 +806,13 @@ class PersistentSemanticMemory:
                 )
                 if reflection_id is not None:
                     reflections.append({"id": reflection_id, "kind": "belief_conflict", **evidence})
+                    logger.debug(
+                        "consolidate_claims_once: belief_conflict reflection_id=%s %s.%s (unresolved)",
+                        reflection_id,
+                        subject,
+                        predicate,
+                    )
+        logger.debug("consolidate_claims_once: reflections_emitted=%d", len(reflections))
         return reflections
 
     def observe_claim(self, subject: str, predicate: str, obj: str, *, confidence: float = 1.0, evidence: dict | None = None) -> dict:
@@ -872,6 +830,13 @@ class PersistentSemanticMemory:
                 confidence=confidence,
                 evidence={**ev, "claim_id": claim_id, "claim_status": "accepted"},
             )
+            logger.debug(
+                "PersistentSemanticMemory.observe_claim: accepted new triple %s.%s=%s claim_id=%s",
+                subj,
+                pred,
+                observed_obj,
+                claim_id,
+            )
             return {"status": "accepted", "claim_id": claim_id, "current_object": observed_obj, "observed_object": observed_obj}
 
         current_obj, current_conf, current_ev = current
@@ -879,6 +844,13 @@ class PersistentSemanticMemory:
             claim_id = self.record_claim(subj, pred, observed_obj, confidence=confidence, status="corroborated", evidence=ev)
             merged_ev = merge_epistemic_evidence_dict(dict(current_ev), {**ev, "claim_id": claim_id, "claim_status": "corroborated"})
             self.upsert(subj, pred, observed_obj, confidence=max(float(current_conf), float(confidence)), evidence=merged_ev)
+            logger.debug(
+                "PersistentSemanticMemory.observe_claim: corroborated %s.%s=%s claim_id=%s",
+                subj,
+                pred,
+                observed_obj,
+                claim_id,
+            )
             return {"status": "corroborated", "claim_id": claim_id, "current_object": current_obj, "observed_object": observed_obj}
 
         conflict_ev = {
@@ -897,6 +869,14 @@ class PersistentSemanticMemory:
             },
         }
         claim_id = self.record_claim(subj, pred, observed_obj, confidence=confidence, status="conflict", evidence=conflict_ev)
+        logger.debug(
+            "PersistentSemanticMemory.observe_claim: conflict %s.%s observed=%s current=%s claim_id=%s",
+            subj,
+            pred,
+            observed_obj,
+            current_obj,
+            claim_id,
+        )
         return {
             "status": "conflict",
             "claim_id": claim_id,
@@ -1031,7 +1011,16 @@ class WorkspaceJournal:
                     json.dumps(frame.evidence or {}, sort_keys=True),
                 ),
             )
-            return int(cur.lastrowid)
+            jid = int(cur.lastrowid)
+            logger.debug(
+                "WorkspaceJournal.append: id=%s intent=%s subject=%r answer=%r utterance_preview=%r",
+                jid,
+                frame.intent,
+                frame.subject,
+                frame.answer,
+                (utterance[:120] + "…") if len(utterance) > 120 else utterance,
+            )
+            return jid
 
     def fetch(self, episode_id: int) -> dict | None:
         with self._connect() as con:
@@ -1167,8 +1156,10 @@ class GlobalWorkspace:
         self._trim_working()
         syn = working_memory_synthesize(self.working)
         if syn is not None:
+            logger.debug("GlobalWorkspace.publish: synthesized intent=%s from working tail", syn.intent)
             self.frames.append(syn)
             self._trim_working()
+        logger.debug("GlobalWorkspace.publish: intent=%s journal_id=%s frames_total=%d", frame.intent, (frame.evidence or {}).get("journal_id"), len(self.frames))
         return frame
 
     @property
@@ -1210,6 +1201,7 @@ class CognitiveBackgroundWorker:
         out = self.mind.consolidate_once()
         self.iterations += 1
         self.last_error = None
+        logger.debug("CognitiveBackgroundWorker.run_once: iteration=%s reflections=%d", self.iterations, len(out))
         return out
 
     def _loop(self) -> None:
@@ -1312,6 +1304,53 @@ class TrainableBrocaGraft(BaseGraft):
         return out
 
 
+class SubstrateLogitBiasGraft(BaseGraft):
+    """Additive logit bias on substrate-supplied vocabulary IDs.
+
+    Wired into the host's ``logits`` slot. The cognitive substrate fills two
+    optional state keys:
+
+      ``broca_logit_bias`` — ``Mapping[int, float]`` of additive bonuses (in
+      nats) applied to the listed token ids at the last position of every batch.
+      ``broca_logit_bias_decay`` — scalar multiplier applied to every bonus
+      this step. Callers typically anneal it to zero over the first few
+      generation steps so content tokens are surfaced early without being
+      hammered into every position.
+
+    This is the Broca-correct soft steering signal: the substrate raises the
+    LLM's prior over content tokens it wants to see (subject, predicate,
+    answer subwords), and the LLM still chooses fluency, ordering, syntax —
+    no plan-forcing, no surface-form puppetry.
+    """
+
+    def __init__(self):
+        super().__init__()
+        self.mixer_priority = 0.5
+
+    def forward(self, x: torch.Tensor, state: dict) -> torch.Tensor:
+        if not self.enabled:
+            return x
+        bias = state.get("broca_logit_bias")
+        if not bias:
+            return x
+        decay_raw = state.get("broca_logit_bias_decay", 1.0)
+        try:
+            decay = float(decay_raw)
+        except (TypeError, ValueError):
+            decay = 1.0
+        if decay <= 0.0:
+            return x
+        out = x.clone()
+        last = state["last_indices"].to(x.device)
+        rows = torch.arange(x.shape[0], device=x.device)
+        for token_id, bonus in bias.items():
+            tid = int(token_id)
+            if tid < 0 or tid >= out.shape[-1]:
+                continue
+            out[rows, last, tid] = out[rows, last, tid] + decay * float(bonus)
+        return out
+
+
 def _batch_from_ids(rows: Sequence[Sequence[int]], pad_id: int, *, device: torch.device | str | None = None):
     max_len = max(1, max(len(r) for r in rows))
     ids = torch.full((len(rows), max_len), pad_id, dtype=torch.long)
@@ -1405,9 +1444,9 @@ class CognitiveRouter:
     candidate traces attached.
     """
 
-    def __init__(self, *, relevance_floor: float = 0.28, extractor: RelationExtractor | None = None):
+    def __init__(self, *, extractor: RelationExtractor, relevance_floor: float = 0.28):
         self.relevance_floor = float(relevance_floor)
-        self.extractor: RelationExtractor = extractor or HeuristicRelationExtractor()
+        self.extractor: RelationExtractor = extractor
 
     def route(self, mind: "BrocaMind", utterance: str, toks: Sequence[str]) -> CognitiveFrame:
         candidates: list[FacultyCandidate] = []
@@ -1445,6 +1484,13 @@ class CognitiveRouter:
             ],
             "intrinsic_cues": [asdict(cue) for cue in mind.workspace.intrinsic_cues],
         }
+        logger.debug(
+            "CognitiveRouter.route: selected=%s intent=%s scores=%s utterance_preview=%r",
+            selected.name if selected is not None else "unknown",
+            frame.intent,
+            [(c.name, round(float(c.score), 4)) for c in ranked],
+            (utterance[:160] + "…") if len(utterance) > 160 else utterance,
+        )
         return frame
 
     def _memory_write(self, mind: "BrocaMind", utterance: str, claim: ParsedClaim) -> CognitiveFrame:
@@ -1646,6 +1692,8 @@ class BrocaMind:
             if host_param is not None:
                 self.feature_graft.to(host_param.device)
         self.host.add_graft("final_hidden", self.feature_graft)
+        self.logit_bias_graft = SubstrateLogitBiasGraft()
+        self.host.add_graft("logits", self.logit_bias_graft)
         self.workspace = GlobalWorkspace()
         self.router = CognitiveRouter(extractor=LLMRelationExtractor(self.host, self.tokenizer))
         self.pomdp = build_tiger_pomdp()
@@ -1661,7 +1709,9 @@ class BrocaMind:
         return self._background_worker
 
     def consolidate_once(self) -> list[dict]:
-        return self.memory.consolidate_claims_once()
+        out = self.memory.consolidate_claims_once()
+        logger.debug("BrocaMind.consolidate_once: reflections=%d", len(out))
+        return out
 
     def start_background(self, *, interval_s: float = 5.0) -> CognitiveBackgroundWorker:
         if self._background_worker is None:
@@ -1702,12 +1752,20 @@ class BrocaMind:
             h_q = belief_entropy(cq)
             if max_ent > 1e-9 and h_q > 0.5 * max_ent:
                 self.workspace.intrinsic_cues.append(IntrinsicCue(float(h_q / max_ent), "causal_uncertain", {"entropy": h_q}))
+        logger.debug("_intrinsic_scan: cues=%d toks=%d", len(self.workspace.intrinsic_cues), len(toks))
 
     def comprehend(self, utterance: str) -> CognitiveFrame:
         toks = utterance_words(utterance)
         self._intrinsic_scan(toks)
         frame = self.router.route(self, utterance, toks)
-        return self._commit_frame(utterance, toks, frame)
+        out = self._commit_frame(utterance, toks, frame)
+        logger.debug(
+            "comprehend: intent=%s confidence=%s journal_id=%s",
+            out.intent,
+            out.confidence,
+            (out.evidence or {}).get("journal_id"),
+        )
+        return out
 
     def _commit_frame(self, utterance: str, toks: Sequence[str], frame: CognitiveFrame) -> CognitiveFrame:
         jid = self.journal.append(utterance, frame)
@@ -1715,6 +1773,7 @@ class BrocaMind:
         if self._last_journal_id is not None:
             self.episode_graph.bump(self._last_journal_id, jid)
         self._last_journal_id = jid
+        logger.debug("_commit_frame: journal_id=%s intent=%s pred_error=%s", jid, frame.intent, frame.intent == "prediction_error")
         if frame.intent == "prediction_error":
             pred = str(frame.evidence.get("predicate", ""))
             if not pred and frame.subject:
@@ -1735,6 +1794,7 @@ class BrocaMind:
             pred = str((tail.evidence or {}).get("predicate", ""))
             if tail.intent == "synthesis_bundle" and tail.subject and pred:
                 self.memory.merge_epistemic_evidence(tail.subject, pred, tail.evidence)
+        logger.debug("_commit_frame: published intent=%s workspace_frames=%d", out.intent, len(self.workspace.frames))
         return out
 
     def retrieve_episode(self, episode_id: int) -> CognitiveFrame:
@@ -1742,6 +1802,7 @@ class BrocaMind:
 
         row = self.journal.fetch(episode_id)
         if row is None:
+            logger.debug("retrieve_episode: missing id=%s", episode_id)
             return CognitiveFrame(
                 "unknown",
                 answer="unknown",
@@ -1750,9 +1811,17 @@ class BrocaMind:
             )
         replay = cognitive_frame_from_episode_row(row)
         self.workspace.publish(replay)
+        logger.debug("retrieve_episode: id=%s intent=%s", episode_id, replay.intent)
         return replay
 
     def speak(self, frame: CognitiveFrame) -> str:
+        """Plan-forced surface generation via :class:`LexicalPlanGraft`.
+
+        Retained for benchmark code that scores the substrate's ability to
+        produce specific tokens. Conversational use should call
+        :meth:`chat_reply` so the LLM speaks freely under soft graft bias.
+        """
+
         return generate_from_plan(
             self.host,
             self.tokenizer,
@@ -1761,5 +1830,179 @@ class BrocaMind:
         )
 
     def answer(self, utterance: str) -> tuple[CognitiveFrame, str]:
-        frame = self.comprehend(utterance)
-        return frame, self.speak(frame)
+        """One-shot natural-language reply driven by substrate-biased decoding."""
+
+        return self.chat_reply([{"role": "user", "content": utterance}])
+
+    def chat_reply(
+        self,
+        messages: Sequence[dict[str, str]],
+        *,
+        max_new_tokens: int = 256,
+        do_sample: bool = True,
+        temperature: float = 0.7,
+        top_p: float = 0.9,
+        on_token: Callable[[str], None] | None = None,
+    ) -> tuple[CognitiveFrame, str]:
+        """Substrate-biased free-form chat reply.
+
+        The last user message routes through :meth:`comprehend` to obtain a
+        cognitive frame. The frame's continuous features feed
+        :class:`TrainableBrocaGraft` (residual-stream bias) and a derived
+        logit-bias dict over the answer's content subwords feeds
+        :class:`SubstrateLogitBiasGraft` (token-level bias). The LLM then
+        decodes a free-form reply through its own chat template — surface
+        form, fluency, and ordering are entirely the LLM's choice. The
+        sampling temperature is annealed by the frame's confidence so
+        high-confidence frames produce decisive replies and ``unknown`` /
+        low-confidence frames let the LLM speak freely with no bias at all.
+        """
+
+        msgs = [dict(m) for m in messages]
+        if not msgs or msgs[-1].get("role") != "user":
+            raise ValueError("chat_reply expects messages ending with a user turn")
+        user_text = str(msgs[-1].get("content", "")).strip()
+        frame = self.comprehend(user_text)
+
+        broca_features = frame.to_features(self.text_encoder) if frame.intent != "unknown" else None
+        logit_bias = self._content_logit_bias(frame)
+        logger.debug(
+            "chat_reply: intent=%s bias_tokens=%d has_broca_features=%s eff_temp_will_be_scaled=%s",
+            frame.intent,
+            len(logit_bias),
+            broca_features is not None,
+            frame.intent != "unknown",
+        )
+
+        confidence = max(0.0, min(1.0, float(frame.confidence)))
+        if frame.intent == "unknown":
+            eff_temperature = max(1e-3, float(temperature))
+        else:
+            eff_temperature = max(1e-3, float(temperature) * (1.0 - 0.6 * confidence))
+
+        text = self._stream_substrate_chat(
+            msgs,
+            broca_features=broca_features,
+            logit_bias=logit_bias,
+            max_new_tokens=int(max_new_tokens),
+            do_sample=bool(do_sample),
+            temperature=eff_temperature,
+            top_p=float(top_p),
+            on_token=on_token,
+        )
+        return frame, text
+
+    def _content_logit_bias(
+        self,
+        frame: CognitiveFrame,
+        *,
+        bonus: float = 2.5,
+    ) -> dict[int, float]:
+        """Map substrate content (subject / predicate / answer) to subword logit bonuses."""
+
+        if frame.intent == "unknown":
+            return {}
+        targets: list[str] = []
+        if frame.subject:
+            targets.append(str(frame.subject))
+        if frame.answer and frame.answer.lower() != "unknown":
+            targets.append(str(frame.answer))
+        pred = (frame.evidence or {}).get("predicate") or (frame.evidence or {}).get("predicate_surface")
+        if isinstance(pred, str) and pred:
+            targets.append(pred)
+        if not targets:
+            return {}
+        hf_tok = getattr(self.tokenizer, "inner", None)
+        bias: dict[int, float] = {}
+        for surface in targets:
+            surface = surface.strip()
+            if not surface:
+                continue
+            ids: list[int] = []
+            if hf_tok is not None and callable(getattr(hf_tok, "encode", None)):
+                ids.extend(int(t) for t in hf_tok.encode(surface, add_special_tokens=False))
+                ids.extend(int(t) for t in hf_tok.encode(" " + surface, add_special_tokens=False))
+            else:
+                ids.extend(int(t) for t in self.tokenizer.encode(surface))
+            for tid in ids:
+                if tid < 0:
+                    continue
+                bias[tid] = max(bias.get(tid, 0.0), float(bonus))
+        return bias
+
+    def _stream_substrate_chat(
+        self,
+        messages: Sequence[dict[str, str]],
+        *,
+        broca_features: torch.Tensor | None,
+        logit_bias: dict[int, float],
+        max_new_tokens: int,
+        do_sample: bool,
+        temperature: float,
+        top_p: float,
+        on_token: Callable[[str], None] | None,
+    ) -> str:
+        hf_tok = getattr(self.tokenizer, "inner", None)
+        if hf_tok is None or not callable(getattr(hf_tok, "apply_chat_template", None)):
+            raise RuntimeError("chat_reply requires a HuggingFace chat-template tokenizer at .tokenizer.inner")
+
+        device = next(self.host.parameters()).device
+        prompt = hf_tok.apply_chat_template(list(messages), add_generation_prompt=True, return_tensors="pt")
+        if not isinstance(prompt, torch.Tensor):
+            prompt = prompt["input_ids"]
+        prompt = prompt.to(device)
+        if prompt.ndim == 1:
+            prompt = prompt.view(1, -1)
+
+        eos_id = getattr(hf_tok, "eos_token_id", None)
+        current = prompt[0].tolist()
+        generated: list[int] = []
+        bias_active = bool(logit_bias)
+        feature_tensor = broca_features.to(device) if broca_features is not None else None
+
+        logger.debug(
+            "_stream_substrate_chat: prompt_len=%d max_new_tokens=%d bias_active=%s feature_active=%s",
+            int(prompt.shape[1]),
+            int(max_new_tokens),
+            bias_active,
+            feature_tensor is not None,
+        )
+        with torch.no_grad():
+            for step in range(max(1, int(max_new_tokens))):
+                row_t = torch.tensor([current], device=device, dtype=torch.long)
+                mask_t = torch.ones_like(row_t, dtype=torch.bool)
+                extra: dict[str, Any] = {"tokenizer": self.tokenizer}
+                if feature_tensor is not None:
+                    extra["broca_features"] = feature_tensor
+                if bias_active:
+                    extra["broca_logit_bias"] = logit_bias
+                    extra["broca_logit_bias_decay"] = max(0.0, 1.0 - step / 6.0)
+                logits = self.host(row_t, mask_t, extra_state=extra)
+                last_pos = row_t.shape[1] - 1
+                logits_row = logits[0, last_pos].float()
+                if do_sample:
+                    scaled = logits_row / max(temperature, 1e-5)
+                    probs = torch.softmax(scaled, dim=-1)
+                    sorted_probs, sorted_idx = torch.sort(probs, descending=True)
+                    cdf = torch.cumsum(sorted_probs, dim=-1)
+                    over = (cdf > top_p).nonzero(as_tuple=False)
+                    keep = int(over[0, 0].item()) + 1 if over.numel() > 0 else int(probs.numel())
+                    keep = max(1, keep)
+                    kept_probs = sorted_probs[:keep]
+                    kept_idx = sorted_idx[:keep]
+                    kept_probs = kept_probs / kept_probs.sum().clamp_min(1e-12)
+                    pick = int(torch.multinomial(kept_probs, num_samples=1).item())
+                    pred = int(kept_idx[pick].item())
+                else:
+                    pred = int(logits_row.argmax().item())
+                if eos_id is not None and pred == int(eos_id):
+                    break
+                generated.append(pred)
+                current.append(pred)
+                if on_token is not None:
+                    piece = hf_tok.decode([pred], skip_special_tokens=True, clean_up_tokenization_spaces=False)
+                    if piece:
+                        on_token(piece)
+        reply = hf_tok.decode(generated, skip_special_tokens=True, clean_up_tokenization_spaces=False)
+        logger.debug("_stream_substrate_chat: emitted_tokens=%d reply_preview=%r", len(generated), reply[:200] if len(reply) > 200 else reply)
+        return reply

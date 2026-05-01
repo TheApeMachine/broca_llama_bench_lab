@@ -11,14 +11,16 @@ cache support.
 
 from __future__ import annotations
 
-from typing import Any, Sequence
-
+import logging
 from contextlib import nullcontext
+from typing import Any, Sequence
 
 import torch
 import torch.nn.functional as F
 
 from .tokenizer import speech_seed_ids
+
+logger = logging.getLogger(__name__)
 
 
 def _batch_from_ids(rows: Sequence[Sequence[int]], pad_id: int, *, device: torch.device | str):
@@ -163,7 +165,16 @@ def lexical_surprise_gap(
         n = float(len(target_ids))
         ce_p = sum_plain / n
         ce_g = sum_graft / n
-        return ce_g, ce_p, float(ce_g - ce_p)
+        gap = float(ce_g - ce_p)
+        logger.debug(
+            "lexical_surprise_gap: path=dual_ce n_targets=%d ce_g=%.6f ce_p=%.6f gap=%.6f utterance_preview=%r",
+            len(target_ids),
+            ce_g,
+            ce_p,
+            gap,
+            (utterance[:100] + "…") if len(utterance) > 100 else utterance,
+        )
+        return ce_g, ce_p, gap
 
     ce_g = lexical_plan_cross_entropy_mean(
         model,
@@ -182,4 +193,13 @@ def lexical_surprise_gap(
         plan_ids=plan_ids,
         grafts_on=False,
     )
-    return ce_g, ce_p, float(ce_g - ce_p)
+    gap_fb = float(ce_g - ce_p)
+    logger.debug(
+        "lexical_surprise_gap: path=fallback_two_pass n_targets=%d ce_g=%.6f ce_p=%.6f gap=%.6f utterance_preview=%r",
+        len(target_ids),
+        ce_g,
+        ce_p,
+        gap_fb,
+        (utterance[:100] + "…") if len(utterance) > 100 else utterance,
+    )
+    return ce_g, ce_p, gap_fb

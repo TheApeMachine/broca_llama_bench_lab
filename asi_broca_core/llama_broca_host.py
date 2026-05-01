@@ -19,6 +19,7 @@ removed when the last graft on that layer slot is detached (see ``remove_graft``
 from __future__ import annotations
 
 import contextlib
+import logging
 import os
 import threading
 import types
@@ -30,6 +31,8 @@ import torch.nn as nn
 from .device_utils import inference_dtype, pick_torch_device
 from .hf_tokenizer_compat import HuggingFaceBrocaTokenizer
 from .host import freeze_module
+
+logger = logging.getLogger(__name__)
 
 
 def quiet_transformers_benchmark_log_warnings() -> None:
@@ -323,6 +326,21 @@ class LlamaBrocaHost(nn.Module):
         }
         if extra_state:
             state.update(extra_state)
+
+        if logger.isEnabledFor(logging.DEBUG) and extra_state and self._grafts_enabled:
+            broca_hints = tuple(
+                sorted(k for k in extra_state.keys() if k.startswith("broca_") or k in ("tokenizer",))
+            )
+            if broca_hints:
+                n_graft_slots = sum(len(v) for v in self.grafts.values())
+                logger.debug(
+                    "LlamaBrocaHost.forward: bsz=%d seq=%d graft_slots_populated=%d extra_keys=%s return_cache=%s",
+                    idx.shape[0],
+                    seq_len,
+                    n_graft_slots,
+                    broca_hints,
+                    bool(return_cache),
+                )
 
         cache: Optional[Dict[str, torch.Tensor]] = {} if return_cache else None
 

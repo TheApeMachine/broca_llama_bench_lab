@@ -1,11 +1,16 @@
 """Terminal chat: vanilla HF streaming or full Broca substrate.
 
 Vanilla mode streams decoded chunks from ``model.generate``. With ``--broca``,
-loads ``BrocaMind`` (SQLite-backed semantic memory + journal), routes each line
-through ``comprehend``, then streams greedy tokens from ``LexicalPlanGraft``.
+loads ``BrocaMind`` (SQLite-backed semantic memory + journal), routes each
+line through ``comprehend``, then streams a free-form LLM reply whose
+residual stream and logits are softly biased by the substrate via the graft
+mechanism — the LLM still chooses surface form, fluency, and ordering.
 
   python -m asi_broca_core.chat_cli
   python -m asi_broca_core.chat_cli --broca --broca-db runs/broca_chat.sqlite
+
+Logs: ``asi_broca_core`` sets DEBUG stderr logging when the package is imported unless
+``ASI_BROCA_LOG_SILENT=1`` or ``ASI_BROCA_LOG_LEVEL=INFO`` (see ``logging_setup.py``).
 """
 
 from __future__ import annotations
@@ -15,14 +20,14 @@ import os
 import sys
 import threading
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any
 
 import torch
 
-from .broca import BrocaMind, decode_generation
+from .broca import BrocaMind
 from .device_utils import pick_torch_device
 from .llama_broca_host import load_llama_broca_host, quiet_transformers_benchmark_log_warnings, resolve_hf_hub_token
-from .tokenizer import speech_seed_ids
+from .logging_setup import configure_lab_logging
 
 
 def _stream_reply(
@@ -79,58 +84,6 @@ def _stream_reply(
     return "".join(chunks)
 
 
-def _batch_rows(rows: Sequence[Sequence[int]], pad_id: int, *, device: torch.device):
-    max_len = max(1, max(len(r) for r in rows))
-    ids = torch.full((len(rows), max_len), pad_id, dtype=torch.long, device=device)
-    mask = torch.zeros((len(rows), max_len), dtype=torch.bool, device=device)
-    for i, row in enumerate(rows):
-        if not row:
-            continue
-        ids[i, : len(row)] = torch.tensor(row, dtype=torch.long, device=device)
-        mask[i, : len(row)] = True
-    return ids, mask
-
-
-def stream_broca_plan_tokens(
-    host: torch.nn.Module,
-    tokenizer: Any,
-    plan_words: Sequence[str],
-    *,
-    device: torch.device,
-    max_new_tokens: int,
-    broca_features: torch.Tensor | None = None,
-) -> str:
-    """Greedy token emission under LexicalPlanGraft (streams decoded pieces)."""
-
-    plan_ids = list(tokenizer.encode_plan_words(list(plan_words)))
-    ids = speech_seed_ids(tokenizer)
-    generated: list[int] = []
-    pad_id = int(tokenizer.pad_id)
-    steps = range(min(max_new_tokens, len(plan_ids)))
-    for step in steps:
-        row = ids + generated
-        batch_ids, mask = _batch_rows([row], pad_id, device=device)
-        logits = host(
-            batch_ids,
-            mask,
-            extra_state={
-                "broca_plan_token_ids": torch.tensor([plan_ids], device=device),
-                "broca_step": torch.tensor([step], device=device),
-                "tokenizer": tokenizer,
-                **({"broca_features": broca_features.to(device)} if broca_features is not None else {}),
-            },
-        )
-        last = int(mask.long().sum().item()) - 1
-        pred = int(logits[0, last].argmax().item())
-        piece = tokenizer.decode_id(pred)
-        sys.stdout.write(piece)
-        sys.stdout.flush()
-        generated.append(pred)
-    sys.stdout.write("\n")
-    sys.stdout.flush()
-    return decode_generation(tokenizer, generated)
-
-
 def _build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="Stream a local Hugging Face chat model in the terminal.")
     p.add_argument(
@@ -164,10 +117,16 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--broca-namespace", default="chat", help="Semantic memory namespace for --broca.")
     p.add_argument("--no-background", action="store_true", help="Disable background memory consolidation in --broca mode.")
     p.add_argument("--background-interval", type=float, default=5.0, help="Seconds between background consolidation passes in --broca mode.")
+    p.add_argument(
+        "--debug-substrate",
+        action="store_true",
+        help="In --broca mode, print the cognitive frame's intent / answer / confidence after each reply.",
+    )
     return p
 
 
 def main() -> None:
+    configure_lab_logging()
     args = _build_parser().parse_args()
     os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
     quiet_transformers_benchmark_log_warnings()
@@ -204,9 +163,13 @@ def main() -> None:
             print(f"Background consolidation: every {validated_interval:.1f}s", flush=True)
         if args.system:
             print("(Note: --system applies only to vanilla HF chat mode, not --broca routing.)", flush=True)
-        print("Substrate comprehension uses your raw text. Teach facts first, then ask about them.", flush=True)
+        print("Substrate biases the LLM via grafts; the LLM still chooses the surface form.", flush=True)
         print("Commands: /quit /exit — leave.", flush=True)
         print(flush=True)
+
+        messages: list[dict[str, str]] = []
+        if args.system:
+            messages.append({"role": "system", "content": args.system.strip()})
 
         try:
             while True:
@@ -222,23 +185,37 @@ def main() -> None:
                     print("Bye.", flush=True)
                     break
 
-                frame = mind.comprehend(line)
-                plan = frame.speech_plan()
-                print(f"[substrate intent={frame.intent} latent={frame.answer}]", flush=True)
+                messages.append({"role": "user", "content": line})
                 sys.stdout.write("Assistant> ")
                 sys.stdout.flush()
+
+                def _on_token(piece: str) -> None:
+                    sys.stdout.write(piece)
+                    sys.stdout.flush()
+
                 try:
-                    stream_broca_plan_tokens(
-                        mind.host,
-                        mind.tokenizer,
-                        plan,
-                        device=dev,
+                    frame, reply = mind.chat_reply(
+                        messages,
                         max_new_tokens=args.max_new_tokens,
-                        broca_features=frame.to_features(mind.text_encoder),
+                        do_sample=args.sample,
+                        temperature=args.temperature,
+                        top_p=args.top_p,
+                        on_token=_on_token,
                     )
                 except KeyboardInterrupt:
                     sys.stdout.write("\n[generation interrupted]\n")
                     sys.stdout.flush()
+                    messages.pop()
+                    continue
+                sys.stdout.write("\n")
+                sys.stdout.flush()
+                if args.debug_substrate:
+                    print(
+                        f"[substrate intent={frame.intent} subject={frame.subject or '-'} "
+                        f"answer={frame.answer} conf={frame.confidence:.2f}]",
+                        flush=True,
+                    )
+                messages.append({"role": "assistant", "content": reply.strip() or "[empty reply]"})
         finally:
             mind.stop_background()
 

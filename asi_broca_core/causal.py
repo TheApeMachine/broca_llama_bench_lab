@@ -123,8 +123,23 @@ class FiniteSCM:
                 if all(vals.get(k) == v for k, v in event.items()):
                     num += p
         if den <= _EPS:
+            logger.debug(
+                "FiniteSCM.probability: p=0.0 event=%s given=%s do=%s (empty conditioning mass)",
+                dict(event),
+                given,
+                dict(interventions or {}),
+            )
             return 0.0
-        return num / den
+        prob = num / den
+        logger.debug(
+            "FiniteSCM.probability: p=%.8f event=%s given=%s do=%s worlds=%d",
+            prob,
+            dict(event),
+            given,
+            dict(interventions or {}),
+            self.exogenous_world_volume,
+        )
+        return prob
 
     @property
     def exogenous_world_volume(self) -> int:
@@ -185,12 +200,10 @@ class FiniteSCM:
         *,
         evidence: Mapping[str, object],
         interventions: Mapping[str, object],
-        n_samples: int = 10_000,
+        n_samples: int = 4_000,
         seed: int = 0,
-        min_accepted: int | None = None,
-        max_draws: int | None = None,
-        pilot_fraction: float = 0.1,
-        proposal_smoothing: float = 0.3,
+        burn_in_sweeps: int = 4,
+        init_max_draws: int | None = None,
     ) -> float:
         """Sampled abduction-action-prediction counterfactual probability.
 
@@ -206,10 +219,8 @@ class FiniteSCM:
             interventions=interventions,
             n_samples=int(n_samples),
             seed=seed,
-            min_accepted=min_accepted,
-            max_draws=max_draws,
-            pilot_fraction=pilot_fraction,
-            proposal_smoothing=proposal_smoothing,
+            burn_in_sweeps=int(burn_in_sweeps),
+            init_max_draws=init_max_draws,
         )
 
     def counterfactual_probability_exact(
@@ -240,153 +251,177 @@ class FiniteSCM:
         *,
         evidence: Mapping[str, object],
         interventions: Mapping[str, object],
-        n_samples: int = 10_000,
+        n_samples: int = 4_000,
         seed: int = 0,
-        min_accepted: int | None = None,
-        max_draws: int | None = None,
-        pilot_fraction: float = 0.1,
-        proposal_smoothing: float = 0.3,
+        burn_in_sweeps: int = 4,
+        init_max_draws: int | None = None,
     ) -> float:
-        """Adaptive importance-sampling counterfactual probability.
+        """Exact-conditional Gibbs abduction for counterfactual probability.
 
-        Stage 1 (pilot): draws exogenous worlds from the factorized prior and
-        keeps the worlds whose factual evaluation matches ``evidence``. These
-        accepted worlds *also* contribute to the estimate (with importance
-        weight ``1`` since they came from the prior).
+        Each Gibbs step resamples one exogenous variable ``U_i`` from its
+        *exact* conditional posterior::
 
-        Stage 2 (proposal): builds a per-variable empirical posterior
-        ``Q(U_i | E)`` from the pilot's accepted worlds, smoothed with the
-        prior so no exogenous value gets zero proposal mass.
+            P(U_i = v | U_{-i}, E) ∝ P(U_i = v) · 1[evaluate(U_i = v, U_{-i}) ⊨ E]
 
-        Stage 3 (importance sampling): samples remaining worlds from ``Q`` and
-        weights each accepted world by ``P(world) / Q(world)``. The final
-        estimate is the self-normalized weighted ratio.
+        Because every endogenous equation is deterministic, the indicator is
+        computed by enumerating values of ``U_i`` (one ``evaluate_world`` call
+        per value) instead of rejecting samples drawn from the prior. The chain
+        therefore lives entirely on the evidence support: every retained
+        sample is already evidence-consistent, so we never throw a draw away
+        and the estimator scales gracefully to evidence with prior probability
+        as low as the initialiser can locate.
 
-        For evidence with prior probability in roughly ``[1e-3, 0.5]`` this is
-        substantially more sample-efficient than pure rejection because most
-        post-pilot draws fall on the evidence support. For evidence rarer than
-        the pilot can resolve (zero pilot acceptances) the routine degrades to
-        plain rejection sampling — the same behavior as the previous
-        implementation.
+        Initialisation finds a seed assignment in ``U`` that satisfies ``E``
+        via two strategies. Strategy 1 is prior rejection (fast for
+        ``P(E) >= ~1e-3``). Strategy 2 is a WalkSAT-style stochastic local
+        search over ``U`` that reduces evidence violations greedily with
+        random kicks; this exploits the structural equations to *propose*
+        evidence-consistent worlds when no prior draw lands on the support.
+
+        After ``burn_in_sweeps`` full sweeps over the exogenous variables we
+        take ``n_samples`` random-scan Gibbs samples (one ``U_i`` resampled
+        per sample) and apply ``interventions`` to each for the
+        counterfactual readout. The conditional support shrinks to the
+        current value when no other value preserves evidence, so a stuck
+        chain is a no-op rather than a crash.
         """
 
         rng = random.Random(int(seed))
         evidence_d = dict(evidence)
         query_event_d = dict(query_event)
-        draw_budget = max(1, int(n_samples))
-        accept_target = int(min_accepted) if min_accepted is not None else max(32, int(math.sqrt(float(draw_budget))))
-        draw_limit = int(max_draws) if max_draws is not None else draw_budget * 20
+        exo_names = list(self.exogenous)
 
-        pilot_cap = max(64, int(draw_budget * float(pilot_fraction)))
-        pilot_cap = min(pilot_cap, max(1, draw_limit // 2))
-        pilot_target = max(32, accept_target // 2)
-
-        weighted_num = 0.0
-        weighted_den = 0.0
-        accepted = 0
-        draws = 0
-        pilot_accepted: list[dict[str, object]] = []
-
-        while draws < pilot_cap and len(pilot_accepted) < pilot_target:
-            draws += 1
-            exo = self._sample_exogenous_world(rng)
-            actual = self.evaluate_world(exo, interventions=None)
+        if not exo_names:
+            actual = self.evaluate_world({}, interventions=None)
             if not all(actual.get(k) == v for k, v in evidence_d.items()):
-                continue
-            pilot_accepted.append(exo)
-            accepted += 1
-            weighted_den += 1.0
-            cf = self.evaluate_world(exo, interventions=interventions)
-            if all(cf.get(k) == v for k, v in query_event_d.items()):
-                weighted_num += 1.0
+                return 0.0
+            cf = self.evaluate_world({}, interventions=interventions)
+            return 1.0 if all(cf.get(k) == v for k, v in query_event_d.items()) else 0.0
 
-        proposal = (
-            self._evidence_proposal_from_pilot(pilot_accepted, smoothing=float(proposal_smoothing))
-            if pilot_accepted
-            else None
-        )
-
-        while draws < draw_limit and (draws < draw_budget or accepted < accept_target):
-            draws += 1
-            if proposal is not None:
-                exo = self._sample_from_proposal(rng, proposal)
-                w = self._importance_weight(exo, proposal)
-            else:
-                exo = self._sample_exogenous_world(rng)
-                w = 1.0
-            if w <= 0.0:
-                continue
-            actual = self.evaluate_world(exo, interventions=None)
-            if not all(actual.get(k) == v for k, v in evidence_d.items()):
-                continue
-            accepted += 1
-            weighted_den += w
-            cf = self.evaluate_world(exo, interventions=interventions)
-            if all(cf.get(k) == v for k, v in query_event_d.items()):
-                weighted_num += w
-
-        if weighted_den <= 0.0:
+        state = self._initialize_evidence_consistent_state(rng, evidence_d, init_max_draws)
+        if state is None:
             logger.warning(
-                "counterfactual_probability_monte_carlo: no samples matched evidence after %s draws (limit=%s); "
-                "returning 0.0. Consider increasing max_draws or n_samples if this is unexpected.",
-                draws,
-                draw_limit,
+                "counterfactual_probability_monte_carlo: failed to seed the Gibbs chain on evidence; "
+                "evidence has effectively zero structural support, returning 0.0",
             )
             return 0.0
-        return weighted_num / weighted_den
 
-    def _evidence_proposal_from_pilot(
-        self,
-        pilot_accepted: Sequence[Mapping[str, object]],
-        *,
-        smoothing: float = 0.3,
-    ) -> dict[str, dict[object, float]]:
-        """Per-variable empirical posterior over exogenous values, smoothed with the prior."""
+        burn = max(0, int(burn_in_sweeps))
+        for _ in range(burn):
+            for name in exo_names:
+                state = self._gibbs_resample(rng, name, state, evidence_d)
 
-        smoothing = max(0.0, min(1.0, float(smoothing)))
-        n = float(len(pilot_accepted))
-        proposal: dict[str, dict[object, float]] = {}
-        for name, prior in self.exogenous.items():
-            counts: dict[object, float] = {x: 0.0 for x in prior}
-            for world in pilot_accepted:
-                value = world.get(name)
-                if value in counts:
-                    counts[value] += 1.0
-            mixed: dict[object, float] = {}
-            for x, prior_p in prior.items():
-                empirical = counts[x] / n if n > 0 else float(prior_p)
-                mixed[x] = (1.0 - smoothing) * empirical + smoothing * float(prior_p)
-            z = float(sum(mixed.values())) or 1.0
-            proposal[name] = {x: mixed[x] / z for x in prior}
-        return proposal
+        n = max(1, int(n_samples))
+        num = 0
+        den = 0
+        for _ in range(n):
+            name = rng.choice(exo_names)
+            state = self._gibbs_resample(rng, name, state, evidence_d)
+            cf = self.evaluate_world(state, interventions=interventions)
+            den += 1
+            if all(cf.get(k) == v for k, v in query_event_d.items()):
+                num += 1
 
-    def _sample_from_proposal(
+        if den <= 0:
+            return 0.0
+        return num / den
+
+    def _gibbs_resample(
         self,
         rng: random.Random,
-        proposal: Mapping[str, Mapping[object, float]],
+        name: str,
+        state: Mapping[str, object],
+        evidence_d: Mapping[str, object],
     ) -> dict[str, object]:
-        world: dict[str, object] = {}
-        for name in self.exogenous:
-            q = proposal[name]
-            dom = list(q.keys())
-            weights = [float(q[x]) for x in dom]
-            world[name] = rng.choices(dom, weights=weights, k=1)[0]
-        return world
+        """Sample ``U_name`` from ``P(U_name | U_{-name}, E)`` by domain enumeration."""
 
-    def _importance_weight(
+        prior = self.exogenous[name]
+        candidates: list[object] = []
+        weights: list[float] = []
+        trial = dict(state)
+        for value, prior_p in prior.items():
+            p = float(prior_p)
+            if p <= 0.0:
+                continue
+            trial[name] = value
+            actual = self.evaluate_world(trial, interventions=None)
+            if not all(actual.get(k) == v for k, v in evidence_d.items()):
+                continue
+            candidates.append(value)
+            weights.append(p)
+        new_state = dict(state)
+        if candidates:
+            new_state[name] = rng.choices(candidates, weights=weights, k=1)[0]
+        return new_state
+
+    def _evidence_violations(
         self,
-        world: Mapping[str, object],
-        proposal: Mapping[str, Mapping[object, float]],
-    ) -> float:
-        log_w = 0.0
-        for name, prior in self.exogenous.items():
-            value = world[name]
-            p = float(prior.get(value, 0.0))
-            q = float(proposal[name].get(value, 0.0))
-            if p <= 0.0 or q <= 0.0:
-                return 0.0
-            log_w += math.log(p) - math.log(q)
-        return math.exp(log_w)
+        state: Mapping[str, object],
+        evidence_d: Mapping[str, object],
+    ) -> int:
+        actual = self.evaluate_world(dict(state), interventions=None)
+        return sum(1 for k, v in evidence_d.items() if actual.get(k) != v)
+
+    def _initialize_evidence_consistent_state(
+        self,
+        rng: random.Random,
+        evidence_d: Mapping[str, object],
+        init_max_draws: int | None,
+    ) -> dict[str, object] | None:
+        """Locate any ``U`` satisfying evidence; rejection first, then stochastic local search."""
+
+        exo_names = list(self.exogenous)
+        domain_total = sum(len(self.exogenous[n]) for n in exo_names) or 1
+        cap = int(init_max_draws) if init_max_draws is not None else max(2048, 32 * domain_total)
+        rejection_budget = max(64, cap // 4)
+
+        for _ in range(rejection_budget):
+            candidate = self._sample_exogenous_world(rng)
+            if self._evidence_violations(candidate, evidence_d) == 0:
+                return candidate
+
+        sls_budget = max(0, cap - rejection_budget)
+        if sls_budget == 0 or not exo_names:
+            return None
+        restart_every = max(8, sls_budget // 16)
+        noise = 0.3
+        state = self._sample_exogenous_world(rng)
+        violations = self._evidence_violations(state, evidence_d)
+
+        for step in range(sls_budget):
+            if violations == 0:
+                return dict(state)
+            if step > 0 and step % restart_every == 0:
+                candidate = self._sample_exogenous_world(rng)
+                cand_violations = self._evidence_violations(candidate, evidence_d)
+                if cand_violations < violations:
+                    state, violations = candidate, cand_violations
+            name = rng.choice(exo_names)
+            prior = self.exogenous[name]
+            domain_values = [(v, float(p)) for v, p in prior.items() if float(p) > 0.0]
+            if not domain_values:
+                continue
+            if rng.random() < noise:
+                value = rng.choices([v for v, _ in domain_values], weights=[p for _, p in domain_values], k=1)[0]
+                trial = dict(state)
+                trial[name] = value
+                trial_violations = self._evidence_violations(trial, evidence_d)
+            else:
+                best_value = state[name]
+                best_violations = violations
+                for value, _ in domain_values:
+                    trial = dict(state)
+                    trial[name] = value
+                    v_count = self._evidence_violations(trial, evidence_d)
+                    if v_count < best_violations:
+                        best_violations = v_count
+                        best_value = value
+                trial = dict(state)
+                trial[name] = best_value
+                trial_violations = best_violations
+            state, violations = trial, trial_violations
+
+        return dict(state) if violations == 0 else None
 
     def descendants(self, node: str, *, parents: Mapping[str, Sequence[str]] | None = None) -> set[str]:
         parents = {k: list(v) for k, v in (parents or self.graph_parents(include_exogenous=True)).items()}
@@ -598,6 +633,7 @@ def build_simpson_scm() -> FiniteSCM:
 
     scm.add_endogenous("T", [0, 1], ["S", "U_T"], t_fn)
     scm.add_endogenous("Y", [0, 1], ["S", "T", "U_Y"], y_fn)
+    logger.debug("build_simpson_scm: enumerate_worlds=%d vars=%s", scm.exogenous_world_volume, scm.order)
     return scm
 
 
@@ -629,4 +665,5 @@ def build_frontdoor_scm() -> FiniteSCM:
     scm.add_endogenous("X", [0, 1], ["U", "U_X"], x_fn)
     scm.add_endogenous("M", [0, 1], ["X", "U_M"], m_fn)
     scm.add_endogenous("Y", [0, 1], ["M", "U", "U_Y"], y_fn)
+    logger.debug("build_frontdoor_scm: enumerate_worlds=%d vars=%s", scm.exogenous_world_volume, scm.order)
     return scm

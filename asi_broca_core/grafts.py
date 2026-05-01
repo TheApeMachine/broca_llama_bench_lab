@@ -1,13 +1,16 @@
 from __future__ import annotations
 
+import logging
+import math
 from typing import Iterable, Mapping, Optional, Sequence, Tuple
 
-import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
 from .active_inference import CoupledDecision, CoupledEFEAgent
+
+logger = logging.getLogger(__name__)
 
 
 def derived_residual_token_strength(d_model: int, n_outcomes: int) -> float:
@@ -96,8 +99,10 @@ class KVMemoryGraft(BaseGraft):
 
         if mat is None or mat.numel() == 0:
             self.spread_matrix = None
+            logger.debug("KVMemoryGraft.set_spread_matrix: cleared")
             return
         self.spread_matrix = mat.detach().float().clone()
+        logger.debug("KVMemoryGraft.set_spread_matrix: shape=%s", tuple(self.spread_matrix.shape))
 
     @torch.no_grad()
     def remember(self, key: torch.Tensor, value: torch.Tensor, metadata: dict | None = None) -> None:
@@ -110,6 +115,12 @@ class KVMemoryGraft(BaseGraft):
         for _ in range(key.shape[0]):
             self.metadata.append(dict(metadata or {}))
         self.metadata = self.metadata[-self.max_items:]
+        logger.debug(
+            "KVMemoryGraft.remember: added_rows=%d store_size=%d d_model=%d",
+            int(key.shape[0]),
+            int(self.keys.shape[0]),
+            self.d_model,
+        )
 
     def _retrieve(self, queries: torch.Tensor, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, dict]:
         q = F.normalize(queries, dim=-1)
@@ -160,6 +171,7 @@ class KVMemoryGraft(BaseGraft):
         if not self.enabled or self.keys.numel() == 0:
             return x
         bsz, seq_len, d_model = x.shape
+        nk = int(self.keys.shape[0])
         mask = state.get("attention_mask")
         if mask is None:
             mask = torch.ones(bsz, seq_len, device=x.device, dtype=torch.bool)
@@ -167,6 +179,17 @@ class KVMemoryGraft(BaseGraft):
             delta, weights, gate, manifold_dbg = self._retrieve(x.reshape(-1, d_model), x)
             self.last_debug = {"weights": weights.detach().cpu(), "gate": gate.detach().cpu(), **manifold_dbg}
             delta_view = delta.reshape(bsz, seq_len, d_model)
+            gmax = float(gate.detach().max().item()) if gate.numel() else 0.0
+            wmax = float(weights.detach().max().item()) if weights.numel() else 0.0
+            logger.debug(
+                "KVMemoryGraft.forward: mode=token bsz=%d seq=%d nk=%s gate_max=%.4f weight_max=%.4f dbg=%s",
+                bsz,
+                seq_len,
+                nk,
+                gmax,
+                wmax,
+                {k: (float(v) if hasattr(v, "item") else v) for k, v in manifold_dbg.items()},
+            )
             return x + delta_view
 
         weights_for_mean = mask.to(x.dtype).unsqueeze(-1)
@@ -177,6 +200,18 @@ class KVMemoryGraft(BaseGraft):
         last = _last_indices(state, x)
         out[torch.arange(bsz, device=x.device), last] += delta
         self.last_debug = {"weights": weights.detach().cpu(), "gate": gate.detach().cpu(), **manifold_dbg}
+        gmax = float(gate.detach().max().item()) if gate.numel() else 0.0
+        wmax = float(weights.detach().max().item()) if weights.numel() else 0.0
+        logger.debug(
+            "KVMemoryGraft.forward: mode=sequence_mean bsz=%d seq=%d nk=%s gate_max=%.4f weight_max=%.4f spread=%s dbg=%s",
+            bsz,
+            seq_len,
+            nk,
+            gmax,
+            wmax,
+            None if self.spread_matrix is None else tuple(self.spread_matrix.shape),
+            {k: (float(v) if hasattr(v, "item") else v) for k, v in manifold_dbg.items()},
+        )
         return out
 
 
