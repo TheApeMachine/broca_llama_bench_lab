@@ -62,7 +62,7 @@ from .memory import SQLiteActivationMemory
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_BROCA_MODEL_ID = os.environ.get("ASI_BROCA_MODEL_ID", "meta-llama/Llama-3.2-1B-Instruct")
+DEFAULT_BROCA_MODEL_ID = os.environ.get("MODEL_ID", "meta-llama/Llama-3.2-1B-Instruct")
 SEMANTIC_CONFIDENCE_FLOOR = 0.5
 BELIEF_REVISION_LOG_ODDS_THRESHOLD = 0.5
 BELIEF_REVISION_MIN_CLAIMS = 1

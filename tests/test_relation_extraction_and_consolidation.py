@@ -6,8 +6,8 @@ from pathlib import Path
 
 import pytest
 
-import asi_broca_core.broca as broca_mod
-from asi_broca_core.broca import (
+import core.broca as broca_mod
+from core.broca import (
     BrocaMind,
     LLMRelationExtractor,
     PersistentSemanticMemory,

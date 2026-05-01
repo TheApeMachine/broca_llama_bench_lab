@@ -11,8 +11,8 @@ from __future__ import annotations
 
 import pytest
 
-from asi_broca_core.causal import FiniteSCM
-from asi_broca_core.native_tools import (
+from core.causal import FiniteSCM
+from core.native_tools import (
     NativeTool,
     NativeToolRegistry,
     SandboxResult,

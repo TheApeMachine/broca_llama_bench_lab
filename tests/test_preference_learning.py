@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from asi_broca_core.preference_learning import (
+from core.preference_learning import (
     DirichletPreference,
     PersistentPreference,
     feedback_polarity_from_text,

@@ -6,10 +6,10 @@ import torch
 
 import pytest
 
-from asi_broca_core.broca import BrocaMind, CognitiveFrame, GlobalWorkspace, TrainableBrocaGraft, WorkspaceJournal, working_memory_synthesize
-import asi_broca_core.broca as broca_mod
-from asi_broca_core.memory import SQLiteActivationMemory
-from asi_broca_core.substrate_graph import EpisodeAssociationGraph, merge_epistemic_evidence_dict
+from core.broca import BrocaMind, CognitiveFrame, GlobalWorkspace, TrainableBrocaGraft, WorkspaceJournal, working_memory_synthesize
+import core.broca as broca_mod
+from core.memory import SQLiteActivationMemory
+from core.substrate_graph import EpisodeAssociationGraph, merge_epistemic_evidence_dict
 
 from conftest import make_stub_llm_pair
 

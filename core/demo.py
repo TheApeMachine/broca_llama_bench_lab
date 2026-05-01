@@ -25,7 +25,7 @@ def main() -> None:
     parser.add_argument(
         "--broca-model-id",
         default=None,
-        help="HF model id (default meta-llama/Llama-3.2-1B-Instruct or ASI_BROCA_MODEL_ID). Requires HF access for gated checkpoints.",
+        help="HF model id (default meta-llama/Llama-3.2-1B-Instruct or MODEL_ID). Requires HF access for gated checkpoints.",
     )
     args = parser.parse_args()
 

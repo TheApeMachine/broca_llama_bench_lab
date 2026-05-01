@@ -4,8 +4,8 @@ import uuid
 
 import torch
 
-from asi_broca_core.continuous_frame import COGNITIVE_FRAME_DIM, FrozenSubwordProjector, pack_cognitive_frame, stable_sketch
-from asi_broca_core.tokenizer import RegexTokenizer, SPEECH_BRIDGE_PREFIX, speech_seed_ids
+from core.continuous_frame import COGNITIVE_FRAME_DIM, FrozenSubwordProjector, pack_cognitive_frame, stable_sketch
+from core.tokenizer import RegexTokenizer, SPEECH_BRIDGE_PREFIX, speech_seed_ids
 
 
 def _cos(a: torch.Tensor, b: torch.Tensor) -> float:

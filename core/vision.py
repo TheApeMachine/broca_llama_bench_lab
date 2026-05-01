@@ -13,7 +13,7 @@ The encoder always exposes:
 * ``ambiguity(image) -> float`` — Friston-style observation entropy. The active
   inference agent uses this to decide whether to ask for a closer image.
 
-For the production model, set ``ASI_BROCA_VISION_MODEL`` (default
+For the production model, set ``VISION_MODEL`` (default
 ``openai/clip-vit-base-patch32``) and pass ``use_real_model=True`` to the
 constructor; the loader silently falls back if transformers is unavailable.
 """
@@ -145,7 +145,7 @@ class VisionEncoder:
         device: torch.device | str | None = None,
     ) -> None:
         self.model_id = model_id or os.environ.get(
-            "ASI_BROCA_VISION_MODEL", "openai/clip-vit-base-patch32"
+            "VISION_MODEL", "openai/clip-vit-base-patch32"
         )
         self.device = (
             torch.device(device) if device is not None else torch.device("cpu")

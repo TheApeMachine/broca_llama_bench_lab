@@ -23,7 +23,7 @@ help:
 	@echo "SQLite persistence:"
 	@echo "  DB files are created under ./runs/ when you run demos, experiments, BrocaMind, or chat --broca."
 	@echo "  runs/* is gitignored (except runs/.gitkeep). Examples:"
-	@echo "    runs/broca_chat.sqlite          ( python -m asi_broca_core.chat_cli --broca )"
+	@echo "    runs/broca_chat.sqlite          ( python -m core.chat_cli --broca )"
 	@echo "    runs/broca_semantic_memory.sqlite ( run_broca_experiment / demo broca mode )"
 	@echo "    runs/faculty_memory.sqlite, runs/faculty_stack.sqlite ( faculty demos )"
 	@echo ""
@@ -41,8 +41,8 @@ install-benchmark:
 	$(PYTHON) -m pip install -e ".[benchmark]"
 
 chat:
-	$(PYTHON) -m asi_broca_core.chat_cli --broca $(CHAT_ARGS)
+	$(PYTHON) -m core.chat_cli --broca $(CHAT_ARGS)
 
 # Native (standard task preset) + Eleuther lm-eval (standard preset limits) + architecture eval.
 bench:
-	$(PYTHON) -m asi_broca_core.benchmarks --engine both --preset standard --limit 250 $(BENCH_EXTRA)
+	$(PYTHON) -m core.benchmarks --engine both --preset standard --limit 250 $(BENCH_EXTRA)

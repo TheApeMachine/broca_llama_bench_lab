@@ -5,8 +5,8 @@ import sys
 
 import torch
 
-from asi_broca_core.continuous_frame import COGNITIVE_FRAME_DIM
-from asi_broca_core.vision import VisionEncoder
+from core.continuous_frame import COGNITIVE_FRAME_DIM
+from core.vision import VisionEncoder
 
 
 def _gradient_image() -> torch.Tensor:

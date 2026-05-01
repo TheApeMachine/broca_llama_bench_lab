@@ -30,8 +30,8 @@ from typing import Any, Callable, Iterable, Iterator, Mapping, Sequence
 import torch
 import torch.nn.functional as F
 
-from asi_broca_core.device_utils import inference_dtype, pick_torch_device
-from asi_broca_core.llama_broca_host import (
+from core.device_utils import inference_dtype, pick_torch_device
+from core.llama_broca_host import (
     LlamaBrocaHost,
     load_llama_broca_host,
     quiet_transformers_benchmark_log_warnings,

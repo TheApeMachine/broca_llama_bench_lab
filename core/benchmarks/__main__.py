@@ -19,10 +19,10 @@ checkpoint) for Llama models. Opt out with ``--no-broca-host-compare``.
 
 Examples:
 
-  HF_TOKEN=... python -m asi_broca_core.benchmarks --engine native --preset quick --limit 50
-  HF_TOKEN=... python -m asi_broca_core.benchmarks --engine native --no-broca-host-compare --preset quick --limit 50
-  HF_TOKEN=... python -m asi_broca_core.benchmarks --engine both --preset standard --limit 100
-  python -m asi_broca_core.benchmarks.hf_datasets_eval --model meta-llama/Llama-3.2-1B-Instruct --tasks boolq,piqa --limit 20
+  HF_TOKEN=... python -m core.benchmarks --engine native --preset quick --limit 50
+  HF_TOKEN=... python -m core.benchmarks --engine native --no-broca-host-compare --preset quick --limit 50
+  HF_TOKEN=... python -m core.benchmarks --engine both --preset standard --limit 100
+  python -m core.benchmarks.hf_datasets_eval --model meta-llama/Llama-3.2-1B-Instruct --tasks boolq,piqa --limit 20
 
 Use ``--model gpt2`` only for a public smoke check; the intended model is
 ``meta-llama/Llama-3.2-1B-Instruct``.
@@ -39,15 +39,15 @@ import tempfile
 from pathlib import Path
 from typing import Any
 
-from asi_broca_core.benchmarks.architecture_eval import run_broca_architecture_eval
-from asi_broca_core.benchmarks.hf_datasets_eval import (
+from core.benchmarks.architecture_eval import run_broca_architecture_eval
+from core.benchmarks.hf_datasets_eval import (
     DEFAULT_LLAMA_MODEL,
     DEFAULT_NATIVE_PRESETS,
     run_hf_datasets_benchmark,
     resolve_task_names,
 )
-from asi_broca_core.benchmarks.lm_eval_pair import run_paired_lm_eval
-from asi_broca_core.device_utils import normalize_device_arg, pick_torch_device
+from core.benchmarks.lm_eval_pair import run_paired_lm_eval
+from core.device_utils import normalize_device_arg, pick_torch_device
 
 DEFAULT_BENCHMARK_MODEL = DEFAULT_LLAMA_MODEL
 
@@ -242,7 +242,7 @@ def write_suite_manifest(
     architecture_eval: dict[str, Any] | None,
 ) -> None:
     manifest = {
-        "kind": "asi_broca_llama_benchmark_suite",
+        "kind": "llama_benchmark_suite",
         "model_checkpoint": model_id,
         "engine": engine,
         "native_hf_datasets": native_result,

@@ -15,7 +15,7 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Sequence
 
-from asi_broca_core.broca import BrocaMind, generate_without_broca
+from core.broca import BrocaMind, generate_without_broca
 
 
 _WORD_RE = re.compile(r"[a-z0-9_]+")
@@ -124,7 +124,7 @@ def run_broca_architecture_eval(
     do not carry over across cases within this run.
     """
 
-    mid = llama_model_id or os.environ.get("ASI_BROCA_MODEL_ID", "meta-llama/Llama-3.2-1B-Instruct")
+    mid = llama_model_id or os.environ.get("MODEL_ID", "meta-llama/Llama-3.2-1B-Instruct")
 
     rows: list[dict[str, Any]] = []
     graft_report = ""

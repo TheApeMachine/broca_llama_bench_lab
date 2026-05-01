@@ -1,7 +1,7 @@
 
 from __future__ import annotations
 
-from asi_broca_core.benchmarks.hf_datasets_eval import (
+from core.benchmarks.hf_datasets_eval import (
     BenchmarkExample,
     build_arc,
     build_boolq,

@@ -4,7 +4,7 @@ import math
 
 import torch
 
-from asi_broca_core.vsa import (
+from core.vsa import (
     DEFAULT_VSA_DIM,
     VSACodebook,
     bind,

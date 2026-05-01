@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pytest
 
-from asi_broca_core.conformal import (
+from core.conformal import (
     ConformalPredictor,
     PersistentConformalCalibration,
     empirical_coverage,

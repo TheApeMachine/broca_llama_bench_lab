@@ -9,7 +9,7 @@ from types import MethodType
 from typing import Any
 
 import torch
-from asi_broca_core.llama_broca_host import LlamaBrocaHost
+from core.llama_broca_host import LlamaBrocaHost
 
 
 def is_llama_hf_model_id(model_id: str) -> bool:

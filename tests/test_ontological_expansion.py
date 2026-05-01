@@ -4,8 +4,8 @@ from pathlib import Path
 
 import torch
 
-from asi_broca_core.continuous_frame import SKETCH_DIM, stable_sketch
-from asi_broca_core.ontological_expansion import (
+from core.continuous_frame import SKETCH_DIM, stable_sketch
+from core.ontological_expansion import (
     OntologicalRegistry,
     PersistentOntologicalRegistry,
     gram_schmidt_orthogonalize,

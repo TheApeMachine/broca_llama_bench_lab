@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import math
 
-from asi_broca_core.experiments import (
+from core.experiments import (
     run_active_inference_experiment,
     run_causal_experiment,
 )

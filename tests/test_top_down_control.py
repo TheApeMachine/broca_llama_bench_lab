@@ -27,9 +27,9 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from asi_broca_core.causal import FiniteSCM
-from asi_broca_core.grafts import KVMemoryGraft
-from asi_broca_core.top_down_control import (
+from core.causal import FiniteSCM
+from core.grafts import KVMemoryGraft
+from core.top_down_control import (
     CausalConstraint,
     CausalConstraintGraft,
     EpistemicInterruptionMonitor,

@@ -48,13 +48,13 @@ export HF_TOKEN=hf_...
 Tiny backend, CPU-friendly:
 
 ```bash
-python -m asi_broca_core.demo --mode broca --seed 0
+python -m core.demo --mode broca --seed 0
 ```
 
 Real Llama Broca backend:
 
 ```bash
-HF_TOKEN=... python -m asi_broca_core.demo --mode broca --broca-backend llama --broca-model-id meta-llama/Llama-3.2-1B-Instruct
+HF_TOKEN=... python -m core.demo --mode broca --broca-backend llama --broca-model-id meta-llama/Llama-3.2-1B-Instruct
 ```
 
 ## Run native HuggingFace-datasets benchmarks
@@ -62,7 +62,7 @@ HF_TOKEN=... python -m asi_broca_core.demo --mode broca --broca-backend llama --
 Quick run:
 
 ```bash
-HF_TOKEN=... python -m asi_broca_core.benchmarks \
+HF_TOKEN=... python -m core.benchmarks \
   --engine native \
   --preset quick \
   --limit 50 \
@@ -72,7 +72,7 @@ HF_TOKEN=... python -m asi_broca_core.benchmarks \
 Standard run:
 
 ```bash
-HF_TOKEN=... python -m asi_broca_core.benchmarks \
+HF_TOKEN=... python -m core.benchmarks \
   --engine native \
   --preset standard \
   --limit 250 \
@@ -82,7 +82,7 @@ HF_TOKEN=... python -m asi_broca_core.benchmarks \
 Explicit task list:
 
 ```bash
-HF_TOKEN=... python -m asi_broca_core.benchmarks \
+HF_TOKEN=... python -m core.benchmarks \
   --engine native \
   --tasks boolq,piqa,arc_easy,arc_challenge,winogrande,hellaswag,commonsenseqa,openbookqa,mmlu_abstract_algebra,gsm8k \
   --limit 100 \
@@ -108,7 +108,7 @@ Multiple-choice tasks are scored by length-normalized continuation log-likelihoo
 This is not the Broca architecture benchmark. It is a wrapper-integrity check: vanilla HF logits vs the same model inside an empty `LlamaBrocaHost`.
 
 ```bash
-HF_TOKEN=... python -m asi_broca_core.benchmarks \
+HF_TOKEN=... python -m core.benchmarks \
   --engine lm-eval \
   --preset quick \
   --limit 80 \
@@ -118,7 +118,7 @@ HF_TOKEN=... python -m asi_broca_core.benchmarks \
 Run both native HF datasets and lm-eval:
 
 ```bash
-HF_TOKEN=... python -m asi_broca_core.benchmarks \
+HF_TOKEN=... python -m core.benchmarks \
   --engine both \
   --preset quick \
   --limit 50 \

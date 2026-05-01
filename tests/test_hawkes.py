@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from asi_broca_core.hawkes import (
+from core.hawkes import (
     MultivariateHawkesProcess,
     PersistentHawkes,
     fit_excitation_em,

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import random
 
-from asi_broca_core.causal_discovery import (
+from core.causal_discovery import (
     DiscoveredGraph,
     _chi2_sf,
     _g_squared_independence,

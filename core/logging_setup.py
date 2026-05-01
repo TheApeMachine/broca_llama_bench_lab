@@ -7,17 +7,17 @@ after the fact).
 
 Override with environment variables:
 
-  ASI_BROCA_LOG_LEVEL   — DEBUG, INFO, WARNING, ERROR (default: DEBUG)
-  ASI_BROCA_LOG_SILENT  — if set to 1/true/yes, skip stderr handler (file still
-                          attaches unless ``ASI_BROCA_LOG_FILE_DISABLED`` is set)
-  ASI_BROCA_LOG_FILE    — override the log-file path (default: runs/broca.log).
+  LOG_LEVEL   — DEBUG, INFO, WARNING, ERROR (default: DEBUG)
+  LOG_SILENT  — if set to 1/true/yes, skip stderr handler (file still
+                          attaches unless ``LOG_FILE_DISABLED`` is set)
+  LOG_FILE    — override the log-file path (default: runs/broca.log).
                           Set to empty to use the default; set
-                          ``ASI_BROCA_LOG_FILE_DISABLED=1`` to skip the file
+                          ``LOG_FILE_DISABLED=1`` to skip the file
                           handler altogether.
-  ASI_BROCA_LOG_FILE_LEVEL — independent level for the file handler (default:
-                          DEBUG; falls back to ASI_BROCA_LOG_LEVEL).
-  ASI_BROCA_LOG_FILE_MAX_BYTES — rotating size cap (default: 16 MB).
-  ASI_BROCA_LOG_FILE_BACKUPS — number of rotated backups to keep (default: 4).
+  LOG_FILE_LEVEL — independent level for the file handler (default:
+                          DEBUG; falls back to LOG_LEVEL).
+  LOG_FILE_MAX_BYTES — rotating size cap (default: 16 MB).
+  LOG_FILE_BACKUPS — number of rotated backups to keep (default: 4).
 
 Idempotent: calling more than once is a no-op after the first configuration.
 """
@@ -70,31 +70,31 @@ def _resolve_int(name: str | None, default: int) -> int:
 
 
 def _resolve_log_file_path() -> Path | None:
-    if _truthy(os.environ.get("ASI_BROCA_LOG_FILE_DISABLED")):
+    if _truthy(os.environ.get("LOG_FILE_DISABLED")):
         return None
-    raw = os.environ.get("ASI_BROCA_LOG_FILE")
+    raw = os.environ.get("LOG_FILE")
     if raw is None or raw.strip() == "":
         return _DEFAULT_LOG_FILE
     return Path(raw).expanduser()
 
 
 def configure_lab_logging() -> None:
-    """Attach stderr + rotating-file logging for the ``asi_broca_core`` namespace."""
+    """Attach stderr + rotating-file logging for the ``core`` namespace."""
 
     global _CONFIGURED
     with _CONFIG_LOCK:
         if _CONFIGURED:
             return
 
-        silent = _truthy(os.environ.get("ASI_BROCA_LOG_SILENT"))
+        silent = _truthy(os.environ.get("LOG_SILENT"))
         base_level = _resolve_level(
-            os.environ.get("ASI_BROCA_LOG_LEVEL"), logging.DEBUG
+            os.environ.get("LOG_LEVEL"), logging.DEBUG
         )
         file_level = _resolve_level(
-            os.environ.get("ASI_BROCA_LOG_FILE_LEVEL"), base_level
+            os.environ.get("LOG_FILE_LEVEL"), base_level
         )
 
-        pkg = logging.getLogger("asi_broca_core")
+        pkg = logging.getLogger("core")
         # Logger threshold must be the more permissive of the two handlers so each
         # handler can independently filter without the parent logger swallowing
         # records below its own level.
@@ -112,10 +112,10 @@ def configure_lab_logging() -> None:
             try:
                 log_path.parent.mkdir(parents=True, exist_ok=True)
                 max_bytes = _resolve_int(
-                    os.environ.get("ASI_BROCA_LOG_FILE_MAX_BYTES"), _DEFAULT_MAX_BYTES
+                    os.environ.get("LOG_FILE_MAX_BYTES"), _DEFAULT_MAX_BYTES
                 )
                 backups = _resolve_int(
-                    os.environ.get("ASI_BROCA_LOG_FILE_BACKUPS"), _DEFAULT_BACKUPS
+                    os.environ.get("LOG_FILE_BACKUPS"), _DEFAULT_BACKUPS
                 )
                 file_handler = RotatingFileHandler(
                     log_path,
@@ -137,7 +137,7 @@ def configure_lab_logging() -> None:
                 pkg.warning("failed to attach file handler at %s: %s", log_path, exc)
                 if silent or not pkg.handlers:
                     print(
-                        f"[asi_broca_core] WARNING: failed to attach file handler at {log_path}: {exc}",
+                        f"[core] WARNING: failed to attach file handler at {log_path}: {exc}",
                         file=sys.stderr,
                         flush=True,
                     )

@@ -6,11 +6,11 @@ line through ``comprehend``, then streams a free-form LLM reply whose
 residual stream and logits are softly biased by the substrate via the graft
 mechanism — the LLM still chooses surface form, fluency, and ordering.
 
-  python -m asi_broca_core.chat_cli
-  python -m asi_broca_core.chat_cli --broca --broca-db runs/broca_chat.sqlite
+  python -m core.chat_cli
+  python -m core.chat_cli --broca --broca-db runs/broca_chat.sqlite
 
-Logs: ``asi_broca_core`` sets DEBUG stderr logging when the package is imported unless
-``ASI_BROCA_LOG_SILENT=1`` or ``ASI_BROCA_LOG_LEVEL=INFO`` (see ``logging_setup.py``).
+Logs: ``core`` sets DEBUG stderr logging when the package is imported unless
+``LOG_SILENT=1`` or ``LOG_LEVEL=INFO`` (see ``logging_setup.py``).
 """
 
 from __future__ import annotations
@@ -88,8 +88,8 @@ def _build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="Stream a local Hugging Face chat model in the terminal.")
     p.add_argument(
         "--model",
-        default=os.environ.get("ASI_BROCA_MODEL_ID", "meta-llama/Llama-3.2-1B-Instruct"),
-        help="HF model id (default: ASI_BROCA_MODEL_ID or Llama-3.2-1B-Instruct).",
+        default=os.environ.get("MODEL_ID", "meta-llama/Llama-3.2-1B-Instruct"),
+        help="HF model id (default: MODEL_ID or Llama-3.2-1B-Instruct).",
     )
     p.add_argument("--device", default=os.environ.get("ASI_DEVICE"), help="Torch device override (cpu, mps, cuda:0). Default: auto.")
     p.add_argument(

@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import pytest
 
-from asi_broca_core.active_inference import (
+from core.active_inference import (
     ActiveInferenceAgent,
     CategoricalPOMDP,
     ToolForagingAgent,

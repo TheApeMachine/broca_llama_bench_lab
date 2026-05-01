@@ -3,7 +3,7 @@ from __future__ import annotations
 import math
 import random
 
-from asi_broca_core.causal import FiniteSCM, build_simpson_scm
+from core.causal import FiniteSCM, build_simpson_scm
 
 
 def test_gibbs_counterfactual_matches_exact_on_small_scm():

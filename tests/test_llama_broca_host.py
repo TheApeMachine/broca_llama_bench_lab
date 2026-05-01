@@ -6,7 +6,7 @@ import types
 import torch
 import torch.nn as nn
 
-from asi_broca_core.llama_broca_host import LlamaBrocaHost
+from core.llama_broca_host import LlamaBrocaHost
 
 
 class AddGraft(nn.Module):

@@ -11,20 +11,20 @@ import random
 import types
 from pathlib import Path
 
-from asi_broca_core.broca import (
+from core.broca import (
     CognitiveBackgroundWorker,
     DMNConfig,
     PersistentSemanticMemory,
     WorkspaceJournal,
     CognitiveFrame,
 )
-from asi_broca_core.causal import build_simpson_scm
-from asi_broca_core.conformal import ConformalPredictor, PersistentConformalCalibration
-from asi_broca_core.hawkes import MultivariateHawkesProcess, PersistentHawkes
-from asi_broca_core.ontological_expansion import OntologicalRegistry, PersistentOntologicalRegistry
-from asi_broca_core.preference_learning import DirichletPreference, PersistentPreference
-from asi_broca_core.substrate_graph import EpisodeAssociationGraph
-from asi_broca_core.continuous_frame import SKETCH_DIM
+from core.causal import build_simpson_scm
+from core.conformal import ConformalPredictor, PersistentConformalCalibration
+from core.hawkes import MultivariateHawkesProcess, PersistentHawkes
+from core.ontological_expansion import OntologicalRegistry, PersistentOntologicalRegistry
+from core.preference_learning import DirichletPreference, PersistentPreference
+from core.substrate_graph import EpisodeAssociationGraph
+from core.continuous_frame import SKETCH_DIM
 
 
 def _build_synthetic_mind(tmp: Path) -> types.SimpleNamespace:

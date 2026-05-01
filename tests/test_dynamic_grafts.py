@@ -21,14 +21,14 @@ import pytest
 import torch
 import torch.nn as nn
 
-from asi_broca_core.dynamic_grafts import (
+from core.dynamic_grafts import (
     ACTIVATION_MODE_KIND,
     CapturedActivationMode,
     DynamicGraftSynthesizer,
     capture_activation_mode,
 )
-from asi_broca_core.grafts import KVMemoryGraft
-from asi_broca_core.memory import SQLiteActivationMemory
+from core.grafts import KVMemoryGraft
+from core.memory import SQLiteActivationMemory
 
 
 # ---------------------------------------------------------------------------
