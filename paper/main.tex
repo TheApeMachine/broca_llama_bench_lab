@@ -3,17 +3,17 @@
 \usepackage[utf8]{inputenc}
 \usepackage[T1]{fontenc}
 \usepackage{lmodern}
-\usepackage{amsmath,amssymb}
+\usepackage{amsmath,amssymb}% amssymb supplies \checkmark (also via amssymb symbols)
 \usepackage{graphicx}
 \usepackage{enumitem}
 \usepackage{booktabs}
 \usepackage{hyperref}
 \usepackage{microtype}
 \usepackage{xcolor}
-\usepackage{amssymb}% for \checkmark
 \hypersetup{colorlinks=true,linkcolor=blue,urlcolor=blue,citecolor=blue}
 % Figures for experiments live alongside generated stubs under include/experiment/.
 \graphicspath{{./}{include/experiment/}}
+\newcommand{\doop}{\operatorname{do}}
 
 \title{MOSAIC: A Cognitive Substrate Architecture for\\Frozen Language Models}
 \author{%
@@ -33,6 +33,6 @@
 \input{section/05_conclusion}
 
 \bibliographystyle{plain}
-% \bibliography{references}  % Uncomment when .bib file is added
+\bibliography{references}
 
 \end{document}

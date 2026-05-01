@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import logging
 import math
+import os
 import random
 from collections import Counter
 from dataclasses import dataclass, field
@@ -42,7 +43,32 @@ logger = logging.getLogger(__name__)
 # ``FiniteSCM.probability`` enumerates the full Cartesian product of exogenous
 # domains, so sizes like 10_000^n are intractable for n≳2. Keep this modest so
 # discovered toy graphs (few variables) remain exactly queryable.
+# Override at process level with ``SCM_EXOGENOUS_DOMAIN_SIZE`` (positive integer).
 SCM_EXOGENOUS_DOMAIN_SIZE = 32
+
+
+def get_scm_exogenous_domain_size() -> int:
+    """Return discrete exogenous domain cardinality (inverse-CDF quantization grid)."""
+
+    raw = os.environ.get("SCM_EXOGENOUS_DOMAIN_SIZE")
+    if raw is None or not str(raw).strip():
+        return int(SCM_EXOGENOUS_DOMAIN_SIZE)
+    try:
+        n = int(str(raw).strip(), 10)
+    except ValueError:
+        logger.warning(
+            "Invalid SCM_EXOGENOUS_DOMAIN_SIZE=%r; using default %s",
+            raw,
+            SCM_EXOGENOUS_DOMAIN_SIZE,
+        )
+        return int(SCM_EXOGENOUS_DOMAIN_SIZE)
+    if n < 2:
+        logger.warning(
+            "SCM_EXOGENOUS_DOMAIN_SIZE=%s is < 2; clamping to 2",
+            n,
+        )
+        return 2
+    return n
 
 
 @dataclass
@@ -408,6 +434,9 @@ def build_scm_from_skeleton(graph: DiscoveredGraph, rows: Sequence[Mapping[str, 
         seen_dir.add((a, b))
         parents_of[b].append(a)
 
+    exo_sz = get_scm_exogenous_domain_size()
+    inv_exo = 1.0 / float(exo_sz)
+
     fitted: dict[str, dict[tuple, dict[object, float]]] = {}
     for v in graph.variables:
         ps = parents_of[v]
@@ -424,6 +453,18 @@ def build_scm_from_skeleton(graph: DiscoveredGraph, rows: Sequence[Mapping[str, 
         for key, counts in cpt.items():
             denom = sum(counts.values()) + len(graph.domains[v]) * 1.0
             smoothed[key] = {value: (counts.get(value, 0) + 1.0) / denom for value in graph.domains[v]}
+        for row_probs in smoothed.values():
+            min_p = min((float(p) for p in row_probs.values()), default=1.0)
+            if min_p < inv_exo:
+                logger.warning(
+                    "build_scm_from_skeleton: node %r CPT row has probability min=%g below "
+                    "1/exogenous_domain_size=%g (exo_sz=%s); inverse-CDF quantization may lose probability mass",
+                    v,
+                    min_p,
+                    inv_exo,
+                    exo_sz,
+                )
+                break
         fitted[v] = smoothed
 
     # Each variable becomes endogenous, deterministic on parents + exogenous random tape U_v.
@@ -431,10 +472,10 @@ def build_scm_from_skeleton(graph: DiscoveredGraph, rows: Sequence[Mapping[str, 
         ps = parents_of[v]
         u_name = f"U_{v}"
         domain = graph.domains[v]
-        scm.add_exogenous(u_name, list(range(SCM_EXOGENOUS_DOMAIN_SIZE)))
+        scm.add_exogenous(u_name, list(range(exo_sz)))
         cpt = fitted.get(v, {})
 
-        def make_fn(var=v, parents=ps, table=cpt, dom=domain, u=u_name):
+        def make_fn(var=v, parents=ps, table=cpt, dom=domain, u=u_name, exo_domain=exo_sz):
             def fn(values: dict[str, object]) -> object:
                 key = tuple(values[p] for p in parents)
                 row = table.get(key)
@@ -446,9 +487,9 @@ def build_scm_from_skeleton(graph: DiscoveredGraph, rows: Sequence[Mapping[str, 
                         dom[0],
                     )
                     return dom[0]
-                u_val = int(values[u]) % SCM_EXOGENOUS_DOMAIN_SIZE
+                u_val = int(values[u]) % exo_domain
                 cumulative = 0.0
-                scale = float(SCM_EXOGENOUS_DOMAIN_SIZE)
+                scale = float(exo_domain)
                 for value in dom:
                     p = row[value]
                     cumulative += float(p) * scale

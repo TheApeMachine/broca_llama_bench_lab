@@ -143,8 +143,13 @@ def run_broca_architecture_eval(
 
     try:
         from core.event_bus import get_default_bus
+
         bus = get_default_bus()
     except Exception:
+        logger.debug(
+            "Could not initialize bench event bus (get_default_bus); proceeding without bench.arch_case.* publishes",
+            exc_info=True,
+        )
         bus = None
 
     rows: list[dict[str, Any]] = []
@@ -178,19 +183,19 @@ def run_broca_architecture_eval(
             )
 
         frame, enhanced_output = mind.answer(case.prompt, max_new_tokens=max_new_tokens)
+        base_scores = _score_output(
+            baseline_output,
+            expected_answer=case.expected_answer,
+            expected_speech=case.expected_speech,
+            task_type=case.task_type,
+        )
+        enh_scores = _score_output(
+            enhanced_output,
+            expected_answer=case.expected_answer,
+            expected_speech=case.expected_speech,
+            task_type=case.task_type,
+        )
         if bus is not None:
-            base_scores = _score_output(
-                baseline_output,
-                expected_answer=case.expected_answer,
-                expected_speech=case.expected_speech,
-                task_type=case.task_type,
-            )
-            enh_scores = _score_output(
-                enhanced_output,
-                expected_answer=case.expected_answer,
-                expected_speech=case.expected_speech,
-                task_type=case.task_type,
-            )
             bus.publish(
                 "bench.arch_case.complete",
                 {
@@ -214,22 +219,12 @@ def run_broca_architecture_eval(
                 "baseline_bare_language_host": {
                     "prompt": prompt,
                     "output": baseline_output,
-                    "scores": _score_output(
-                        baseline_output,
-                        expected_answer=case.expected_answer,
-                        expected_speech=case.expected_speech,
-                        task_type=case.task_type,
-                    ),
+                    "scores": base_scores,
                 },
                 "enhanced_broca_architecture": {
                     "latent_frame": asdict(frame),
                     "output": enhanced_output,
-                    "scores": _score_output(
-                        enhanced_output,
-                        expected_answer=case.expected_answer,
-                        expected_speech=case.expected_speech,
-                        task_type=case.task_type,
-                    ),
+                    "scores": enh_scores,
                 },
             }
         )

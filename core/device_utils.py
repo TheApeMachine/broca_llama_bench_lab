@@ -25,10 +25,19 @@ def pick_torch_device(pref: str | None = None, *, preferred_order: tuple[str, ..
     ``pref`` is ``None``, ``''``, or ``'auto'`` → use *preferred_order* then fall back sensibly.
 
     Override with ``M_DEVICE`` when ``pref`` is auto-like (useful for CI).
+    ``ASI_DEVICE`` is accepted as a deprecated alias when ``M_DEVICE`` is unset.
     """
 
     normalized = normalize_device_arg(pref)
-    env = os.environ.get("M_DEVICE", "").strip()
+    env_m = os.environ.get("M_DEVICE", "").strip()
+    env_legacy = os.environ.get("ASI_DEVICE", "").strip()
+    if env_legacy and not env_m:
+        warnings.warn(
+            "ASI_DEVICE is deprecated; use M_DEVICE for torch device override.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+    env = env_m or env_legacy
     pick = normalized if normalized is not None else (env or None)
 
     if pick:

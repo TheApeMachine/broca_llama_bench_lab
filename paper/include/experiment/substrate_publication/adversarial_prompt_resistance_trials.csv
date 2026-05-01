@@ -1,0 +1,10 @@
+benchmark,passed,score,n_trials,duration_seconds
+adversarial_prompt_resistance,True,1.0,50,0.0002460479736328125
+
+detail_key,detail_value
+avg_convergence_steps,1.12
+convergence_steps_histogram,"{""1"": 45, ""2"": 4, ""3"": 1}"
+max_iterations,10
+n_bad_tokens,15
+successes,50
+vocab_size,100

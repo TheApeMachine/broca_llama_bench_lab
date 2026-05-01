@@ -6,7 +6,7 @@
 \subsection{Architecture Overview}
 
 The \textsc{Mosaic} system consists of two interacting systems, inspired by dual-process
-theories of cognition (Kahneman, 2011):
+theories of cognition \cite{kahneman2011thinking}:
 
 \begin{itemize}[nosep]
   \item \textbf{System~1 (Language Organ):} A frozen causal language model
@@ -19,7 +19,8 @@ theories of cognition (Kahneman, 2011):
 \end{itemize}
 
 Communication flows exclusively through three \emph{graft slots} in the frozen
-model's forward pass:
+model's forward pass.  Throughout we refer to the graft-augmented frozen LM arm as the
+\emph{Broca shell} (sometimes ``Broca stack''): it is the surface decoder paired with this substrate inside \textsc{Mosaic}, not a separate system.
 
 \begin{enumerate}[nosep]
   \item \textbf{Residual-stream graft} (\texttt{final\_hidden}): Projects a
@@ -51,7 +52,7 @@ sampling temperature: a confused substrate produces exploratory decoding; a
 decisive substrate produces near-greedy decoding.
 
 \paragraph{Structural causal model.}
-A finite SCM (\texttt{FiniteSCM}) supports exact \texttt{do($\cdot$)} interventions,
+A finite SCM (\texttt{FiniteSCM}) supports exact $\doop(\cdot)$ interventions,
 counterfactual queries, d-separation, and automatic identification of backdoor
 and frontdoor adjustment sets.  The default bootstrap is Simpson's paradox; the
 SCM grows during REM sleep via the PC algorithm applied to journal
@@ -64,7 +65,7 @@ correlation.  The codebook is persistent: the same atom name always produces the
 same hypervector across runs.
 
 \paragraph{Hopfield associative memory.}
-Modern Continuous Hopfield networks (Ramsauer et al., 2020) provide one-step
+Modern Continuous Hopfield networks \cite{Ramsauer2020} provide one-step
 content-addressable retrieval with exponential storage capacity in the
 embedding dimension~$d$.  The inverse temperature $\beta = \sqrt{d}/\sigma$ is
 derived from the geometry of the stored patterns.
@@ -88,7 +89,7 @@ Four predictive-coding-inspired mechanisms let the substrate override the LLM:
   \item \emph{Modality shifting:} A continuous unit-norm direction biases the
     residual stream toward a named cognitive mood (analytical, fluent, etc.).
   \item \emph{Causal constraint injection:} KV-memory grafts pre-loaded with
-    $P(Y | \text{do}(T{=}t))$ pull the LLM toward the SCM's verdict whenever
+    $P(Y \mid \doop(T{=}t))$ pull the LLM toward the SCM's verdict whenever
     it attends to the cause concept.
 \end{itemize}
 
@@ -101,16 +102,16 @@ We evaluate on three tiers:
     length-normalized continuation log-likelihood (BoolQ, PIQA, ARC,
     WinoGrande, HellaSwag, CommonsenseQA, OpenBookQA, MMLU) and
     generation tasks scored by deterministic greedy decode with normalized
-    exact matching (GSM8K).  A paired vanilla-vs-Broca-shell comparison
+    exact matching (GSM8K).  A paired vanilla-vs-\emph{Broca shell} comparison
     verifies that the graft infrastructure does not degrade leaderboard
     accuracy.
   \item \textbf{Architecture probes:} Scripted prompts where the bare LLM and
-    the full Broca stack are scored on speech-exact and answer-present metrics.
+    the full Broca shell are scored on speech-exact and answer-present metrics.
     The probes cover semantic-memory recall, active-inference action selection,
     and causal-intervention queries.
   \item \textbf{Substrate benchmarks:} Eight CPU-only benchmarks that exercise
     each algebraic component directly: belief revision, hypothesis masking,
-    Simpson's-paradox resolution, memory fidelity, conformal coverage, VSA
+    Simpson's paradox resolution, memory fidelity, conformal coverage, VSA
     round-trip, Hopfield retrieval, and active-inference decision quality.
 \end{enumerate}
 

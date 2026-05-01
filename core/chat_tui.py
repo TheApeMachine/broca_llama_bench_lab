@@ -33,7 +33,7 @@ from typing import Any
 
 try:
     from textual.app import App, ComposeResult
-    from textual.containers import Grid, Horizontal, Vertical, VerticalScroll
+    from textual.containers import Horizontal, Vertical, VerticalScroll
     from textual.reactive import reactive
     from textual.widgets import Footer, Header, Input, Label, RichLog, Sparkline, Static
     from textual.worker import Worker, WorkerState
@@ -147,7 +147,7 @@ class SystemsMatrix(Static):
         # top of the left column where width is limited anyway.
         for status, name, detail in rows:
             color = self._COLORS.get(status, OFFLINE)
-            glyph = self._GLYPHS.get(status, "?")
+            glyph = self._GLYPHS.get(status, self._GLYPHS["off"])
             label = f"{name:<14}"
             tail = f" [dim]{detail}[/dim]" if detail else ""
             lines.append(f"[{color}]{glyph}[/{color}] {label}{tail}")
@@ -180,7 +180,7 @@ class BrocaChatApp(App):
     CSS = f"""
     Screen {{
         layout: vertical;
-        background: $surface;
+        background: {BRAND_BG};
     }}
     Header {{
         background: {BRAND_DEEP};
@@ -406,10 +406,10 @@ class BrocaChatApp(App):
         entries.append((host_status, "llama host", str(model.get("device") or "—")))
         # Semantic memory: online if any rows OR namespace is set.
         mem_n = int(memory.get("count") or 0)
-        entries.append(("on" if mem_n >= 0 else "off", "semantic mem", f"{mem_n} rows"))
+        entries.append(("on" if mem_n > 0 else "off", "semantic mem", f"{mem_n} rows"))
         # Workspace
         wn = int(ws.get("frames_total") or 0)
-        entries.append(("on" if wn >= 0 else "off", "workspace", f"{wn} frames"))
+        entries.append(("on" if wn > 0 else "off", "workspace", f"{wn} frames"))
         # DMN background worker
         if bg.get("error") is not None and not bg.get("running"):
             entries.append(("warn", "dmn worker", "err"))

@@ -91,7 +91,7 @@ def test_broca_arch_tex_from_fixture(tmp_path: Path) -> None:
     )
     write_broca_architecture_experiment_tex(payload, tmp_path)
     tex = (tmp_path / "exp_broca_architecture.tex").read_text(encoding="utf-8")
-    assert "Broca architecture probes" in tex
+    assert "broca architecture probes" in tex.lower()
     assert "$1.000$" in tex
 
 

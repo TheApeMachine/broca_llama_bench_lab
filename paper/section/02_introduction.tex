@@ -26,18 +26,18 @@ The substrate is assembled from components with published mathematical
 guarantees rather than from learned or heuristic modules:
 
 \begin{itemize}[nosep]
-  \item \textbf{Active inference} (Friston): POMDPs that minimise Expected Free
+  \item \textbf{Active inference} \cite{friston2010free}: POMDPs that minimise Expected Free
     Energy, coupling epistemic and pragmatic value in a single decision
     criterion.
-  \item \textbf{Finite SCM with do-calculus} (Pearl): exact interventional and
+  \item \textbf{Finite SCM with do-calculus} \cite{pearl2009causality}: exact interventional and
     counterfactual queries, with automatic backdoor and frontdoor
     identification.
-  \item \textbf{Holographic Reduced Representations} (Plate): compositional
+  \item \textbf{Holographic Reduced Representations} \cite{plate1995hrr}: compositional
     bind/unbind/bundle algebra in $O(d \log d)$ via FFT, with capacity
     $\sim 0.5\,d / \log d$.
-  \item \textbf{Modern Continuous Hopfield networks} (Ramsauer et al., 2020):
+  \item \textbf{Modern Continuous Hopfield networks} \cite{Ramsauer2020}:
     one-step retrieval with exponential storage capacity in $d$.
-  \item \textbf{Split-conformal prediction} (Vovk; Romano et al., 2020):
+  \item \textbf{Split-conformal prediction} \cite{vovk2005algorithmiclearning,romano2020classification}:
     distribution-free coverage guarantee $P[y \in C(x)] \geq 1 - \alpha$.
   \item \textbf{Multivariate Hawkes processes}: self- and mutually-exciting
     event streams for working-memory ``heat.''
@@ -51,8 +51,7 @@ practical advantages: (1)~the language organ can be swapped (e.g.\ Llama~3.2
 $\to$ a future checkpoint) without retraining any cognitive component;
 (2)~the substrate's state is fully persistent (SQLite WAL), surviving restarts
 and enabling long-running agents; and (3)~every cognitive claim---retrieval
-correctness, coverage, capacity, convergence---has a paper trail rather than a
-vibe.
+correctness, coverage, capacity, convergence---has a paper trail rather than a subjective impression.
 
 \paragraph{Contributions.}
 \begin{enumerate}[nosep]

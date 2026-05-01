@@ -94,20 +94,18 @@ def _phash_sketch(image: torch.Tensor, *, dim: int = SKETCH_DIM) -> torch.Tensor
 
     dx = (g[:, 1:] - g[:, :-1]).abs()
     dy = (g[1:, :] - g[:-1, :]).abs()
-    texture = torch.tensor(
+    texture = torch.stack(
         [
-            float(dx.mean().item()),
-            float(dy.mean().item()),
-            float(dx.std(unbiased=False).item()),
-            float(dy.std(unbiased=False).item()),
-            float(g.mean().item()),
-            float(g.std(unbiased=False).item()),
-            float(g.min().item()),
-            float(g.max().item()),
-        ],
-        dtype=torch.float32,
-        device=g.device,
-    )
+            dx.mean(),
+            dy.mean(),
+            dx.std(unbiased=False),
+            dy.std(unbiased=False),
+            g.mean(),
+            g.std(unbiased=False),
+            g.min(),
+            g.max(),
+        ]
+    ).to(dtype=torch.float32, device=g.device)
 
     feature = torch.cat([hist, low_freq, texture]).nan_to_num(0.0)
     feature = F.normalize(feature, dim=0)

@@ -4,32 +4,113 @@
   "n_passed": 8,
   "n_failed": 0,
   "pass_rate": 1.0,
-  "total_duration_seconds": 0.45946812629699707,
+  "total_duration_seconds": 0.4515659809112549,
   "per_benchmark": {
     "rule_shift_adaptation": {
       "passed": true,
       "score": 1.0,
-      "n_trials": 1,
-      "duration_seconds": 0.0035429000854492188,
+      "n_trials": 30,
+      "duration_seconds": 0.08859896659851074,
       "description": "Belief revision under accumulating low-surprise evidence",
       "details": {
-        "initial_value": "rome",
-        "challenger_value": "paris",
-        "final_value": "paris",
-        "n_initial_claims": 5,
-        "n_challenger_claims": 8,
-        "n_reflections": 1,
-        "reflection_kinds": [
-          "belief_revision"
+        "repeat_trials": 30,
+        "base_seed": 0,
+        "trial_seed_strategy": "trial_seed = base_seed + trial_index * 1000003",
+        "mean_score": 1.0,
+        "score_variance": 0.0,
+        "confidence_interval_95": [
+          1.0,
+          1.0
         ],
-        "revised": true
+        "trial_scores": [
+          1.0,
+          1.0,
+          1.0,
+          1.0,
+          1.0,
+          1.0,
+          1.0,
+          1.0,
+          1.0,
+          1.0,
+          1.0,
+          1.0,
+          1.0,
+          1.0,
+          1.0,
+          1.0,
+          1.0,
+          1.0,
+          1.0,
+          1.0,
+          1.0,
+          1.0,
+          1.0,
+          1.0,
+          1.0,
+          1.0,
+          1.0,
+          1.0,
+          1.0,
+          1.0
+        ],
+        "trial_revised_flags": [
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true
+        ],
+        "representative_last_trial_details": {
+          "trial_index": 29,
+          "trial_seed": 29000087,
+          "initial_value": "rome",
+          "challenger_value": "paris",
+          "final_value": "paris",
+          "n_initial_claims": 5,
+          "n_challenger_claims": 8,
+          "n_reflections": 1,
+          "reflection_kinds": [
+            "belief_revision"
+          ],
+          "revised": true,
+          "final_log_odds": 1.001239,
+          "updates_to_converge": 1,
+          "completeness_score": 1.0,
+          "log_odds_threshold": 0.3
+        }
       }
     },
     "adversarial_prompt_resistance": {
       "passed": true,
       "score": 1.0,
       "n_trials": 50,
-      "duration_seconds": 0.00038504600524902344,
+      "duration_seconds": 0.0002460479736328125,
       "description": "Hypothesis masking convergence on valid tokens under adversarial rejection",
       "details": {
         "successes": 50,
@@ -39,8 +120,8 @@
         "avg_convergence_steps": 1.12,
         "convergence_steps_histogram": {
           "1": 45,
-          "3": 1,
-          "2": 4
+          "2": 4,
+          "3": 1
         }
       }
     },
@@ -48,7 +129,7 @@
       "passed": true,
       "score": 1.0,
       "n_trials": 1,
-      "duration_seconds": 0.21586990356445312,
+      "duration_seconds": 0.21066594123840332,
       "description": "Simpson's paradox: do-calculus recovers correct ATE despite confounding",
       "details": {
         "p_y_given_t1": 0.35,
@@ -58,7 +139,7 @@
         "p_y_do_t0": 0.45,
         "ate": 0.1,
         "do_says_helps": true,
-        "counterfactual_p_y0_given_t1y1_do_t0": 0.285714,
+        "counterfactual_p_y0_given_t1y1_do_t0": 0.2857,
         "backdoor_sets": [
           [
             "S"
@@ -71,7 +152,7 @@
       "passed": true,
       "score": 1.0,
       "n_trials": 100,
-      "duration_seconds": 0.01225590705871582,
+      "duration_seconds": 0.011307001113891602,
       "description": "Write/recall fidelity over N random triples",
       "details": {
         "n_triples": 100,
@@ -82,19 +163,20 @@
     },
     "conformal_coverage_guarantee": {
       "passed": true,
-      "score": 0.948,
+      "score": 0.944,
       "n_trials": 500,
-      "duration_seconds": 0.05566573143005371,
+      "duration_seconds": 0.013309240341186523,
       "description": "Split-conformal coverage >= 0.90 (alpha=0.1)",
       "details": {
+        "score_methodology": "score = round((lac_coverage + aps_coverage) / 2, 4); lac_coverage and aps_coverage are empirical frequencies from empirical_coverage(predictor, test_data) over n_test held-out (distribution, label) pairs after split calibration on n_calibration draws each (LAC from label probs; APS from full softmax vectors). Equal weights; rounding applied only when storing score.",
         "alpha": 0.1,
         "target_coverage": 0.9,
-        "lac_coverage": 0.906,
-        "aps_coverage": 0.99,
+        "lac_coverage": 0.904,
+        "aps_coverage": 0.984,
         "lac_meets_target": true,
         "aps_meets_target": true,
-        "avg_lac_set_size": 2.57,
-        "avg_aps_set_size": 3.55,
+        "avg_lac_set_size": 2.6,
+        "avg_aps_set_size": 3.52,
         "n_calibration": 200,
         "n_test": 500
       }
@@ -103,7 +185,7 @@
       "passed": true,
       "score": 1.0,
       "n_trials": 150,
-      "duration_seconds": 0.08249497413635254,
+      "duration_seconds": 0.07339811325073242,
       "description": "VSA bind/unbind round-trip accuracy across dimensionalities",
       "details": {
         "per_dimensionality": {
@@ -137,7 +219,7 @@
       "passed": true,
       "score": 0.7125,
       "n_trials": 160,
-      "duration_seconds": 0.04549360275268555,
+      "duration_seconds": 0.0317387580871582,
       "description": "Modern Continuous Hopfield one-step retrieval at varying store sizes",
       "details": {
         "d_model": 256,
@@ -179,7 +261,7 @@
       "passed": true,
       "score": 0.87,
       "n_trials": 200,
-      "duration_seconds": 0.03886914253234863,
+      "duration_seconds": 0.01691603660583496,
       "description": "EFE-driven Tiger POMDP agent vs random baseline",
       "details": {
         "agent_success_rate": 0.87,
@@ -191,5 +273,16 @@
         "max_steps": 3
       }
     }
-  }
+  },
+  "timestamp": "2026-05-01T19:15:31Z",
+  "commit_hash": "2d06b1a93b663e0329be7f15f8ee1beed3827291",
+  "environment": {
+    "os": "Darwin",
+    "kernel": "25.4.0",
+    "machine": "arm64",
+    "python": "3.14.4",
+    "torch": "2.11.0",
+    "numpy": "2.4.4"
+  },
+  "random_seed": 0
 }

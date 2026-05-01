@@ -37,6 +37,7 @@ import logging
 import os
 import sys
 import tempfile
+import warnings
 from pathlib import Path
 from typing import Any
 
@@ -182,11 +183,26 @@ def _try_print_architecture_suite_metrics(result: dict[str, Any], *, artifact_pa
     print(f"  wrote {artifact_path}", flush=True)
 
 
+def _device_env_for_pick() -> str | None:
+    raw = os.environ.get("M_DEVICE")
+    if raw is not None and str(raw).strip() != "":
+        return str(raw).strip()
+    legacy = os.environ.get("ASI_DEVICE")
+    if legacy is not None and str(legacy).strip() != "":
+        warnings.warn(
+            "ASI_DEVICE is deprecated; set M_DEVICE instead.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        return str(legacy).strip()
+    return None
+
+
 def resolve_cli_device(device: str | None) -> tuple[str, str]:
     """Return (CLI device string, coarse device type cpu|mps|cuda)."""
 
     if device is None or str(device).strip() == "":
-        dev_cli = str(pick_torch_device(os.environ.get("M_DEVICE")))
+        dev_cli = str(pick_torch_device(_device_env_for_pick()))
     else:
         dev_cli = str(device).strip()
     coarse = dev_cli.split(":")[0].lower()
@@ -284,7 +300,7 @@ def run_broca_architecture_benchmark(
 ) -> dict[str, Any]:
     """Score bare language host vs the active Broca architecture."""
 
-    dev = device if (device and str(device).strip()) else str(pick_torch_device(os.environ.get("M_DEVICE")))
+    dev = device if (device and str(device).strip()) else str(pick_torch_device(_device_env_for_pick()))
     path = output_run_dir / "broca_architecture_eval.json"
     bus = get_default_bus()
     bus.publish(
@@ -324,7 +340,11 @@ def run_broca_architecture_benchmark(
             payload["enhanced_speech_acc"] = float(metrics["enhanced_broca_architecture"]["speech_exact_accuracy"])
             payload["delta_speech_acc"] = float(metrics["delta_enhanced_minus_baseline"]["speech_exact_accuracy"])
         except (KeyError, TypeError, ValueError):
-            pass
+            logger.debug(
+                "Failed to extract architecture metrics for phase payload",
+                exc_info=True,
+                extra={"result": result, "metrics": metrics},
+            )
     bus.publish("bench.phase.complete", payload)
     return result
 
@@ -405,8 +425,14 @@ def main() -> None:
 
     if not args.skip_smoke:
         bus.publish("bench.phase.start", {"phase": "smoke"})
-        hf_datasets_smoke(verbose=True)
-        bus.publish("bench.phase.complete", {"phase": "smoke"})
+        smoke_payload: dict[str, Any] = {"phase": "smoke"}
+        try:
+            hf_datasets_smoke(verbose=True)
+        except Exception as exc:
+            smoke_payload["error"] = str(exc)
+            logger.exception("HF datasets smoke phase failed")
+        finally:
+            bus.publish("bench.phase.complete", smoke_payload)
 
     hf_tok_raw = os.environ.get("HF_TOKEN")
     hf_token: str | bool | None = hf_tok_raw if hf_tok_raw and hf_tok_raw.strip() else None

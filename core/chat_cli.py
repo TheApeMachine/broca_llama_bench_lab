@@ -20,6 +20,7 @@ import logging
 import os
 import sys
 import threading
+import warnings
 from pathlib import Path
 from typing import Any
 
@@ -107,6 +108,21 @@ def _stream_reply(
     return "".join(chunks)
 
 
+def _default_cli_device_env() -> str | None:
+    raw_m = os.environ.get("M_DEVICE")
+    if raw_m is not None and str(raw_m).strip() != "":
+        return str(raw_m).strip()
+    legacy = os.environ.get("ASI_DEVICE")
+    if legacy is not None and str(legacy).strip() != "":
+        warnings.warn(
+            "ASI_DEVICE is deprecated; set M_DEVICE for the default torch device override.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        return str(legacy).strip()
+    return None
+
+
 def _build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="Stream a local Hugging Face chat model in the terminal.")
     p.add_argument(
@@ -114,7 +130,11 @@ def _build_parser() -> argparse.ArgumentParser:
         default=os.environ.get("MODEL_ID", "meta-llama/Llama-3.2-1B-Instruct"),
         help="HF model id (default: MODEL_ID or Llama-3.2-1B-Instruct).",
     )
-    p.add_argument("--device", default=os.environ.get("M_DEVICE"), help="Torch device override (cpu, mps, cuda:0). Default: auto.")
+    p.add_argument(
+        "--device",
+        default=_default_cli_device_env(),
+        help="Torch device override (cpu, mps, cuda:0). Default: auto; env M_DEVICE (ASI_DEVICE deprecated).",
+    )
     p.add_argument(
         "--token",
         default=None,

@@ -811,8 +811,9 @@ def evaluate_task(
     # optional event_bus shim is unavailable; publish() is no-op without subs.
     try:
         from core.event_bus import get_default_bus
+
         bus = get_default_bus()
-    except Exception:
+    except ImportError:
         bus = None
     total = len(examples)
     label = progress_label or task_name
@@ -878,8 +879,9 @@ def _run_hf_tasks_to_dir(
     task_out_dir.mkdir(parents=True, exist_ok=True)
     try:
         from core.event_bus import get_default_bus
+
         bus = get_default_bus()
-    except Exception:
+    except ImportError:
         bus = None
     per_task: dict[str, Any] = {}
     all_rows: list[dict[str, Any]] = []
@@ -1035,15 +1037,15 @@ def run_hf_datasets_benchmark(
 
     try:
         from core.event_bus import get_default_bus
+
         bus = get_default_bus()
-    except Exception:
+    except ImportError:
         bus = None
     if bus is not None:
         bus.publish(
             "bench.phase.start",
             {
                 "phase": "native",
-                "arm": "vanilla_lm",
                 "model_id": model_id,
                 "device": str(backend.device),
                 "tasks": list(tasks),
@@ -1073,6 +1075,8 @@ def run_hf_datasets_benchmark(
     micro_n = sum(int(v["n"]) for v in per_task.values())
     micro_correct = sum(int(v["correct"]) for v in per_task.values())
     micro_acc = micro_correct / max(1, micro_n)
+    macro = round(float(macro), 2)
+    micro_acc = round(float(micro_acc), 2)
     if not do_compare:
         print(f"\nvanilla_lm  macro_accuracy={macro:.3f} micro_accuracy={micro_acc:.3f}", flush=True)
 
@@ -1114,17 +1118,6 @@ def run_hf_datasets_benchmark(
 
     comparison: dict[str, Any] = {}
     if do_compare:
-        if bus is not None:
-            bus.publish(
-                "bench.phase.start",
-                {
-                    "phase": "native",
-                    "arm": "broca_shell",
-                    "model_id": model_id,
-                    "tasks": list(tasks),
-                    "limit": limit,
-                },
-            )
         shell_back = HFLocalLlamaBrocaShell.wrapping_same_lm(backend)
         shell_dir = out / "broca_shell"
         per_shell, _rows_shell = _run_hf_tasks_to_dir(
@@ -1147,6 +1140,8 @@ def run_hf_datasets_benchmark(
         micro_n_s = sum(int(v["n"]) for v in per_shell.values())
         micro_c_s = sum(int(v["correct"]) for v in per_shell.values())
         micro_acc_s = micro_c_s / max(1, micro_n_s)
+        macro_s = round(float(macro_s), 2)
+        micro_acc_s = round(float(micro_acc_s), 2)
         comparison = {
             "llama_broca_shell": {
                 "device": str(shell_back.device),
@@ -1155,8 +1150,8 @@ def run_hf_datasets_benchmark(
                     "micro_accuracy": micro_acc_s,
                     "micro_n": micro_n_s,
                     "micro_correct": micro_c_s,
-                    "macro_delta_vs_vanilla_lm": macro_s - macro,
-                    "micro_delta_vs_vanilla_lm": micro_acc_s - micro_acc,
+                    "macro_delta_vs_vanilla_lm": round(macro_s - macro, 2),
+                    "micro_delta_vs_vanilla_lm": round(micro_acc_s - micro_acc, 2),
                 },
                 "per_task": per_shell,
                 "artifacts_subdir": "broca_shell",

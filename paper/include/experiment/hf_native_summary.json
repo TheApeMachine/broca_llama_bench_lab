@@ -72,7 +72,7 @@
     }
   },
   "aggregate": {
-    "macro_accuracy": 0.6699999999999999,
+    "macro_accuracy": 0.67,
     "micro_accuracy": 0.67,
     "micro_n": 200,
     "micro_correct": 134
@@ -95,7 +95,7 @@
     "llama_broca_shell": {
       "device": "mps",
       "aggregate": {
-        "macro_accuracy": 0.6699999999999999,
+        "macro_accuracy": 0.67,
         "micro_accuracy": 0.67,
         "micro_n": 200,
         "micro_correct": 134,

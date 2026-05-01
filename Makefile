@@ -48,7 +48,7 @@ install:
 	$(PYTHON) -m venv .venv
 	. .venv/bin/activate && $(UV) sync --extra tui --extra test
 
-install-benchmark:
+install-benchmark: install
 	. .venv/bin/activate && $(UV) pip install -e ".[benchmark]"
 
 chat:

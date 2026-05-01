@@ -50,6 +50,7 @@ try:
         Sparkline,
         Static,
     )
+    from textual.widgets.data_table import Column
     from textual.worker import Worker, WorkerState
     from textual import work
 except ImportError as exc:  # pragma: no cover
@@ -73,6 +74,47 @@ from .event_bus import EventBus, LogToBusHandler, get_default_bus
 from .logging_setup import configure_lab_logging
 
 logger = logging.getLogger(__name__)
+
+# ``DataTable`` column keys (explicit keys avoid fragile positional indexing).
+RESULT_COL_ARM = "arm"
+RESULT_COL_TASK = "task"
+RESULT_COL_N = "n"
+RESULT_COL_ACC = "acc"
+RESULT_COL_DELTA = "delta"
+RESULT_COL_SECS = "secs"
+RESULT_COL_STATUS = "status"
+
+
+def _system_exit_code(exc: SystemExit) -> int:
+    code = exc.code
+    if code is None:
+        return 0
+    if isinstance(code, int):
+        return code
+    try:
+        return int(code)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _safe_float(val: Any, *, default: float = 0.0, field: str = "") -> float:
+    if val is None:
+        return default
+    try:
+        return float(val)
+    except (TypeError, ValueError):
+        logger.warning("bench_tui: ignoring non-numeric float field%s: %r", f" {field}" if field else "", val)
+        return default
+
+
+def _safe_int(val: Any, *, default: int = 0, field: str = "") -> int:
+    if val is None:
+        return default
+    try:
+        return int(val)
+    except (TypeError, ValueError):
+        logger.warning("bench_tui: ignoring non-numeric int field%s: %r", f" {field}" if field else "", val)
+        return default
 
 
 class _LinePublisher(io.TextIOBase):
@@ -108,6 +150,10 @@ class _LinePublisher(io.TextIOBase):
             except Exception:
                 pass
             self._buf = ""
+
+    def close(self) -> None:
+        self.flush()
+        super().close()
 
 
 def _fmt_pct(v: float | None, prec: int = 1) -> str:
@@ -278,7 +324,15 @@ class BenchApp(App):
         self.title = "Mosaic benchmarks"
         self.sub_title = " ".join(self.bench_argv) if self.bench_argv else "default"
         results = self.query_one("#results", DataTable)
-        results.add_columns("arm", "task", "n", "acc", "Δ", "secs", "status")
+        results.add_columns(
+            Column(RESULT_COL_ARM, "arm"),
+            Column(RESULT_COL_TASK, "task"),
+            Column(RESULT_COL_N, "n"),
+            Column(RESULT_COL_ACC, "acc"),
+            Column(RESULT_COL_DELTA, "Δ"),
+            Column(RESULT_COL_SECS, "secs"),
+            Column(RESULT_COL_STATUS, "status"),
+        )
         self.set_interval(0.25, self._tick)
         self.set_interval(1.0, self._refresh_status)
         self._refresh_panels_static()
@@ -311,7 +365,7 @@ class BenchApp(App):
                 try:
                     bench_main()
                 except SystemExit as exc:
-                    self.app.call_from_thread(self._on_suite_systemexit, int(exc.code or 0))
+                    self.app.call_from_thread(self._on_suite_systemexit, _system_exit_code(exc))
                     return
                 except Exception as exc:
                     logger.exception("bench TUI: bench_main failed")
@@ -322,6 +376,8 @@ class BenchApp(App):
             try:
                 out_stream.flush()
                 err_stream.flush()
+                out_stream.close()
+                err_stream.close()
             except Exception:
                 pass
         self.app.call_from_thread(self._on_suite_finished)
@@ -402,11 +458,12 @@ class BenchApp(App):
         elif topic == "bench.task.complete":
             arm = str(payload.get("arm") or self._current_arm or "vanilla_lm")
             task = str(payload.get("task") or "")
-            n = int(payload.get("n", 0))
-            acc = float(payload.get("accuracy", 0.0))
-            secs = float(payload.get("seconds", 0.0))
+            n = _safe_int(payload.get("n"), default=0, field="n")
+            acc = _safe_float(payload.get("accuracy"), default=0.0, field="accuracy")
+            secs = _safe_float(payload.get("seconds"), default=0.0, field="seconds")
+            correct = _safe_int(payload.get("correct"), default=0, field="correct")
             self._upsert_row(arm, task, n=n, acc=acc, secs=secs, status="done")
-            self._update_arm_totals(arm, n=n, correct=int(payload.get("correct", 0)))
+            self._update_arm_totals(arm, n=n, correct=correct)
             activity.write(
                 f"[{ONLINE}]{ts_s}[/{ONLINE}] task done    "
                 f"{arm}:{task}  n={n} acc={_fmt_pct(acc)} ({secs:.1f}s)"
@@ -498,9 +555,18 @@ class BenchApp(App):
         )
         if key in self._row_keys:
             rk = self._row_keys[key]
-            for i, val in enumerate(cells):
+            mapping = (
+                (RESULT_COL_ARM, cells[0]),
+                (RESULT_COL_TASK, cells[1]),
+                (RESULT_COL_N, cells[2]),
+                (RESULT_COL_ACC, cells[3]),
+                (RESULT_COL_DELTA, cells[4]),
+                (RESULT_COL_SECS, cells[5]),
+                (RESULT_COL_STATUS, cells[6]),
+            )
+            for col_key, val in mapping:
                 try:
-                    table.update_cell(rk, table.ordered_columns[i].key, val)
+                    table.update_cell(rk, col_key, val)
                 except Exception:
                     pass
         else:
@@ -527,7 +593,7 @@ class BenchApp(App):
         rk = self._row_keys.get(("broca_shell", task))
         if rk is not None:
             try:
-                table.update_cell(rk, table.ordered_columns[4].key, _fmt_delta(delta))
+                table.update_cell(rk, RESULT_COL_DELTA, _fmt_delta(delta))
             except Exception:
                 pass
 

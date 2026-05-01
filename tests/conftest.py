@@ -17,6 +17,9 @@ import torch
 
 try:
     torch.set_num_threads(1)
+except RuntimeError:
+    pass
+try:
     torch.set_num_interop_threads(1)
 except RuntimeError:
     # PyTorch may reject interop-thread changes after a backend initialized; the
