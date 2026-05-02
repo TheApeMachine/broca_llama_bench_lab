@@ -63,7 +63,10 @@ def test_cascade_maps_request_axis_to_request_intent():
     assert result["allows_storage"] is False
     assert classifier.calls[0]["labels"] == {axis: list(labels) for axis, labels in SemanticCascade.AXES.items()}
     assert extraction.relation_calls == ["Tell me a joke"]
-    assert extraction.entity_calls == [("Tell me a joke", SemanticCascade.SPAN_LABELS)]
+    assert extraction.entity_calls == [
+        ("Tell me a joke", SemanticCascade.SPEECH_SPAN_LABELS),
+        ("Tell me a joke", SemanticCascade.SOCIAL_SPAN_LABELS),
+    ]
 
 
 def test_identity_relation_overrides_greeting_axis_as_statement():
@@ -142,3 +145,30 @@ def test_fact_relation_overrides_bad_semantic_top_label():
     assert result["label"] == "statement"
     assert result["allows_storage"] is True
     assert result["evidence"]["fact_relations"][0]["subject"] == "ada"
+
+
+def test_request_span_wins_same_coverage_question_span():
+    classifier = StubSemanticClassificationEncoder(_axes(question=0.7, request=0.4))
+    extraction = StubExtractionEncoder(
+        spans=[
+            ExtractedEntity(
+                text="Tell me a joke",
+                label="question",
+                score=1.0,
+                start=0,
+                end=14,
+            ),
+            ExtractedEntity(
+                text="Tell me a joke",
+                label="request",
+                score=1.0,
+                start=0,
+                end=14,
+            ),
+        ]
+    )
+    cascade = SemanticCascade(classifier=classifier, extraction=extraction)
+
+    result = cascade.intent_scores("Tell me a joke.")
+
+    assert result["label"] == "request"

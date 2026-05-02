@@ -18,7 +18,26 @@ class SemanticCascade:
         "content_role": ("self_description", "world_fact", "task_instruction", "social_signal"),
         "storage": ("storable", "non_storable"),
     }
-    SPAN_LABELS: tuple[str, ...] = (
+    SPAN_INTENT_LABELS: dict[str, str] = {
+        "claim": "statement",
+        "question": "question",
+        "request": "request",
+        "command": "command",
+        "greeting": "greeting",
+        "feedback": "feedback",
+        "greeting phrase": "greeting",
+        "salutation phrase": "greeting",
+        "social greeting": "greeting",
+    }
+    SPAN_SPECIFICITY_ORDER: tuple[str, ...] = (
+        "statement",
+        "question",
+        "greeting",
+        "feedback",
+        "command",
+        "request",
+    )
+    SPEECH_SPAN_LABELS: tuple[str, ...] = (
         "claim",
         "question",
         "request",
@@ -28,6 +47,12 @@ class SemanticCascade:
         "negation",
         "correction",
     )
+    SOCIAL_SPAN_LABELS: tuple[str, ...] = (
+        "greeting phrase",
+        "salutation phrase",
+        "social greeting",
+    )
+    SPAN_LABELS: tuple[str, ...] = SPEECH_SPAN_LABELS + SOCIAL_SPAN_LABELS
     PROMPT = (
         "Classify this utterance for a cognitive substrate. Separate speech act, "
         "polarity, content role, and whether the utterance contains durable semantic content."
@@ -131,7 +156,11 @@ class SemanticCascade:
         elif span_scores:
             label = max(
                 span_scores,
-                key=lambda item: (span_scores[item], semantic_scores[item]),
+                key=lambda item: (
+                    span_scores[item],
+                    self.SPAN_SPECIFICITY_ORDER.index(item),
+                    semantic_scores[item],
+                ),
             )
             confidence = max(span_scores[label], semantic_scores[label])
         elif fact_relations:
@@ -203,7 +232,9 @@ class SemanticCascade:
 
     def _extract_semantic_evidence(self, text: str) -> dict[str, Any]:
         relations = self.extraction.extract_relations(text)
-        intent_spans = self.extraction.extract_entities(text, labels=self.SPAN_LABELS)
+        speech_spans = self.extraction.extract_entities(text, labels=self.SPEECH_SPAN_LABELS)
+        social_spans = self.extraction.extract_entities(text, labels=self.SOCIAL_SPAN_LABELS)
+        intent_spans = [*speech_spans, *social_spans]
         identity_relations = [
             rel
             for rel in relations
@@ -225,7 +256,7 @@ class SemanticCascade:
         scores: dict[str, float] = {}
         for span in spans:
             source_label = span.label.strip().lower()
-            canonical = self.INTENT_FROM_SPEECH_ACT.get(source_label)
+            canonical = self.SPAN_INTENT_LABELS.get(source_label)
             if canonical is None:
                 continue
             coverage = self._span_coverage(span, denom)
