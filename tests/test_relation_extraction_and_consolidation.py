@@ -6,9 +6,9 @@ from pathlib import Path
 
 import pytest
 
-import core.broca as broca_mod
-from core.broca import (
-    BrocaMind,
+import core.cognition.substrate as broca_mod
+from core.cognition.substrate import (
+    SubstrateController,
     LLMRelationExtractor,
     PersistentSemanticMemory,
     _claim_trust_weight,
@@ -159,6 +159,6 @@ def test_consolidation_still_revises_when_challengers_have_low_surprise(tmp_path
 
 def test_runtime_router_uses_llm_relation_extractor(tmp_path: Path, fake_host_loader):
     fake_host_loader()
-    mind = BrocaMind(seed=0, db_path=tmp_path / "router_extractor.sqlite", namespace="ext")
+    mind = SubstrateController(seed=0, db_path=tmp_path / "router_extractor.sqlite", namespace="ext")
 
     assert isinstance(mind.router.extractor, LLMRelationExtractor)

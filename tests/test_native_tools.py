@@ -12,8 +12,8 @@ from __future__ import annotations
 import pytest
 
 from core.causal import FiniteSCM
-from core.conformal import ConformalPredictor
-from core.native_tools import (
+from core.calibration.conformal import ConformalPredictor
+from core.natives.native_tools import (
     NativeTool,
     NativeToolRegistry,
     SandboxResult,
@@ -334,9 +334,9 @@ def test_attach_to_scm_registers_endogenous_equation(tmp_path):
     assert scm.domains["humidity"] == (0, 1)
     assert "U_humidity" in scm.exogenous
     # The equation must be evaluable through the SCM's standard pipeline.
-    p = scm.probability({"rains_today": 1}, interventions={"humidity": 1})
+    p = scm.probability({"rains_today": 1}, given={}, interventions={"humidity": 1})
     assert p == 1.0
-    p0 = scm.probability({"rains_today": 1}, interventions={"humidity": 0})
+    p0 = scm.probability({"rains_today": 1}, given={}, interventions={"humidity": 0})
     assert p0 == 0.0
 
 
@@ -377,8 +377,8 @@ def test_attach_to_scm_supports_intervention_via_native_tool(tmp_path):
     scm = FiniteSCM(domains={})
     reg.attach_to_scm(scm)
     # Intervene on smoke alone (fire varies under prior).
-    p_alarm_smoke1 = scm.probability({"alarm": 1}, interventions={"smoke": 1, "fire": 1})
-    p_alarm_smoke0 = scm.probability({"alarm": 1}, interventions={"smoke": 0, "fire": 1})
+    p_alarm_smoke1 = scm.probability({"alarm": 1}, given={}, interventions={"smoke": 1, "fire": 1})
+    p_alarm_smoke0 = scm.probability({"alarm": 1}, given={}, interventions={"smoke": 0, "fire": 1})
     assert p_alarm_smoke1 == 1.0
     assert p_alarm_smoke0 == 0.0
 
@@ -437,8 +437,8 @@ def test_full_synthesis_pipeline_describes_real_dependency(tmp_path):
     reg.attach_to_scm(scm)
 
     # Open door → humidity 0; closed door → humidity 1.
-    p_high_closed = scm.probability({"humidity_high": 1}, interventions={"door_closed": 1})
-    p_high_open = scm.probability({"humidity_high": 1}, interventions={"door_closed": 0})
+    p_high_closed = scm.probability({"humidity_high": 1}, given={}, interventions={"door_closed": 1})
+    p_high_open = scm.probability({"humidity_high": 1}, given={}, interventions={"door_closed": 0})
     assert p_high_closed == 1.0
     assert p_high_open == 0.0
     # ATE is the full effect.

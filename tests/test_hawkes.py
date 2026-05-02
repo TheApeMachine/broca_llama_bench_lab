@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from core.hawkes import (
+from core.temporal.hawkes import (
     MultivariateHawkesProcess,
     PersistentHawkes,
     fit_excitation_em,

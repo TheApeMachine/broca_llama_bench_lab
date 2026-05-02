@@ -6,7 +6,7 @@ import argparse
 import json
 import sys
 
-from core.logging_setup import configure_lab_logging
+from core.infra.logging_setup import configure_lab_logging
 
 from .harness import refresh_paper_experiments
 

@@ -1,6 +1,6 @@
 """Tests for the DMN's REM phase.
 
-The full ``BrocaMind`` requires a Llama checkpoint, so we wire up a synthetic
+The full ``SubstrateController`` requires a Llama checkpoint, so we wire up a synthetic
 "mind" exposing only the surfaces the REM phase touches. This isolates the
 sleep-cycle plumbing from the heavy substrate stack.
 """
@@ -11,7 +11,7 @@ import random
 import types
 from pathlib import Path
 
-from core.broca import (
+from core.cognition.substrate import (
     CognitiveBackgroundWorker,
     DMNConfig,
     PersistentSemanticMemory,
@@ -19,12 +19,12 @@ from core.broca import (
     CognitiveFrame,
 )
 from core.causal import build_simpson_scm
-from core.conformal import ConformalPredictor, PersistentConformalCalibration
-from core.hawkes import MultivariateHawkesProcess, PersistentHawkes
-from core.ontological_expansion import OntologicalRegistry, PersistentOntologicalRegistry
-from core.preference_learning import DirichletPreference, PersistentPreference
-from core.substrate_graph import EpisodeAssociationGraph
-from core.continuous_frame import SKETCH_DIM
+from core.calibration.conformal import ConformalPredictor, PersistentConformalCalibration
+from core.temporal.hawkes import MultivariateHawkesProcess, PersistentHawkes
+from core.idletime.ontological_expansion import OntologicalRegistry, PersistentOntologicalRegistry
+from core.learning.preference_learning import DirichletPreference, PersistentPreference
+from core.substrate.graph import EpisodeAssociationGraph
+from core.frame.continuous_frame import SKETCH_DIM
 
 
 def _build_synthetic_mind(tmp: Path) -> types.SimpleNamespace:

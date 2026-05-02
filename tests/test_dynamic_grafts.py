@@ -21,13 +21,13 @@ import pytest
 import torch
 import torch.nn as nn
 
-from core.dynamic_grafts import (
+from core.grafting.dynamic_grafts import (
     ACTIVATION_MODE_KIND,
     CapturedActivationMode,
     DynamicGraftSynthesizer,
     capture_activation_mode,
 )
-from core.grafts import KVMemoryGraft
+from core.grafting.grafts import KVMemoryGraft
 from core.memory import SQLiteActivationMemory
 
 

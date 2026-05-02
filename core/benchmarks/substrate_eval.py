@@ -57,7 +57,7 @@ from typing import Any, Mapping, Sequence
 
 import torch
 
-from core.substrate_runtime import default_substrate_sqlite_path, ensure_parent_dir
+from core.substrate.runtime import default_substrate_sqlite_path, ensure_parent_dir
 
 logger = logging.getLogger(__name__)
 
@@ -128,7 +128,7 @@ def bench_rule_shift(
     ``seed + trial_index * 1_000_003`` and micro-jitter on challenger prediction
     gaps so finite-sample variability can be summarized (mean, variance, CI).
     """
-    from core.broca import PersistentSemanticMemory
+    from core.cognition.substrate import PersistentSemanticMemory
 
     start = time.time()
     trial_scores: list[float] = []
@@ -259,7 +259,7 @@ def bench_adversarial_prompt_resistance(*, seed: int = 0) -> SubstrateBenchmarkR
     digits) and the evaluator rejects them. The search must converge on a valid
     token within max_iterations by physically banning rejected candidates.
     """
-    from core.top_down_control import HypothesisMaskingGraft, HypothesisVerdict
+    from core.cognition.top_down_control import HypothesisMaskingGraft, HypothesisVerdict
 
     start = time.time()
     rng = random.Random(seed)
@@ -338,13 +338,13 @@ def bench_causal_reasoning() -> SubstrateBenchmarkResult:
     scm = build_simpson_scm()
 
     # Naive association
-    p_y_given_t1 = scm.probability({"Y": 1}, given={"T": 1})
-    p_y_given_t0 = scm.probability({"Y": 1}, given={"T": 0})
+    p_y_given_t1 = scm.probability({"Y": 1}, given={"T": 1}, interventions={})
+    p_y_given_t0 = scm.probability({"Y": 1}, given={"T": 0}, interventions={})
     naive_suggests_helps = p_y_given_t1 > p_y_given_t0
 
     # Interventional (do-calculus)
-    p_y_do_t1 = scm.probability({"Y": 1}, interventions={"T": 1})
-    p_y_do_t0 = scm.probability({"Y": 1}, interventions={"T": 0})
+    p_y_do_t1 = scm.probability({"Y": 1}, given={}, interventions={"T": 1})
+    p_y_do_t0 = scm.probability({"Y": 1}, given={}, interventions={"T": 0})
     ate = p_y_do_t1 - p_y_do_t0
     do_says_helps = p_y_do_t1 > p_y_do_t0
 
@@ -393,7 +393,7 @@ def bench_causal_reasoning() -> SubstrateBenchmarkResult:
 
 def bench_memory_fidelity(*, n_triples: int = 100, seed: int = 0) -> SubstrateBenchmarkResult:
     """Write N random triples to semantic memory, recall each, measure accuracy."""
-    from core.broca import PersistentSemanticMemory
+    from core.cognition.substrate import PersistentSemanticMemory
 
     start = time.time()
     rng = random.Random(seed)
@@ -453,7 +453,7 @@ def bench_memory_fidelity(*, n_triples: int = 100, seed: int = 0) -> SubstrateBe
 
 def bench_conformal_coverage(*, n_calibration: int = 200, n_test: int = 500, alpha: float = 0.1, seed: int = 0) -> SubstrateBenchmarkResult:
     """Verify that split-conformal prediction achieves >= 1-alpha empirical coverage."""
-    from core.conformal import ConformalPredictor, empirical_coverage
+    from core.calibration.conformal import ConformalPredictor, empirical_coverage
 
     start = time.time()
     rng = random.Random(seed)
@@ -548,7 +548,7 @@ def bench_conformal_coverage(*, n_calibration: int = 200, n_test: int = 500, alp
 
 def bench_vsa_algebra(*, dims: Sequence[int] = (1000, 5000, 10000), n_triples: int = 50, seed: int = 0) -> SubstrateBenchmarkResult:
     """Test bind/unbind round-trip accuracy at varying dimensionalities."""
-    from core.vsa import VSACodebook
+    from core.symbolic import VSACodebook
 
     start = time.time()
     rng = random.Random(seed)
@@ -612,7 +612,7 @@ def bench_vsa_algebra(*, dims: Sequence[int] = (1000, 5000, 10000), n_triples: i
 
 def bench_hopfield_retrieval(*, d_model: int = 256, store_sizes: Sequence[int] = (10, 50, 100, 500), n_queries: int = 50, seed: int = 0) -> SubstrateBenchmarkResult:
     """Test one-step Hopfield retrieval accuracy at varying store sizes."""
-    from core.hopfield import HopfieldAssociativeMemory
+    from core.memory.hopfield import HopfieldAssociativeMemory
 
     start = time.time()
     rng_torch = torch.Generator().manual_seed(seed)
@@ -681,7 +681,7 @@ def bench_hopfield_retrieval(*, d_model: int = 256, store_sizes: Sequence[int] =
 
 def bench_active_inference(*, n_episodes: int = 200, max_steps: int = 3, seed: int = 0) -> SubstrateBenchmarkResult:
     """Compare EFE-driven Tiger POMDP agent to a random baseline."""
-    from core.active_inference import (
+    from core.agent.active_inference import (
         ActiveInferenceAgent, TigerDoorEnv, build_tiger_pomdp,
         run_episode, random_episode,
     )

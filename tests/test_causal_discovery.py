@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import random
 
-from core.causal_discovery import (
+from core.causal.causal_discovery import (
     DiscoveredGraph,
     _chi2_sf,
     _g_squared_independence,
@@ -103,9 +103,9 @@ def test_build_scm_from_skeleton_runs_simulation():
     graph = pc_algorithm(rows, ["X", "Y", "Z"], alpha=0.05)
     scm = build_scm_from_skeleton(graph, rows)
     assert "X" in scm.endogenous_names
-    p = scm.probability({"Z": 1}, interventions={"X": 1})
+    p = scm.probability({"Z": 1}, given={}, interventions={"X": 1})
     # Intervening on the chain root should still bias Z because Y depends on X.
-    p0 = scm.probability({"Z": 1}, interventions={"X": 0})
+    p0 = scm.probability({"Z": 1}, given={}, interventions={"X": 0})
     assert (
         abs(p - p0) > 0.05
     ), f"do(X=1) and do(X=0) gave same Z=1 probability ({p:.3f} vs {p0:.3f})"

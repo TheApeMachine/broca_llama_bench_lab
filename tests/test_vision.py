@@ -5,7 +5,7 @@ import sys
 
 import torch
 
-from core.continuous_frame import COGNITIVE_FRAME_DIM
+from core.frame.continuous_frame import COGNITIVE_FRAME_DIM
 from core.vision import VisionEncoder
 
 

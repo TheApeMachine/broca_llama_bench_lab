@@ -1047,7 +1047,7 @@ def refresh_paper_experiments(*, root: Path | None = None) -> dict[str, Any]:
                 resolve_task_names,
                 run_hf_datasets_benchmark,
             )
-            from core.device_utils import pick_torch_device
+            from core.system.device import pick_torch_device
 
             if preset not in DEFAULT_NATIVE_PRESETS:
                 preset = "quick"
@@ -1126,7 +1126,7 @@ def refresh_paper_experiments(*, root: Path | None = None) -> dict[str, Any]:
     else:
         try:
             from core.benchmarks.__main__ import run_broca_architecture_benchmark
-            from core.device_utils import pick_torch_device
+            from core.system.device import pick_torch_device
 
             dev = os.environ.get("PAPER_DEVICE") or os.environ.get("BENCHMARK_DEVICE") or pick_torch_device(
                 os.environ.get("M_DEVICE"),

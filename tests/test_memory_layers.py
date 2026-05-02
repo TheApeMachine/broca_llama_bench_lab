@@ -6,10 +6,17 @@ import torch
 
 import pytest
 
-from core.broca import BrocaMind, CognitiveFrame, GlobalWorkspace, TrainableBrocaGraft, WorkspaceJournal, working_memory_synthesize
-import core.broca as broca_mod
+from core.cognition.substrate import (
+    SubstrateController,
+    CognitiveFrame,
+    GlobalWorkspace,
+    TrainableFeatureGraft,
+    WorkspaceJournal,
+    working_memory_synthesize,
+)
+import core.cognition.substrate as broca_mod
 from core.memory import SQLiteActivationMemory
-from core.substrate_graph import EpisodeAssociationGraph, merge_epistemic_evidence_dict
+from core.substrate.graph import EpisodeAssociationGraph, merge_epistemic_evidence_dict
 
 from conftest import make_stub_llm_pair
 
@@ -59,7 +66,7 @@ def test_episode_association_graph_persistent(tmp_path: Path):
 def test_workspace_journal_fetch_roundtrip(tmp_path: Path, llama_broca_loaded: None):
     subject = _symbol("subject")
     obj = _symbol("object")
-    mind = BrocaMind(seed=0, db_path=tmp_path / "b.sqlite", namespace="x")
+    mind = SubstrateController(seed=0, db_path=tmp_path / "b.sqlite", namespace="x")
     mind.answer(f"{subject} is in {obj} .")
     mind.answer(f"where is {subject} ?")
     row = mind.journal.fetch(2)
@@ -89,7 +96,7 @@ def test_runtime_mind_creates_sqlite_before_model_load_failure(tmp_path: Path, m
     monkeypatch.setattr(broca_mod, "load_llama_broca_host", fail_load)
 
     with pytest.raises(RuntimeError, match="model unavailable"):
-        BrocaMind(seed=0, db_path=db, namespace="early")
+        SubstrateController(seed=0, db_path=db, namespace="early")
 
     assert db.exists()
     assert WorkspaceJournal(db).count() == 0
@@ -101,7 +108,7 @@ def test_runtime_mind_starts_empty_and_learns_observed_location(tmp_path: Path, 
     subject = _symbol("subject")
     obj = _symbol("object")
 
-    mind = BrocaMind(seed=0, db_path=db, namespace="runtime")
+    mind = SubstrateController(seed=0, db_path=db, namespace="runtime")
     assert mind.memory.count() == 0
     assert mind.comprehend(f"where is {subject} ?").intent == "unknown"
 
@@ -111,7 +118,7 @@ def test_runtime_mind_starts_empty_and_learns_observed_location(tmp_path: Path, 
     assert mind.memory.count() == 1
     assert mind.comprehend(f"where is {subject} ?").answer == obj
 
-    restarted = BrocaMind(seed=0, db_path=db, namespace="runtime")
+    restarted = SubstrateController(seed=0, db_path=db, namespace="runtime")
     assert restarted.memory.count() == 1
     assert restarted.comprehend(f"where is {subject} ?").answer == obj
     assert pred == learned.evidence["predicate"]
@@ -119,16 +126,16 @@ def test_runtime_mind_starts_empty_and_learns_observed_location(tmp_path: Path, 
 
 def test_runtime_mind_routes_faculties_and_installs_feature_graft(tmp_path: Path, fake_host_loader):
     host = fake_host_loader(track_grafts=True)
-    mind = BrocaMind(seed=0, db_path=tmp_path / "router.sqlite", namespace="runtime")
+    mind = SubstrateController(seed=0, db_path=tmp_path / "router.sqlite", namespace="runtime")
 
-    assert any(isinstance(graft, TrainableBrocaGraft) for _, graft in host.grafts)
+    assert any(isinstance(graft, TrainableFeatureGraft) for _, graft in host.grafts)
     assert mind.comprehend("what action should i take ?").intent == "active_action"
     assert mind.comprehend("does treatment help ?").intent == "causal_effect"
 
 
 def test_observed_contradiction_records_counterfactual_without_overwrite(tmp_path: Path, fake_host_loader):
     fake_host_loader(track_grafts=False)
-    mind = BrocaMind(seed=0, db_path=tmp_path / "conflict.sqlite", namespace="runtime")
+    mind = SubstrateController(seed=0, db_path=tmp_path / "conflict.sqlite", namespace="runtime")
     subject = _symbol("subject")
     current = _symbol("object")
     challenger = _symbol("object")
@@ -147,7 +154,7 @@ def test_observed_contradiction_records_counterfactual_without_overwrite(tmp_pat
 
 def test_background_consolidation_revises_after_repeated_counterevidence(tmp_path: Path, fake_host_loader):
     fake_host_loader(track_grafts=False)
-    mind = BrocaMind(seed=0, db_path=tmp_path / "consolidate.sqlite", namespace="runtime")
+    mind = SubstrateController(seed=0, db_path=tmp_path / "consolidate.sqlite", namespace="runtime")
     subject = _symbol("subject")
     current = _symbol("object")
     challenger = _symbol("object")
@@ -168,7 +175,7 @@ def test_background_consolidation_revises_after_repeated_counterevidence(tmp_pat
 
 def test_background_worker_start_stop(tmp_path: Path, fake_host_loader):
     fake_host_loader(track_grafts=False)
-    mind = BrocaMind(seed=0, db_path=tmp_path / "worker.sqlite", namespace="runtime")
+    mind = SubstrateController(seed=0, db_path=tmp_path / "worker.sqlite", namespace="runtime")
 
     worker = mind.start_background(interval_s=60.0)
 

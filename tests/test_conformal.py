@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pytest
 
-from core.conformal import (
+from core.calibration.conformal import (
     ConformalPredictor,
     PersistentConformalCalibration,
     empirical_coverage,

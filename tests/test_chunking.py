@@ -13,7 +13,7 @@ from typing import Sequence
 
 import torch
 
-from core.chunking import (
+from core.idletime.chunking import (
     ChunkingDetectionConfig,
     CompiledMacro,
     DMNChunkingCompiler,
@@ -21,7 +21,7 @@ from core.chunking import (
     macro_frame_features,
     _macro_name_for_pattern,
 )
-from core.continuous_frame import BROCA_FEATURE_DIM
+from core.frame.continuous_frame import BROCA_FEATURE_DIM
 
 
 class _StubJournal:

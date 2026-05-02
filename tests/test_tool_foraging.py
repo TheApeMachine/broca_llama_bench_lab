@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import pytest
 
-from core.active_inference import (
+from core.agent.active_inference import (
     ActiveInferenceAgent,
     CategoricalPOMDP,
     ToolForagingAgent,

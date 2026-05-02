@@ -4,8 +4,8 @@ from unittest import mock
 
 import pytest
 
-from core.docker_sandbox import DockerToolSandbox
-from core.native_tools import ToolSynthesisError
+from core.system.sandbox import DockerToolSandbox
+from core.natives.native_tools import ToolSynthesisError
 
 
 def test_docker_sandbox_requires_cli():
@@ -26,7 +26,7 @@ def test_docker_sandbox_invokes_runner(monkeypatch: pytest.MonkeyPatch, tmp_path
         captured["input"] = kwargs.get("input")
         return mock.Mock(returncode=0, stdout=b'{"ok": true, "result": 42}\n', stderr=b"")
 
-    monkeypatch.setattr("core.docker_sandbox.subprocess.run", fake_run)
+    monkeypatch.setattr("core.system.sandbox.subprocess.run", fake_run)
 
     class FakeTmp:
         def __enter__(self_inner):
@@ -35,7 +35,7 @@ def test_docker_sandbox_invokes_runner(monkeypatch: pytest.MonkeyPatch, tmp_path
         def __exit__(self_inner, *a):
             return None
 
-    monkeypatch.setattr("core.docker_sandbox.tempfile.TemporaryDirectory", lambda **k: FakeTmp())
+    monkeypatch.setattr("core.system.sandbox.tempfile.TemporaryDirectory", lambda **k: FakeTmp())
 
     res = sb.compile(
         "def tool(values):\n    return int(values['x']) + 1\n",
@@ -51,7 +51,7 @@ def test_docker_sandbox_invokes_runner(monkeypatch: pytest.MonkeyPatch, tmp_path
 def test_docker_relaxed_validator_allows_import():
     import ast
 
-    from core.docker_sandbox import _DockerRelaxedValidator
+    from core.system.sandbox import _DockerRelaxedValidator
 
     src = "import math\n\ndef tool(values):\n    return int(math.sqrt(values['x']))\n"
     tree = ast.parse(src)

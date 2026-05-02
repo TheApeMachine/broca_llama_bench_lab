@@ -4,7 +4,7 @@
 This module intentionally does not depend on EleutherAI's lm-eval harness.  It
 loads public benchmark datasets through ``datasets.load_dataset`` and scores
 vanilla ``AutoModelForCausalLM``, a ``LlamaBrocaHost`` replay on the same
-weights, and (for Llama checkpoints) full :class:`~core.broca.BrocaMind` on that
+weights, and (for Llama checkpoints) full :class:`~core.cognition.substrate.SubstrateController` on that
 host --- by length-normalized continuation log-likelihood (multiple choice) or
 deterministic generation with normalized exact matching where applicable.
 
@@ -34,16 +34,16 @@ from typing import Any, Callable, Iterable, Iterator, Mapping, Protocol, Sequenc
 import torch
 import torch.nn.functional as F
 
-from core.broca import BrocaMind
-from core.device_utils import inference_dtype, pick_torch_device
-from core.hf_tokenizer_compat import HuggingFaceBrocaTokenizer
-from core.llama_broca_host import (
+from core.cognition.substrate import SubstrateController
+from core.system.device import inference_dtype, pick_torch_device
+from core.host.hf_tokenizer_compat import HuggingFaceBrocaTokenizer
+from core.host.llama_broca_host import (
     LlamaBrocaHost,
     load_llama_broca_host,
     quiet_transformers_benchmark_log_warnings,
     resolve_hf_hub_token,
 )
-from core.substrate_runtime import CHAT_NAMESPACE, default_substrate_sqlite_path
+from core.substrate.runtime import CHAT_NAMESPACE, default_substrate_sqlite_path
 
 
 DEFAULT_LLAMA_MODEL = "meta-llama/Llama-3.2-1B-Instruct"
@@ -615,14 +615,14 @@ class HFLocalLlamaBrocaShell:
         ).strip()
 
 
-class HFLocalBrocaMindBench:
-    """Full BrocaMind stack: comprehend → graft-biased ``LlamaBrocaHost`` forward.
+class HFLocalSubstrateBench:
+    """Full substrate stack: comprehend → graft-biased ``LlamaBrocaHost`` forward.
 
-    Expects ``mind.host`` to be the same :class:`~core.llama_broca_host.LlamaBrocaHost`
+    Expects ``mind.host`` to be the same :class:`~core.host.llama_broca_host.LlamaBrocaHost`
     instance already used for the paired ``broca_shell`` pass (no second weight load).
     """
 
-    def __init__(self, mind: BrocaMind, hf_local: HFLocalCausalLM) -> None:
+    def __init__(self, mind: SubstrateController, hf_local: HFLocalCausalLM) -> None:
         self.mind = mind
         self.device = hf_local.device
         self.max_seq_len = hf_local.max_seq_len
@@ -895,7 +895,7 @@ def evaluate_task(
     # Late import keeps the benchmark module usable in environments where the
     # optional event_bus shim is unavailable; publish() is no-op without subs.
     try:
-        from core.event_bus import get_default_bus
+        from core.system.event_bus import get_default_bus
 
         bus = get_default_bus()
     except ImportError:
@@ -945,7 +945,7 @@ def evaluate_task(
 
 
 def _run_hf_tasks_to_dir(
-    backend: BenchmarkBackendProtocol | HFLocalCausalLM | HFLocalLlamaBrocaShell | HFLocalBrocaMindBench,
+    backend: BenchmarkBackendProtocol | HFLocalCausalLM | HFLocalLlamaBrocaShell | HFLocalSubstrateBench,
     *,
     run_root: Path,
     task_out_dir: Path,
@@ -963,7 +963,7 @@ def _run_hf_tasks_to_dir(
 ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     task_out_dir.mkdir(parents=True, exist_ok=True)
     try:
-        from core.event_bus import get_default_bus
+        from core.system.event_bus import get_default_bus
 
         bus = get_default_bus()
     except ImportError:
@@ -1135,7 +1135,7 @@ def run_hf_datasets_benchmark(
 
     ``compare_llama_broca_host_shell``: ``None`` (default) turns on paired runs for
     Llama checkpoints: ``broca_shell`` (host forward, no substrate) and ``broca_mind``
-    (full :class:`~core.broca.BrocaMind` on the same loaded host). Pass ``False`` to run
+    (full :class:`~core.cognition.substrate.SubstrateController` on the same loaded host). Pass ``False`` to run
     vanilla only; pass ``True`` to force when possible (skip with a message if not Llama).
     """
 
@@ -1173,7 +1173,7 @@ def run_hf_datasets_benchmark(
         print("\n--- Native HF datasets benchmark · vanilla_lm (HFLocalCausalLM) ---", flush=True)
 
     try:
-        from core.event_bus import get_default_bus
+        from core.system.event_bus import get_default_bus
 
         bus = get_default_bus()
     except ImportError:
@@ -1296,7 +1296,7 @@ def run_hf_datasets_benchmark(
             }
         }
         mind_preload = (shell_back.host, HuggingFaceBrocaTokenizer(shell_back.tokenizer))
-        bm = BrocaMind(
+        bm = SubstrateController(
             seed=int(seed),
             db_path=default_substrate_sqlite_path(),
             namespace=CHAT_NAMESPACE,
@@ -1305,7 +1305,7 @@ def run_hf_datasets_benchmark(
             device=str(shell_back.device),
             hf_token=hf_token,
         )
-        mind_backend = HFLocalBrocaMindBench(bm, backend)
+        mind_backend = HFLocalSubstrateBench(bm, backend)
         mind_dir = out / "broca_mind"
         per_mind, _rows_mind = _run_hf_tasks_to_dir(
             mind_backend,

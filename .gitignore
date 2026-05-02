@@ -19,3 +19,4 @@ paper/main.fls
 paper/include/experiment/hf_native_accuracy_by_task.pdf
 paper/main.pdf
 *.egg-info/
+.cursor/commands/refactor.md

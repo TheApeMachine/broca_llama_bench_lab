@@ -22,8 +22,8 @@ def test_gibbs_counterfactual_matches_exact_on_small_scm():
 
 def test_large_counterfactual_uses_sampling_without_exhaustive_worlds():
     scm = FiniteSCM(domains={})
-    scm.add_exogenous("U_X", range(1000))
-    scm.add_exogenous("U_Y", range(1000))
+    scm.add_exogenous_uniform("U_X", range(1000))
+    scm.add_exogenous_uniform("U_Y", range(1000))
     scm.add_endogenous("X", [0, 1], ["U_X"], lambda v: 1 if v["U_X"] < 900 else 0)
     scm.add_endogenous("Y", [0, 1], ["X", "U_Y"], lambda v: 1 if (v["X"] == 1 and v["U_Y"] < 800) else 0)
 
@@ -50,9 +50,9 @@ def test_gibbs_counterfactual_handles_rare_evidence_via_local_search():
     """
 
     scm = FiniteSCM(domains={})
-    scm.add_exogenous("U_A", range(100))
-    scm.add_exogenous("U_B", range(100))
-    scm.add_exogenous("U_Y", range(100))
+    scm.add_exogenous_uniform("U_A", range(100))
+    scm.add_exogenous_uniform("U_B", range(100))
+    scm.add_exogenous_uniform("U_Y", range(100))
     scm.add_endogenous("A", [0, 1], ["U_A"], lambda v: 1 if v["U_A"] < 5 else 0)
     scm.add_endogenous("B", [0, 1], ["U_B"], lambda v: 1 if v["U_B"] < 10 else 0)
     scm.add_endogenous(
@@ -79,7 +79,7 @@ def test_gibbs_resample_returns_value_inside_evidence_support():
     """The conditional resampler must only emit values that keep evidence satisfied."""
 
     scm = FiniteSCM(domains={})
-    scm.add_exogenous("U", range(20))
+    scm.add_exogenous_uniform("U", range(20))
     scm.add_endogenous("E", [0, 1], ["U"], lambda v: 1 if v["U"] < 5 else 0)
 
     rng = random.Random(0)

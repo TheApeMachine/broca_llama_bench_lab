@@ -4,7 +4,7 @@ import math
 
 import torch
 
-from core.vsa import (
+from core.symbolic import (
     DEFAULT_VSA_DIM,
     VSACodebook,
     bind,

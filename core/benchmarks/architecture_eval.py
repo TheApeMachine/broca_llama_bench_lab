@@ -1,8 +1,8 @@
 """Scored baseline-vs-Broca architecture benchmark.
 
 Questions the bare language host and the full Broca stack the same way interactive
-chat does: canonical SQLite, :data:`core.substrate_runtime.CHAT_NAMESPACE`, one
-:class:`BrocaMind` session for the probe series.
+chat does: canonical SQLite, :data:`core.substrate.runtime.CHAT_NAMESPACE`, one
+:class:`SubstrateController` session for the probe series.
 """
 
 from __future__ import annotations
@@ -15,8 +15,8 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Sequence
 
-from core.broca import BrocaMind, generate_without_broca
-from core.substrate_runtime import CHAT_NAMESPACE
+from core.cognition.substrate import SubstrateController, generate_without_substrate
+from core.substrate.runtime import CHAT_NAMESPACE
 
 logger = logging.getLogger(__name__)
 
@@ -135,7 +135,7 @@ def run_broca_architecture_eval(
 ) -> dict[str, Any]:
     """Run a direct scored comparison between bare host and Broca architecture.
 
-    Uses a **single** :class:`BrocaMind` load and the same SQLite + namespace as
+    Uses a **single** :class:`SubstrateController` load and the same SQLite + namespace as
     interactive chat (:data:`CHAT_NAMESPACE`), so benchmarks exercise and persist
     through the identical substrate stack—not an alternate memory partition.
     """
@@ -143,7 +143,7 @@ def run_broca_architecture_eval(
     mid = llama_model_id or os.environ.get("MODEL_ID", "meta-llama/Llama-3.2-1B-Instruct")
 
     try:
-        from core.event_bus import get_default_bus
+        from core.system.event_bus import get_default_bus
 
         bus = get_default_bus()
     except Exception:
@@ -156,7 +156,7 @@ def run_broca_architecture_eval(
     rows: list[dict[str, Any]] = []
     graft_reports_by_case: dict[str, str] = {}
     total_cases = len(cases)
-    mind = BrocaMind(
+    mind = SubstrateController(
         seed=seed,
         db_path=db_path,
         namespace=CHAT_NAMESPACE,
@@ -176,7 +176,7 @@ def run_broca_architecture_eval(
         max_new_tokens = _encode_len(mind.tokenizer, case.expected_speech)
         prompt = _baseline_prompt(case)
         with mind.host.grafts_enabled(False):
-            baseline_output = generate_without_broca(
+            baseline_output = generate_without_substrate(
                 mind.host,
                 mind.tokenizer,
                 prefix=prompt,
@@ -238,10 +238,10 @@ def run_broca_architecture_eval(
     result: dict[str, Any] = {
         "kind": "broca_architecture_eval",
         "description": (
-            "Direct scored comparison: bare frozen language host vs BrocaMind with semantic memory, "
+            "Direct scored comparison: bare frozen language host vs full substrate (SubstrateController) with semantic memory, "
             "active inference, causal substrate, workspace frames, and residual-stream graft verbalization. "
             "Runs on the canonical substrate SQLite with the same namespace as chat (CHAT_NAMESPACE); "
-            "one BrocaMind session carries workspace and persistence across cases for this eval."
+            "one SubstrateController session carries workspace and persistence across cases for this eval."
         ),
         "model_id": mid,
         "device": device,

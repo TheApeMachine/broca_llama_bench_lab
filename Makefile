@@ -12,6 +12,7 @@ UV ?= uv
 
 help:
 	@echo "Targets:"
+	@echo "  Unified entry: \`$(RUN_PYTHON) -m core --help\` (subcommands: chat, chat-tui, bench, bench-tui, demo, paper)"
 	@echo "  make install             python3 -m venv .venv; uv sync (--extra tui --extra test; tui pulls benchmark)"
 	@echo "  make install-benchmark   add/refresh benchmark extra: uv pip install -e \".[benchmark]\""
 	@echo "  make chat                streaming terminal chat (full Broca substrate; fixed runtime)"
@@ -40,24 +41,24 @@ install-benchmark: install
 	. .venv/bin/activate && $(UV) pip install -e ".[benchmark]"
 
 chat:
-	$(RUN_PYTHON) -m core.chat_cli
+	$(RUN_PYTHON) -m core chat
 
 tui:
-	$(RUN_PYTHON) -m core.chat_tui
+	$(RUN_PYTHON) -m core chat-tui
 
 # Native (standard task preset) + Eleuther lm-eval (standard preset limits) + architecture eval.
 # `make bench` launches the Textual dashboard. Use `make bench-cli` for plain stdout.
 bench: bench-tui
 
 bench-tui:
-	$(RUN_PYTHON) -m core.bench_tui
+	$(RUN_PYTHON) -m core bench-tui
 
 bench-cli:
-	$(RUN_PYTHON) -m core.benchmarks
+	$(RUN_PYTHON) -m core bench
 
 # Smaller default preset/limit via env: PAPER_NATIVE_PRESET=quick PAPER_BENCH_LIMIT=50
 paper-bench:
-	$(RUN_PYTHON) -m core.paper
+	$(RUN_PYTHON) -m core paper
 
 paper-pdf:
 	@if command -v latexmk >/dev/null 2>&1; then \

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import logging
 
-from core.event_bus import EventBus, LogToBusHandler, get_default_bus, reset_default_bus
+from core.system.event_bus import EventBus, LogToBusHandler, get_default_bus, reset_default_bus
 
 
 def test_subscribe_and_publish_round_trip():

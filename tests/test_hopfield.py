@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import torch
 
-from core.hopfield import (
+from core.memory.hopfield import (
     HopfieldAssociativeMemory,
     derived_inverse_temperature,
     hopfield_update,

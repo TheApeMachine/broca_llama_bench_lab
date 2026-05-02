@@ -5,9 +5,9 @@ from pathlib import Path
 
 import pytest
 
-import core.broca as broca_mod
-from core.broca import BrocaMind, CognitiveFrame
-from core.event_bus import EventBus
+import core.cognition.substrate as substrate_mod
+from core.cognition.substrate import SubstrateController, CognitiveFrame
+from core.system.event_bus import EventBus
 
 from conftest import make_stub_llm_pair
 
@@ -37,11 +37,11 @@ class _FakeTok:
 def fake_host_loader(monkeypatch: pytest.MonkeyPatch):
     """Return (host, mind) after patching the Llama host loader — no implicit ordering."""
 
-    def _setup(tmp_path: Path) -> tuple[_FakeHost, BrocaMind]:
+    def _setup(tmp_path: Path) -> tuple[_FakeHost, SubstrateController]:
         host = _FakeHost()
         tok = _FakeTok(host._stub_tokenizer)
-        monkeypatch.setattr(broca_mod, "load_llama_broca_host", lambda *a, **k: (host, tok))
-        mind = BrocaMind(seed=0, db_path=tmp_path / "snap.sqlite", namespace="snap")
+        monkeypatch.setattr(substrate_mod, "load_llama_broca_host", lambda *a, **k: (host, tok))
+        mind = SubstrateController(seed=0, db_path=tmp_path / "snap.sqlite", namespace="snap")
         return host, mind
 
     return _setup

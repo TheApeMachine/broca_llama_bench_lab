@@ -1,6 +1,6 @@
 """Unified Mosaic benchmark suite (fixed wiring, no tuning flags).
 
-Runs the native HF-datasets leaderboard (vanilla LM, Broca host shell, full BrocaMind),
+Runs the native HF-datasets leaderboard (vanilla LM, Broca host shell, full substrate stack),
 Eleuther LM-eval parity, dataset smoke sanity checks, and Broca architecture
 baseline-vs-enhanced probes. Model id follows ``MODEL_ID`` / ``BENCHMARK_MODEL``.
 Substrate probes persist to ``runs/broca_substrate.sqlite`` (pytest uses
@@ -22,7 +22,7 @@ import warnings
 from pathlib import Path
 from typing import Any, Sequence
 
-from core.substrate_runtime import (
+from core.substrate.runtime import (
     BENCHMARK_ENGINE,
     BENCHMARK_FIXED_SEED,
     BENCHMARK_GEN_MAX_NEW_TOKENS,
@@ -43,8 +43,8 @@ from core.benchmarks.hf_datasets_eval import (
     resolve_task_names,
 )
 from core.benchmarks.lm_eval_pair import run_paired_lm_eval
-from core.device_utils import normalize_device_arg, pick_torch_device
-from core.event_bus import get_default_bus
+from core.system.device import normalize_device_arg, pick_torch_device
+from core.system.event_bus import get_default_bus
 
 logger = logging.getLogger(__name__)
 
@@ -54,7 +54,7 @@ DEFAULT_BENCHMARK_MODEL = DEFAULT_LLAMA_MODEL
 def _touch_canonical_substrate_sqlite_early(*, model_id: str) -> None:
     """Create ``runs/broca_substrate.sqlite`` when the suite starts (non-tests, Llama backends).
 
-    The native HF leg may open :class:`~core.broca.BrocaMind` for the ``broca_mind`` arm when
+    The native HF leg may open :class:`~core.cognition.substrate.SubstrateController` for the ``broca_mind`` arm when
     pairing on Llama checkpoints; lm-eval stays host-only; architecture eval runs *last*.
     Touching early avoids ``runs/`` looking empty during long leaderboard phases."""
 

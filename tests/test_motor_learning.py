@@ -13,7 +13,7 @@ import torch.nn as nn
 
 import pytest
 
-from core.motor_learning import (
+from core.learning.motor_learning import (
     GraftMotorTrainer,
     MotorLearningConfig,
     freeze_all_but,

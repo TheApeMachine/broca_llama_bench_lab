@@ -4,8 +4,8 @@ from pathlib import Path
 
 import torch
 
-from core.continuous_frame import SKETCH_DIM, stable_sketch
-from core.ontological_expansion import (
+from core.frame.continuous_frame import SKETCH_DIM, stable_sketch
+from core.idletime.ontological_expansion import (
     OntologicalRegistry,
     PersistentOntologicalRegistry,
     gram_schmidt_orthogonalize,

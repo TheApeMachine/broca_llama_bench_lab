@@ -3,9 +3,9 @@ __version__ = "0.6.1-mosaic"
 import os
 from typing import Any
 
-from .logging_setup import configure_lab_logging
+from .infra.logging_setup import configure_lab_logging
 
-from .active_inference import (
+from .agent.active_inference import (
     ActiveInferenceAgent,
     CategoricalPOMDP,
     CoupledDecision,
@@ -17,26 +17,32 @@ from .active_inference import (
     derived_listen_channel_reliability,
     extend_pomdp_with_synthesize_tool,
 )
-from .broca import (
-    BrocaMind,
+from .cognition.substrate import (
+    SubstrateController,
     CognitiveBackgroundWorker,
     CognitiveFrame,
     DMNConfig,
     IntrinsicCue,
     PersistentSemanticMemory,
-    TrainableBrocaGraft,
+    TrainableFeatureGraft,
     WorkspaceJournal,
     cognitive_frame_from_episode_row,
 )
 from .causal import FiniteSCM, build_frontdoor_scm, build_simpson_scm
-from .device_utils import pick_torch_device
-from .grafts import ActiveInferenceTokenGraft, CoupledActiveInferenceTokenGraft, CausalEffectTokenGraft, FeatureVectorGraft, KVMemoryGraft
-from .hf_tokenizer_compat import HuggingFaceBrocaTokenizer
-from .llama_broca_host import LlamaBrocaHost, load_llama_broca_host
+from .system.device import pick_torch_device
+from .grafting.grafts import (
+    ActiveInferenceTokenGraft,
+    CoupledActiveInferenceTokenGraft,
+    CausalEffectTokenGraft,
+    FeatureVectorGraft,
+    KVMemoryGraft,
+)
+from .host.hf_tokenizer_compat import HuggingFaceBrocaTokenizer
+from .host.llama_broca_host import LlamaBrocaHost, load_llama_broca_host
 from .memory import SQLiteActivationMemory
-from .substrate_graph import EpisodeAssociationGraph, merge_epistemic_evidence_dict
-from .tokenizer import SPEECH_BRIDGE_PREFIX, speech_seed_ids, utterance_words
-from .continuous_frame import (
+from .substrate.graph import EpisodeAssociationGraph, merge_epistemic_evidence_dict
+from .host.tokenizer import SPEECH_BRIDGE_PREFIX, speech_seed_ids, utterance_words
+from .frame.continuous_frame import (
     COGNITIVE_FRAME_DIM,
     BROCA_FEATURE_DIM,
     FrozenSubwordProjector,
@@ -46,67 +52,67 @@ from .continuous_frame import (
     semantic_subword_sketch,
     stable_sketch,
 )
-from .vsa import bind, unbind, bundle, permute, hypervector, cleanup
+from .symbolic.vsa import bind, unbind, bundle, permute, hypervector, cleanup
 
 # Optional / heavier subsystems: imported on first attribute access via __getattr__ (PEP 562).
 
 _LAZY_EXPORTS: dict[str, tuple[str, str]] = {
-    "ChunkingDetectionConfig": (".chunking", "ChunkingDetectionConfig"),
-    "CompiledMacro": (".chunking", "CompiledMacro"),
-    "DMNChunkingCompiler": (".chunking", "DMNChunkingCompiler"),
-    "MacroChunkRegistry": (".chunking", "MacroChunkRegistry"),
-    "macro_frame_features": (".chunking", "macro_frame_features"),
-    "NativeTool": (".native_tools", "NativeTool"),
-    "NativeToolRegistry": (".native_tools", "NativeToolRegistry"),
-    "SandboxResult": (".native_tools", "SandboxResult"),
-    "ToolSandbox": (".native_tools", "ToolSandbox"),
-    "tool_sandbox_from_env": (".native_tools", "tool_sandbox_from_env"),
-    "ToolSynthesisError": (".native_tools", "ToolSynthesisError"),
-    "ACTIVATION_MODE_KIND": (".dynamic_grafts", "ACTIVATION_MODE_KIND"),
-    "CapturedActivationMode": (".dynamic_grafts", "CapturedActivationMode"),
-    "DynamicGraftSynthesizer": (".dynamic_grafts", "DynamicGraftSynthesizer"),
-    "capture_activation_mode": (".dynamic_grafts", "capture_activation_mode"),
-    "CausalConstraint": (".top_down_control", "CausalConstraint"),
-    "CausalConstraintGraft": (".top_down_control", "CausalConstraintGraft"),
-    "EpistemicInterruptionMonitor": (".top_down_control", "EpistemicInterruptionMonitor"),
-    "EpistemicInterruptionResult": (".top_down_control", "EpistemicInterruptionResult"),
-    "HypothesisAttempt": (".top_down_control", "HypothesisAttempt"),
-    "HypothesisMaskingGraft": (".top_down_control", "HypothesisMaskingGraft"),
-    "HypothesisSearchResult": (".top_down_control", "HypothesisSearchResult"),
-    "HypothesisVerdict": (".top_down_control", "HypothesisVerdict"),
-    "InterruptionEvent": (".top_down_control", "InterruptionEvent"),
-    "InterruptionVerdict": (".top_down_control", "InterruptionVerdict"),
-    "IterativeHypothesisSearch": (".top_down_control", "IterativeHypothesisSearch"),
-    "ModalityShiftGraft": (".top_down_control", "ModalityShiftGraft"),
-    "VSACodebook": (".vsa", "VSACodebook"),
-    "vsa_cosine": (".vsa", "cosine"),
-    "HopfieldAssociativeMemory": (".hopfield", "HopfieldAssociativeMemory"),
-    "hopfield_update": (".hopfield", "hopfield_update"),
-    "derived_inverse_temperature": (".hopfield", "derived_inverse_temperature"),
-    "VisionEncoder": (".vision", "VisionEncoder"),
-    "ConformalPredictor": (".conformal", "ConformalPredictor"),
-    "ConformalSet": (".conformal", "ConformalSet"),
-    "PersistentConformalCalibration": (".conformal", "PersistentConformalCalibration"),
-    "empirical_coverage": (".conformal", "empirical_coverage"),
-    "MultivariateHawkesProcess": (".hawkes", "MultivariateHawkesProcess"),
-    "PersistentHawkes": (".hawkes", "PersistentHawkes"),
-    "fit_excitation_em": (".hawkes", "fit_excitation_em"),
-    "GraftMotorTrainer": (".motor_learning", "GraftMotorTrainer"),
-    "MotorLearningConfig": (".motor_learning", "MotorLearningConfig"),
-    "DirichletPreference": (".preference_learning", "DirichletPreference"),
-    "PersistentPreference": (".preference_learning", "PersistentPreference"),
-    "feedback_polarity_from_text": (".preference_learning", "feedback_polarity_from_text"),
-    "OntologicalRegistry": (".ontological_expansion", "OntologicalRegistry"),
-    "PersistentOntologicalRegistry": (".ontological_expansion", "PersistentOntologicalRegistry"),
-    "gram_schmidt_orthogonalize": (".ontological_expansion", "gram_schmidt_orthogonalize"),
-    "pc_algorithm": (".causal_discovery", "pc_algorithm"),
-    "build_scm_from_skeleton": (".causal_discovery", "build_scm_from_skeleton"),
-    "DiscoveredGraph": (".causal_discovery", "DiscoveredGraph"),
-    "local_predicate_cluster": (".causal_discovery", "local_predicate_cluster"),
-    "project_rows_to_variables": (".causal_discovery", "project_rows_to_variables"),
-    "DockerToolSandbox": (".docker_sandbox", "DockerToolSandbox"),
-    "SelfImproveConfig": (".docker_self_improve_worker", "SelfImproveConfig"),
-    "SelfImproveDockerWorker": (".docker_self_improve_worker", "SelfImproveDockerWorker"),
+    "ChunkingDetectionConfig": (".idletime.chunking", "ChunkingDetectionConfig"),
+    "CompiledMacro": (".idletime.chunking", "CompiledMacro"),
+    "MacroChunkRegistry": (".idletime.chunking", "MacroChunkRegistry"),
+    "DMNChunkingCompiler": (".idletime.chunking", "DMNChunkingCompiler"),
+    "macro_frame_features": (".idletime.chunking", "macro_frame_features"),
+    "NativeTool": (".natives.native_tools", "NativeTool"),
+    "NativeToolRegistry": (".natives.native_tools", "NativeToolRegistry"),
+    "SandboxResult": (".natives.native_tools", "SandboxResult"),
+    "ToolSandbox": (".natives.native_tools", "ToolSandbox"),
+    "tool_sandbox_from_env": (".natives.native_tools", "tool_sandbox_from_env"),
+    "ToolSynthesisError": (".natives.native_tools", "ToolSynthesisError"),
+    "ACTIVATION_MODE_KIND": (".grafting.dynamic_grafts", "ACTIVATION_MODE_KIND"),
+    "CapturedActivationMode": (".grafting.dynamic_grafts", "CapturedActivationMode"),
+    "DynamicGraftSynthesizer": (".grafting.dynamic_grafts", "DynamicGraftSynthesizer"),
+    "capture_activation_mode": (".grafting.dynamic_grafts", "capture_activation_mode"),
+    "CausalConstraint": (".cognition.top_down_control", "CausalConstraint"),
+    "CausalConstraintGraft": (".cognition.top_down_control", "CausalConstraintGraft"),
+    "EpistemicInterruptionMonitor": (".cognition.top_down_control", "EpistemicInterruptionMonitor"),
+    "EpistemicInterruptionResult": (".cognition.top_down_control", "EpistemicInterruptionResult"),
+    "HypothesisAttempt": (".cognition.top_down_control", "HypothesisAttempt"),
+    "HypothesisMaskingGraft": (".cognition.top_down_control", "HypothesisMaskingGraft"),
+    "HypothesisSearchResult": (".cognition.top_down_control", "HypothesisSearchResult"),
+    "HypothesisVerdict": (".cognition.top_down_control", "HypothesisVerdict"),
+    "InterruptionEvent": (".cognition.top_down_control", "InterruptionEvent"),
+    "InterruptionVerdict": (".cognition.top_down_control", "InterruptionVerdict"),
+    "IterativeHypothesisSearch": (".cognition.top_down_control", "IterativeHypothesisSearch"),
+    "ModalityShiftGraft": (".cognition.top_down_control", "ModalityShiftGraft"),
+    "VSACodebook": (".symbolic.vsa", "VSACodebook"),
+    "vsa_cosine": (".symbolic.vsa", "cosine"),
+    "HopfieldAssociativeMemory": (".memory.hopfield", "HopfieldAssociativeMemory"),
+    "hopfield_update": (".memory.hopfield", "hopfield_update"),
+    "derived_inverse_temperature": (".memory.hopfield", "derived_inverse_temperature"),
+    "VisionEncoder": (".vision.vision", "VisionEncoder"),
+    "ConformalPredictor": (".calibration.conformal", "ConformalPredictor"),
+    "ConformalSet": (".calibration.conformal", "ConformalSet"),
+    "PersistentConformalCalibration": (".calibration.conformal", "PersistentConformalCalibration"),
+    "empirical_coverage": (".calibration.conformal", "empirical_coverage"),
+    "MultivariateHawkesProcess": (".temporal.hawkes", "MultivariateHawkesProcess"),
+    "PersistentHawkes": (".temporal.hawkes", "PersistentHawkes"),
+    "fit_excitation_em": (".temporal.hawkes", "fit_excitation_em"),
+    "GraftMotorTrainer": (".learning.motor_learning", "GraftMotorTrainer"),
+    "MotorLearningConfig": (".learning.motor_learning", "MotorLearningConfig"),
+    "DirichletPreference": (".learning.preference_learning", "DirichletPreference"),
+    "PersistentPreference": (".learning.preference_learning", "PersistentPreference"),
+    "feedback_polarity_from_text": (".learning.preference_learning", "feedback_polarity_from_text"),
+    "OntologicalRegistry": (".idletime.ontological_expansion", "OntologicalRegistry"),
+    "PersistentOntologicalRegistry": (".idletime.ontological_expansion", "PersistentOntologicalRegistry"),
+    "gram_schmidt_orthogonalize": (".idletime.ontological_expansion", "gram_schmidt_orthogonalize"),
+    "pc_algorithm": (".causal.causal_discovery", "pc_algorithm"),
+    "build_scm_from_skeleton": (".causal.causal_discovery", "build_scm_from_skeleton"),
+    "DiscoveredGraph": (".causal.causal_discovery", "DiscoveredGraph"),
+    "local_predicate_cluster": (".causal.causal_discovery", "local_predicate_cluster"),
+    "project_rows_to_variables": (".causal.causal_discovery", "project_rows_to_variables"),
+    "DockerToolSandbox": (".system.sandbox", "DockerToolSandbox"),
+    "SelfImproveConfig": (".workers.docker_self_improve_worker", "SelfImproveConfig"),
+    "SelfImproveDockerWorker": (".workers.docker_self_improve_worker", "SelfImproveDockerWorker"),
 }
 
 
@@ -166,14 +172,14 @@ __all__ = [
     "InterruptionVerdict",
     "IterativeHypothesisSearch",
     "ModalityShiftGraft",
-    "BrocaMind",
+    "SubstrateController",
     "CognitiveBackgroundWorker",
     "CognitiveFrame",
     "DMNConfig",
     "IntrinsicCue",
     "PersistentSemanticMemory",
     "WorkspaceJournal",
-    "TrainableBrocaGraft",
+    "TrainableFeatureGraft",
     "cognitive_frame_from_episode_row",
     "EpisodeAssociationGraph",
     "merge_epistemic_evidence_dict",
