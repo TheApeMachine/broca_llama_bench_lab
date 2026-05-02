@@ -32,6 +32,7 @@ import sqlite3
 import threading
 import time
 from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Mapping, Optional, Sequence
@@ -1957,80 +1958,81 @@ class CognitiveBackgroundWorker:
         return reflections, summary
 
     def _causal_dreaming(self) -> dict[str, Any]:
-        cfg = self.config
-        scm = getattr(self.mind, "scm", None)
-        if scm is None:
-            return {"reflections": [], "attempts": 0, "insights": 0}
-        endogenous = list(scm.endogenous_names)
-        if len(endogenous) < 2:
-            return {"reflections": [], "attempts": 0, "insights": 0}
+        with self.mind._cognitive_state_lock:
+            cfg = self.config
+            scm = getattr(self.mind, "scm", None)
+            if scm is None:
+                return {"reflections": [], "attempts": 0, "insights": 0}
+            endogenous = list(scm.endogenous_names)
+            if len(endogenous) < 2:
+                return {"reflections": [], "attempts": 0, "insights": 0}
 
-        attempts = 0
-        insights: list[dict[str, Any]] = []
-        for _ in range(max(0, int(cfg.dream_attempts_per_tick))):
-            attempts += 1
-            treatment, outcome = self._rng.sample(endogenous, 2)
-            try:
-                t_dom = scm.domains.get(treatment)
-                o_dom = scm.domains.get(outcome)
-                if not t_dom or not o_dom or len(t_dom) < 2 or len(o_dom) < 2:
+            attempts = 0
+            insights: list[dict[str, Any]] = []
+            for _ in range(max(0, int(cfg.dream_attempts_per_tick))):
+                attempts += 1
+                treatment, outcome = self._rng.sample(endogenous, 2)
+                try:
+                    t_dom = scm.domains.get(treatment)
+                    o_dom = scm.domains.get(outcome)
+                    if not t_dom or not o_dom or len(t_dom) < 2 or len(o_dom) < 2:
+                        continue
+                    t_pos, t_neg = t_dom[0], t_dom[1]
+                    outcome_value = o_dom[0]
+                    p_pos = scm.probability({outcome: outcome_value}, given={}, interventions={treatment: t_pos})
+                    p_neg = scm.probability({outcome: outcome_value}, given={}, interventions={treatment: t_neg})
+                except (KeyError, ValueError, RuntimeError):
+                    logger.debug("DMN.phase3.dream: failed treatment=%s outcome=%s", treatment, outcome, exc_info=True)
                     continue
-                t_pos, t_neg = t_dom[0], t_dom[1]
-                outcome_value = o_dom[0]
-                p_pos = scm.probability({outcome: outcome_value}, given={}, interventions={treatment: t_pos})
-                p_neg = scm.probability({outcome: outcome_value}, given={}, interventions={treatment: t_neg})
-            except (KeyError, ValueError, RuntimeError):
-                logger.debug("DMN.phase3.dream: failed treatment=%s outcome=%s", treatment, outcome, exc_info=True)
-                continue
-            ate = float(p_pos - p_neg)
-            logger.debug(
-                "DMN.phase3.dream: do(%s=%s)→P(%s=%s)=%.4f vs do(%s=%s)→%.4f ate=%.4f",
-                treatment,
-                t_pos,
-                outcome,
-                outcome_value,
-                p_pos,
-                treatment,
-                t_neg,
-                p_neg,
-                ate,
-            )
-            if abs(ate) < cfg.dream_ate_insight_threshold:
-                continue
-            relation_label = scm.labels.get("positive_effect" if ate >= 0 else "negative_effect")
-            relation = relation_label or ("causes_increase" if ate >= 0 else "causes_decrease")
-            evidence = {
-                "treatment": treatment,
-                "outcome": outcome,
-                "outcome_value": outcome_value,
-                "treatment_values": [t_pos, t_neg],
-                "p_do_positive": float(p_pos),
-                "p_do_negative": float(p_neg),
-                "ate": ate,
-                "instrument": "dmn_causal_dream",
-            }
-            dedupe = f"latent_causal_insight:{treatment}->{outcome}:{relation}"
-            reflection_id = self.mind.memory.record_reflection(
-                "latent_causal_insight",
-                treatment,
-                relation,
-                f"dreamt that intervening on {treatment} {relation} {outcome} (ATE={ate:+.2f})",
-                evidence,
-                dedupe_key=dedupe,
-            )
-            if reflection_id is None:
-                continue
-            insights.append({"id": reflection_id, "kind": "latent_causal_insight", **evidence})
-            logger.info(
-                "DMN.phase3.dream.insight: id=%d %s %s %s ate=%+.3f",
-                reflection_id,
-                treatment,
-                relation,
-                outcome,
-                ate,
-            )
+                ate = float(p_pos - p_neg)
+                logger.debug(
+                    "DMN.phase3.dream: do(%s=%s)→P(%s=%s)=%.4f vs do(%s=%s)→%.4f ate=%.4f",
+                    treatment,
+                    t_pos,
+                    outcome,
+                    outcome_value,
+                    p_pos,
+                    treatment,
+                    t_neg,
+                    p_neg,
+                    ate,
+                )
+                if abs(ate) < cfg.dream_ate_insight_threshold:
+                    continue
+                relation_label = scm.labels.get("positive_effect" if ate >= 0 else "negative_effect")
+                relation = relation_label or ("causes_increase" if ate >= 0 else "causes_decrease")
+                evidence = {
+                    "treatment": treatment,
+                    "outcome": outcome,
+                    "outcome_value": outcome_value,
+                    "treatment_values": [t_pos, t_neg],
+                    "p_do_positive": float(p_pos),
+                    "p_do_negative": float(p_neg),
+                    "ate": ate,
+                    "instrument": "dmn_causal_dream",
+                }
+                dedupe = f"latent_causal_insight:{treatment}->{outcome}:{relation}"
+                reflection_id = self.mind.memory.record_reflection(
+                    "latent_causal_insight",
+                    treatment,
+                    relation,
+                    f"dreamt that intervening on {treatment} {relation} {outcome} (ATE={ate:+.2f})",
+                    evidence,
+                    dedupe_key=dedupe,
+                )
+                if reflection_id is None:
+                    continue
+                insights.append({"id": reflection_id, "kind": "latent_causal_insight", **evidence})
+                logger.info(
+                    "DMN.phase3.dream.insight: id=%d %s %s %s ate=%+.3f",
+                    reflection_id,
+                    treatment,
+                    relation,
+                    outcome,
+                    ate,
+                )
 
-        return {"reflections": insights, "attempts": attempts, "insights": len(insights)}
+            return {"reflections": insights, "attempts": attempts, "insights": len(insights)}
 
     def _transitive_episode_closure(self) -> dict[str, Any]:
         cfg = self.config
@@ -2795,9 +2797,6 @@ class CognitiveRouter:
         utterance_intent: UtteranceIntent,
     ) -> CognitiveFrame:
         candidates: list[FacultyCandidate] = []
-        claim = self.extractor.extract_claim(utterance, toks, utterance_intent=utterance_intent)
-        if claim is not None:
-            claim = mind.refine_extracted_claim(utterance, toks, claim)
         query = _query_from_tokens(
             toks,
             utterance=utterance,
@@ -2806,8 +2805,14 @@ class CognitiveRouter:
             text_encoder=mind.text_encoder,
         )
 
-        if claim is not None:
-            candidates.append(FacultyCandidate("semantic_claim", 1.45, lambda claim=claim: self._memory_write(mind, utterance, claim)))
+        if utterance_intent.allows_storage:
+            candidates.append(
+                FacultyCandidate(
+                    "memory_ingest_pending",
+                    1.45,
+                    lambda: self._memory_ingest_pending(utterance, toks),
+                )
+            )
         if query is not None:
             candidates.append(FacultyCandidate("semantic_query", 1.35, lambda query=query: self._memory_query(mind, utterance, toks, query)))
 
@@ -3091,7 +3096,6 @@ class SubstrateController:
         self.classification_encoder = SemanticClassificationEncoder()
         self.semantic_cascade = SemanticCascade(
             classifier=self.classification_encoder,
-            extraction=self.extraction_encoder,
         )
         self.affect_encoder = AffectEncoder()
         self.affect_trace = PersistentAffectTrace(rp, namespace=f"{namespace}__affect")
@@ -3113,7 +3117,7 @@ class SubstrateController:
         self.unified_agent = CoupledEFEAgent(self.active_agent, self.causal_agent)
         self._background_worker: CognitiveBackgroundWorker | None = None
         self._self_improve_worker: Any | None = None
-        self._cognitive_state_lock = threading.Lock()
+        self._cognitive_state_lock = threading.RLock()
         self._deferred_relation_jobs: deque[DeferredRelationIngest] = deque()
         self._next_deferred_relation_job_id = 1
 
@@ -3170,7 +3174,11 @@ class SubstrateController:
         # into the live SCM as an endogenous equation.
         self.tool_registry = NativeToolRegistry(rp, namespace=f"{namespace}__tools")
         try:
-            self.tool_registry.attach_to_scm(self.scm, on_tool_drift=self._handle_native_tool_drift)
+            self.tool_registry.attach_to_scm(
+                self.scm,
+                topology_lock=self._cognitive_state_lock,
+                on_tool_drift=self._handle_native_tool_drift,
+            )
         except Exception:
             logger.exception("SubstrateController: initial tool attachment failed")
 
@@ -3298,6 +3306,7 @@ class SubstrateController:
             "processed_at": time.time(),
         }
         self.workspace.publish(frame)
+        self._after_deferred_relation_commit(frame, job)
 
         reflection = {
             "kind": "deferred_relation_ingest",
@@ -3312,6 +3321,19 @@ class SubstrateController:
         }
         self.event_bus.publish("deferred_relation_ingest.processed", reflection)
         return reflection
+
+    def _after_deferred_relation_commit(
+        self,
+        frame: CognitiveFrame,
+        job: DeferredRelationIngest,
+    ) -> None:
+        try:
+            self.hawkes.observe(str(frame.intent or "unknown"))
+        except Exception:
+            logger.exception("_after_deferred_relation_commit: hawkes observe failed")
+
+        self._observe_frame_concepts(frame)
+        self._remember_declarative_binding(frame, job.utterance)
 
     def consolidate_once(self) -> list[dict]:
         out = self.memory.consolidate_claims_once()
@@ -3598,25 +3620,8 @@ class SubstrateController:
         if self._background_worker is not None:
             self._background_worker.mark_user_active()
 
-        for concept in (out.subject, out.answer):
-            if isinstance(concept, str) and concept and concept != "unknown":
-                self.ontology.observe(concept)
-                base = stable_sketch(concept, dim=SKETCH_DIM)
-                self.ontology.maybe_promote(concept, base)
-
-        if out.subject and out.answer and out.intent in {"memory_write", "memory_lookup"}:
-            try:
-                pr_bind = str((out.evidence or {}).get("predicate", out.intent))
-                self.vsa.encode_triple(out.subject, pr_bind, out.answer)
-                ut_sk = stable_sketch(utterance[:512])
-                trip_sk = stable_sketch(f"{out.subject}|{pr_bind}|{out.answer}")
-                self.remember_hopfield(
-                    ut_sk,
-                    trip_sk,
-                    metadata={"kind": "declarative_binding", "intent": out.intent},
-                )
-            except Exception:
-                logger.exception("_after_frame_commit: vsa/hopfield binding failed")
+        self._observe_frame_concepts(out)
+        self._remember_declarative_binding(out, utterance)
 
         logger.debug(
             "_after_frame_commit: intent=%s confidence=%s journal_id=%s",
@@ -3645,6 +3650,28 @@ class SubstrateController:
             self.event_bus.publish(event_topic, payload)
         except Exception:
             logger.exception("_after_frame_commit: event publish failed")
+
+    def _observe_frame_concepts(self, out: CognitiveFrame) -> None:
+        for concept in (out.subject, out.answer):
+            if isinstance(concept, str) and concept and concept != "unknown":
+                self.ontology.observe(concept)
+                base = stable_sketch(concept, dim=SKETCH_DIM)
+                self.ontology.maybe_promote(concept, base)
+
+    def _remember_declarative_binding(self, out: CognitiveFrame, utterance: str) -> None:
+        if out.subject and out.answer and out.intent in {"memory_write", "memory_lookup"}:
+            try:
+                pr_bind = str((out.evidence or {}).get("predicate", out.intent))
+                self.vsa.encode_triple(out.subject, pr_bind, out.answer)
+                ut_sk = stable_sketch(utterance[:512])
+                trip_sk = stable_sketch(f"{out.subject}|{pr_bind}|{out.answer}")
+                self.remember_hopfield(
+                    ut_sk,
+                    trip_sk,
+                    metadata={"kind": "declarative_binding", "intent": out.intent},
+                )
+            except Exception:
+                logger.exception("_after_frame_commit: vsa/hopfield binding failed")
 
     def _frame_from_observation(self, observation: CognitiveObservation) -> CognitiveFrame:
         """Convert a strict multimodal observation to a workspace frame."""
@@ -3904,7 +3931,11 @@ class SubstrateController:
         )
         if attach:
             try:
-                self.tool_registry.attach_to_scm(self.scm, on_tool_drift=self._handle_native_tool_drift)
+                self.tool_registry.attach_to_scm(
+                    self.scm,
+                    topology_lock=self._cognitive_state_lock,
+                    on_tool_drift=self._handle_native_tool_drift,
+                )
             except Exception:
                 logger.exception("SubstrateController.synthesize_native_tool: SCM re-attach failed")
         # Rebuild the tool foraging agent so its likelihoods reflect the new tool count.
@@ -3917,7 +3948,11 @@ class SubstrateController:
     def attach_tools_to_scm(self) -> int:
         """Re-attach every persisted native tool onto :attr:`scm`. Returns the count attached."""
 
-        return self.tool_registry.attach_to_scm(self.scm, on_tool_drift=self._handle_native_tool_drift)
+        return self.tool_registry.attach_to_scm(
+            self.scm,
+            topology_lock=self._cognitive_state_lock,
+            on_tool_drift=self._handle_native_tool_drift,
+        )
 
     def should_synthesize_tool(self) -> bool:
         """Run the tool foraging agent against the current substrate state.
@@ -4179,10 +4214,9 @@ class SubstrateController:
 
     def comprehend(self, utterance: str) -> CognitiveFrame:
         toks = utterance_words(utterance)
+        intent, affect = self._perceive_utterance(utterance)
         with self._cognitive_state_lock:
             self._intrinsic_scan(toks)
-            intent = self.intent_gate.classify(utterance)
-            affect = self.affect_encoder.detect(utterance)
             self._last_intent = intent
             self._last_affect = affect
             if not intent.is_actionable:
@@ -4209,6 +4243,12 @@ class SubstrateController:
             )
         self._after_frame_commit(out, utterance, event_topic="frame.comprehend")
         return out
+
+    def _perceive_utterance(self, utterance: str) -> tuple[UtteranceIntent, AffectState]:
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            intent_future = executor.submit(self.intent_gate.classify, utterance)
+            affect_future = executor.submit(self.affect_encoder.detect, utterance)
+            return intent_future.result(), affect_future.result()
 
     def _commit_frame(self, utterance: str, toks: Sequence[str], frame: CognitiveFrame) -> CognitiveFrame:
         commit_ts = time.time()

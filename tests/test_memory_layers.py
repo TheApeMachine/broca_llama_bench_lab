@@ -57,6 +57,12 @@ def _symbol(prefix: str) -> str:
     return f"{prefix}_{uuid.uuid4().hex[:10]}"
 
 
+def _process_deferred(mind):
+    reflections = mind.process_deferred_relation_ingest()
+    assert reflections, "expected queued deferred relation ingest"
+    return reflections[-1]
+
+
 def test_episode_association_graph_persistent(tmp_path: Path):
     db = tmp_path / "m.sqlite"
     g = EpisodeAssociationGraph(db)
@@ -73,6 +79,7 @@ def test_workspace_journal_fetch_roundtrip(tmp_path: Path, llama_broca_loaded: N
     mind = build_substrate_controller(seed=0, db_path=tmp_path / "b.sqlite", namespace="x", device="cpu", hf_token=False)
     stub_substrate_encoders(mind)
     mind.answer(f"{subject} is in {obj} .")
+    _process_deferred(mind)
     mind.answer(f"where is {subject} ?")
     row = mind.journal.fetch(2)
     assert row is not None
@@ -119,8 +126,10 @@ def test_runtime_mind_starts_empty_and_learns_observed_location(tmp_path: Path, 
     assert mind.comprehend(f"where is {subject} ?").intent == "unknown"
 
     learned = mind.comprehend(f"{subject} is in {obj} .")
-    assert learned.intent == "memory_write"
-    pred = learned.evidence["predicate"]
+    assert learned.intent == "memory_ingest_pending"
+    reflection = _process_deferred(mind)
+    assert reflection["status"] == "memory_write"
+    pred = reflection["evidence"]["predicate"]
     assert mind.memory.count() == 1
     assert mind.comprehend(f"where is {subject} ?").answer == obj
 
@@ -128,15 +137,16 @@ def test_runtime_mind_starts_empty_and_learns_observed_location(tmp_path: Path, 
     stub_substrate_encoders(restarted)
     assert restarted.memory.count() == 1
     assert restarted.comprehend(f"where is {subject} ?").answer == obj
-    assert pred == learned.evidence["predicate"]
+    assert restarted.memory.get(subject, pred) is not None
 
 
 def test_runtime_mind_stores_observed_location_while_background_worker_running(tmp_path: Path, fake_host_loader):
     class RunningBackgroundWorker:
         running = True
+        notified = False
 
         def notify_work(self):
-            raise AssertionError("synchronous claim extraction should not enqueue deferred ingest")
+            self.notified = True
 
         def mark_user_active(self):
             pass
@@ -152,9 +162,13 @@ def test_runtime_mind_stores_observed_location_while_background_worker_running(t
 
     learned = mind.comprehend(f"{subject} is in {obj} .")
 
-    assert learned.intent == "memory_write"
-    assert learned.answer == obj
-    assert learned.evidence.get("deferred_relation_ingest") is None
+    assert learned.intent == "memory_ingest_pending"
+    assert learned.evidence.get("deferred_relation_ingest") is True
+    assert mind.memory.count() == 0
+    assert mind._background_worker.notified is True
+    reflection = _process_deferred(mind)
+    assert reflection["status"] == "memory_write"
+    assert reflection["answer"] == obj
     assert mind.memory.count() == 1
 
 
@@ -177,14 +191,16 @@ def test_observed_contradiction_records_counterfactual_without_overwrite(tmp_pat
     challenger = _symbol("object")
 
     mind.comprehend(f"{subject} is in {current} .")
-    conflict = mind.comprehend(f"{subject} is in {challenger} .")
+    _process_deferred(mind)
+    mind.comprehend(f"{subject} is in {challenger} .")
+    conflict = _process_deferred(mind)
 
-    assert conflict.intent == "memory_conflict"
-    assert conflict.answer == current
-    assert conflict.evidence["claimed_answer"] == challenger
-    assert conflict.evidence["counterfactual"]["would_change_answer_to"] == challenger
+    assert conflict["status"] == "memory_conflict"
+    assert conflict["answer"] == current
+    assert conflict["evidence"]["claimed_answer"] == challenger
+    assert conflict["evidence"]["counterfactual"]["would_change_answer_to"] == challenger
     assert mind.comprehend(f"where is {subject} ?").answer == current
-    statuses = [c["status"] for c in mind.memory.claims(subject, conflict.evidence["predicate"])]
+    statuses = [c["status"] for c in mind.memory.claims(subject, conflict["evidence"]["predicate"])]
     assert statuses == ["accepted", "conflict"]
 
 
@@ -197,11 +213,14 @@ def test_background_consolidation_revises_after_repeated_counterevidence(tmp_pat
     challenger = _symbol("object")
 
     mind.comprehend(f"{subject} is in {current} .")
+    _process_deferred(mind)
     mind.comprehend(f"{subject} is in {challenger} .")
+    _process_deferred(mind)
     assert mind.consolidate_once()[0]["kind"] == "belief_conflict"
     assert mind.comprehend(f"where is {subject} ?").answer == current
 
     mind.comprehend(f"{subject} is in {challenger} .")
+    _process_deferred(mind)
     reflections = mind.consolidate_once()
 
     assert any(r["kind"] == "belief_revision" for r in reflections)

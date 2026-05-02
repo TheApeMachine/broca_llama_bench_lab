@@ -2,10 +2,10 @@
 
 The original failure mode, end to end:
 
-  User says "Tell me a joke" → ``LLMRelationExtractor`` parses it as the
-  triple ``(me, tell, joke)`` → ``CognitiveRouter`` picks ``semantic_claim``
-  (score 1.45 above the 0.28 floor) → graft activates with bias_tokens=7,
-  confidence=0.92 → the LLM produces "memory write me tell joke".
+  User says "Tell me a joke" → relation extraction parses it as the triple
+  ``(me, tell, joke)`` → ``CognitiveRouter`` picks a memory write candidate
+  above the relevance floor → graft activates with confidence=0.92 → the LLM
+  produces "memory write me tell joke".
 
 This test asserts the new behavior, end to end:
 
@@ -288,18 +288,14 @@ class TestStatementsStillFlowThrough:
             affect=AffectState(dominant_emotion="neutral", dominant_score=0.6),
         )
         frame = mind.comprehend("Ada lives in Rome")
-        # The router decided this is a memory_write (or similar storable
-        # outcome). The exact intent string can vary depending on whether the
-        # router uses memory_write vs memory_conflict; what matters is that
-        # the frame is *not* unknown and a derived strength is non-zero.
-        assert frame.intent != "unknown"
-        assert frame.confidence > 0.0
-        assert mind._derived_target_snr_scale(frame) > 0.0
+        assert frame.intent == "memory_ingest_pending"
+        assert frame.evidence["deferred_relation_ingest"] is True
+        assert mind.deferred_relation_ingest_count() == 1
 
     def test_statement_writes_to_memory(self, tmp_path: Path, fake_host_loader):
         fake_host_loader()
         mind = _build_mind(tmp_path)
-        _wire_stubs(
+        stub = _wire_stubs(
             mind,
             intent_responses={"ada lives in rome": [("statement", 0.93)]},
             relation_responses={
@@ -309,11 +305,16 @@ class TestStatementsStillFlowThrough:
             },
         )
         before = mind.memory.count()
-        mind.comprehend("Ada lives in Rome")
-        after = mind.memory.count()
-        assert after > before, "statement must reach semantic memory"
+        frame = mind.comprehend("Ada lives in Rome")
+        assert frame.intent == "memory_ingest_pending"
+        assert stub.relation_calls == []
+        assert mind.memory.count() == before
+        reflections = mind.process_deferred_relation_ingest()
+        assert reflections[0]["status"] == "memory_write"
+        assert mind.memory.count() > before, "DMN ingest must reach semantic memory"
+        assert stub.relation_calls == ["Ada lives in Rome"]
 
-    def test_statement_relation_extraction_stays_synchronous_when_dmn_online(self, tmp_path: Path, fake_host_loader):
+    def test_statement_relation_extraction_is_deferred_when_dmn_online(self, tmp_path: Path, fake_host_loader):
         fake_host_loader()
         mind = _build_mind(tmp_path)
         stub = _wire_stubs(
@@ -330,11 +331,11 @@ class TestStatementsStillFlowThrough:
 
         frame = mind.comprehend("Ada lives in Rome")
 
-        assert frame.intent == "memory_write"
-        assert stub.relation_calls == ["Ada lives in Rome"]
-        assert mind.memory.count() == 1
-        assert mind.deferred_relation_ingest_count() == 0
-        assert worker.notified is False
+        assert frame.intent == "memory_ingest_pending"
+        assert stub.relation_calls == []
+        assert mind.memory.count() == 0
+        assert mind.deferred_relation_ingest_count() == 1
+        assert worker.notified is True
         assert worker.marked_active is True
 
 

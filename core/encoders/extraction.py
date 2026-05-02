@@ -340,9 +340,26 @@ class ExtractionEncoder(BaseEncoder):
         if isinstance(raw, dict):
             primary = raw.get(IDENTITY_CLAIM_KEY)
             if isinstance(primary, list):
+                malformed = [repr(r) for r in primary if not isinstance(r, dict)]
+                if malformed:
+                    logger.warning(
+                        "ExtractionEncoder.identity: malformed identity records ignored: %s",
+                        malformed[:3],
+                    )
                 records.extend(r for r in primary if isinstance(r, dict))
             elif isinstance(primary, dict) and primary:
                 records.append(primary)
+            elif primary is not None:
+                logger.warning(
+                    "ExtractionEncoder.identity: expected %r to be dict or list[dict], got %s",
+                    IDENTITY_CLAIM_KEY,
+                    type(primary).__name__,
+                )
+        else:
+            logger.warning(
+                "ExtractionEncoder.identity: expected raw dict, got %s",
+                type(raw).__name__,
+            )
 
         relations: list[ExtractedRelation] = []
         for item in records:

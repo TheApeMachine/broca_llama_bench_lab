@@ -179,6 +179,10 @@ def test_perceive_audio_routes_transcription_into_language_memory(
     assert frame.intent == "perception_audio"
     assert frame.answer == "ada is in rome ."
     assert mind.journal.count() == 2
+    assert len(mind.hopfield_memory) == 1
+
+    reflections = mind.process_deferred_relation_ingest()
+    assert reflections[0]["status"] == "memory_write"
     assert len(mind.hopfield_memory) == 2
 
     rec = mind.memory.get("ada", "is_in")

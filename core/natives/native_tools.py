@@ -468,6 +468,7 @@ class NativeToolRegistry:
         self.namespace = str(namespace)
         self.sandbox = sandbox if sandbox is not None else tool_sandbox_from_env()
         self._db_lock = threading.RLock()
+        self._scm_topology_lock = threading.RLock()
         self._conn: sqlite3.Connection | None = None
         self._init_schema()
 
@@ -799,6 +800,7 @@ class NativeToolRegistry:
         *,
         allow_unknown_parents: bool = True,
         strict_tool_wrappers: bool = False,
+        topology_lock: Any | None = None,
         on_tool_drift: Callable[[NativeTool, Mapping[str, Any]], None] | None = None,
     ) -> int:
         """Register every verified tool as an endogenous equation on ``scm``.
@@ -816,70 +818,76 @@ class NativeToolRegistry:
         if not isinstance(scm, FiniteSCM):
             raise TypeError("attach_to_scm: scm must be a FiniteSCM")
 
+        lock = topology_lock if topology_lock is not None else self._scm_topology_lock
         attached = 0
-        for tool in self.all_tools(rehydrate=True):
-            if not tool.verified or tool.fn is None:
-                continue
-            if tool.name in scm.equations:
-                scm.update_endogenous(
+        tools = self.all_tools(rehydrate=True)
+        with lock:
+            for tool in tools:
+                if not tool.verified or tool.fn is None:
+                    continue
+                if tool.name in scm.equations:
+                    scm.update_endogenous(
+                        tool.name,
+                        fn=self._wrap_for_scm(
+                            tool,
+                            scm=scm,
+                            registry=self,
+                            strict=strict_tool_wrappers,
+                            topology_lock=lock,
+                            on_tool_drift=on_tool_drift,
+                        ),
+                        domain=list(tool.domain),
+                        parents=tuple(tool.parents),
+                    )
+                    attached += 1
+                    continue
+
+                missing = [p for p in tool.parents if p not in scm.domains]
+                if missing and not allow_unknown_parents:
+                    logger.debug(
+                        "NativeToolRegistry.attach_to_scm: skipping %s; missing parents=%s",
+                        tool.name,
+                        missing,
+                    )
+                    continue
+                for p in missing:
+                    # Declare the missing parent as endogenous so Pearl-style do(p=v)
+                    # interventions actually rewrite its structural equation. Each
+                    # endogenous parent is a pass-through of its own dedicated
+                    # exogenous noise variable, so the auto-declaration looks just
+                    # like an ordinary binary variable from the SCM's perspective.
+                    noise = f"U_{p}"
+                    if noise not in scm.exogenous:
+                        scm.add_exogenous(noise, [0, 1], {0: 0.5, 1: 0.5})
+                    if p not in scm.equations:
+                        passthrough = (lambda noise=noise: lambda v: v[noise])()
+                        scm.add_endogenous(p, [0, 1], [noise], passthrough)
+                    logger.debug(
+                        "NativeToolRegistry.attach_to_scm: auto-declared endogenous parent %s for %s (noise=%s)",
+                        p,
+                        tool.name,
+                        noise,
+                    )
+                scm.add_endogenous(
                     tool.name,
-                    fn=self._wrap_for_scm(
+                    list(tool.domain),
+                    list(tool.parents),
+                    self._wrap_for_scm(
                         tool,
                         scm=scm,
                         registry=self,
                         strict=strict_tool_wrappers,
+                        topology_lock=lock,
                         on_tool_drift=on_tool_drift,
                     ),
-                    domain=list(tool.domain),
-                    parents=tuple(tool.parents),
                 )
                 attached += 1
-                continue
-
-            missing = [p for p in tool.parents if p not in scm.domains]
-            if missing and not allow_unknown_parents:
-                logger.debug(
-                    "NativeToolRegistry.attach_to_scm: skipping %s; missing parents=%s",
+                logger.info(
+                    "NativeToolRegistry.attach_to_scm: attached %s parents=%s domain=%s",
                     tool.name,
-                    missing,
+                    list(tool.parents),
+                    list(tool.domain),
                 )
-                continue
-            for p in missing:
-                # Declare the missing parent as endogenous so Pearl-style do(p=v)
-                # interventions actually rewrite its structural equation. Each
-                # endogenous parent is a pass-through of its own dedicated
-                # exogenous noise variable, so the auto-declaration looks just
-                # like an ordinary binary variable from the SCM's perspective.
-                noise = f"U_{p}"
-                if noise not in scm.exogenous:
-                    scm.add_exogenous(noise, [0, 1], {0: 0.5, 1: 0.5})
-                if p not in scm.equations:
-                    scm.add_endogenous(p, [0, 1], [noise], (lambda noise=noise: lambda v: v[noise])())
-                logger.debug(
-                    "NativeToolRegistry.attach_to_scm: auto-declared endogenous parent %s for %s (noise=%s)",
-                    p,
-                    tool.name,
-                    noise,
-                )
-            scm.add_endogenous(
-                tool.name,
-                list(tool.domain),
-                list(tool.parents),
-                self._wrap_for_scm(
-                    tool,
-                    scm=scm,
-                    registry=self,
-                    strict=strict_tool_wrappers,
-                    on_tool_drift=on_tool_drift,
-                ),
-            )
-            attached += 1
-            logger.info(
-                "NativeToolRegistry.attach_to_scm: attached %s parents=%s domain=%s",
-                tool.name,
-                list(tool.parents),
-                list(tool.domain),
-            )
         return attached
 
     @staticmethod
@@ -888,6 +896,7 @@ class NativeToolRegistry:
         *,
         scm,
         registry: "NativeToolRegistry",
+        topology_lock: Any,
         strict: bool = False,
         on_tool_drift: Callable[[NativeTool, Mapping[str, Any]], None] | None = None,
     ) -> Callable[[dict], Any]:
@@ -915,13 +924,14 @@ class NativeToolRegistry:
                 "verifier_distribution": dict(verifier_distribution),
                 **dict(evidence),
             }
-            try:
-                scm.detach_endogenous_as_exogenous(name)
-            except ValueError:
-                logger.debug("NativeTool %s already detached from SCM", name)
-            registry.mark_unverified(name, reason=reason, evidence=payload)
-            if on_tool_drift is not None:
-                on_tool_drift(tool, payload)
+            with topology_lock:
+                try:
+                    scm.detach_endogenous_as_exogenous(name)
+                except ValueError:
+                    logger.debug("NativeTool %s already detached from SCM", name)
+                registry.mark_unverified(name, reason=reason, evidence=payload)
+                if on_tool_drift is not None:
+                    on_tool_drift(tool, payload)
 
         def _wrapped(values: dict) -> Any:
             try:
