@@ -7,6 +7,10 @@
 
 ---
 
+![Inforgraphic of MOSAIC architecture](inforgraphic.jpg)
+
+---
+
 ## The thesis
 
 Today's LLMs are extraordinary surface-form generators trapped inside an
