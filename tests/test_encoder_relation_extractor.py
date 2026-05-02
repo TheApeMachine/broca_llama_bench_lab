@@ -1,4 +1,4 @@
-"""Tests for the organ-backed relation extractor.
+"""Tests for the encoder-backed relation extractor.
 
 The extractor sits inside :class:`CognitiveRouter` and decides whether the
 substrate writes a triple to memory. The original failure mode — the LLM
@@ -7,7 +7,7 @@ at confidence 0.92 — must be impossible by *construction*: the intent gate
 short-circuits non-storable utterances before the extractor ever asks
 GLiNER for a relation.
 
-These tests use stubs for the intent gate and extraction organ so the
+These tests use stubs for the intent gate and extraction encoder so the
 extractor's *policy* is what is under test, not GLiNER's accuracy.
 """
 
@@ -18,11 +18,11 @@ from typing import Sequence
 import pytest
 
 from core.cognition.intent_gate import IntentGate
-from core.cognition.organ_relation_extractor import OrganRelationExtractor
-from core.organs.extraction import ExtractedRelation
+from core.cognition.encoder_relation_extractor import EncoderRelationExtractor
+from core.encoders.extraction import ExtractedRelation
 
 
-class StubExtractionOrgan:
+class StubExtractionEncoder:
     """Stub that returns canned entities/relations and intent classifications."""
 
     def __init__(
@@ -69,21 +69,21 @@ def _build(
     *,
     intent_responses: dict[str, list[tuple[str, float]]] | None = None,
     relation_responses: dict[str, list[ExtractedRelation]] | None = None,
-) -> tuple[OrganRelationExtractor, StubExtractionOrgan]:
-    organ = StubExtractionOrgan(
+) -> tuple[EncoderRelationExtractor, StubExtractionEncoder]:
+    extraction = StubExtractionEncoder(
         intent_responses=intent_responses,
         relation_responses=relation_responses,
     )
-    gate = IntentGate(organ)
-    extractor = OrganRelationExtractor(intent_gate=gate, organ=organ)
-    return extractor, organ
+    gate = IntentGate(extraction)
+    extractor = EncoderRelationExtractor(intent_gate=gate, extraction=extraction)
+    return extractor, extraction
 
 
 class TestNonActionableUtterancesNeverProduceClaims:
     """The original bug: requests stored as triples. Must be impossible now."""
 
     def test_request_returns_none(self):
-        ext, organ = _build(
+        ext, extraction = _build(
             intent_responses={
                 "tell me a joke": [("request", 0.95), ("statement", 0.03)],
             },
@@ -102,27 +102,27 @@ class TestNonActionableUtterancesNeverProduceClaims:
         assert result is None
         # And the relation extractor must NEVER have been called: the gate
         # must short-circuit *before* GLiNER is consulted.
-        assert organ.relation_calls == []
+        assert extraction.relation_calls == []
 
     def test_greeting_returns_none_and_does_not_invoke_extractor(self):
-        ext, organ = _build(
+        ext, extraction = _build(
             intent_responses={"hi": [("greeting", 0.9), ("statement", 0.05)]},
             relation_responses={"hi": []},
         )
         result = ext.extract_claim("Hi", ["hi"])
         assert result is None
-        assert organ.relation_calls == []
+        assert extraction.relation_calls == []
 
     def test_question_returns_none(self):
-        ext, organ = _build(
+        ext, extraction = _build(
             intent_responses={"where is ada": [("question", 0.93), ("statement", 0.05)]},
         )
         result = ext.extract_claim("Where is Ada?", ["where", "is", "ada", "?"])
         assert result is None
-        assert organ.relation_calls == []
+        assert extraction.relation_calls == []
 
     def test_command_returns_none(self):
-        ext, _organ = _build(
+        ext, _extraction = _build(
             intent_responses={
                 "stop talking": [("command", 0.88), ("request", 0.10), ("statement", 0.02)],
             },
@@ -133,7 +133,7 @@ class TestNonActionableUtterancesNeverProduceClaims:
 
 class TestStatementsProduceClaims:
     def test_statement_with_relation_yields_claim(self):
-        ext, organ = _build(
+        ext, extraction = _build(
             intent_responses={
                 "ada lives in rome": [("statement", 0.93), ("question", 0.04)],
             },
@@ -155,12 +155,12 @@ class TestStatementsProduceClaims:
         assert claim.subject == "ada"
         assert claim.predicate == "lives_in"
         assert claim.obj == "rome"
-        assert organ.relation_calls == ["Ada lives in Rome"]
+        assert extraction.relation_calls == ["Ada lives in Rome"]
 
     def test_statement_with_no_relation_returns_none(self):
         """If GLiNER finds no relation, the substrate honestly stores nothing."""
 
-        ext, organ = _build(
+        ext, extraction = _build(
             intent_responses={"hello world": [("statement", 0.6), ("greeting", 0.3)]},
             relation_responses={"hello world": []},
         )
@@ -168,14 +168,14 @@ class TestStatementsProduceClaims:
         assert result is None
         # The extractor *was* called — the gate let this through, but no
         # relation was found, so no triple is fabricated.
-        assert organ.relation_calls == ["Hello world"]
+        assert extraction.relation_calls == ["Hello world"]
 
 
 class TestClaimConfidenceComposesIntentAndExtractor:
     """Both the intent gate and GLiNER must vouch for the claim."""
 
     def test_confidence_is_intent_times_extractor(self):
-        ext, _organ = _build(
+        ext, _extraction = _build(
             intent_responses={"ada lives in rome": [("statement", 0.8)]},
             relation_responses={
                 "ada lives in rome": [
@@ -193,7 +193,7 @@ class TestClaimConfidenceComposesIntentAndExtractor:
         assert claim.confidence == pytest.approx(0.8 * 0.5, rel=1e-6)
 
     def test_low_intent_confidence_drags_claim_confidence_down(self):
-        ext, _organ = _build(
+        ext, _extraction = _build(
             intent_responses={"ada lives in rome": [("statement", 0.4)]},
             relation_responses={
                 "ada lives in rome": [
@@ -210,7 +210,7 @@ class TestEvidenceIncludesIntentTrace:
     """The frame must record which gate decision unlocked the claim."""
 
     def test_evidence_records_intent_label_and_scores(self):
-        ext, _organ = _build(
+        ext, _extraction = _build(
             intent_responses={
                 "ada lives in rome": [
                     ("statement", 0.88), ("question", 0.07), ("request", 0.05)
@@ -228,10 +228,10 @@ class TestEvidenceIncludesIntentTrace:
         assert ev["intent_label"] == "statement"
         assert ev["intent_confidence"] == pytest.approx(0.88, rel=1e-6)
         assert "intent_scores" in ev
-        assert ev["parser"] == "organ_relation_extractor"
+        assert ev["parser"] == "encoder_relation_extractor"
 
     def test_alternative_relations_recorded(self):
-        ext, _organ = _build(
+        ext, _extraction = _build(
             intent_responses={"alpha is beta": [("statement", 0.9)]},
             relation_responses={
                 "alpha is beta": [
@@ -251,7 +251,7 @@ class TestEvidenceIncludesIntentTrace:
     def test_prefilled_intent_skips_second_classify(self):
         """Router passes comprehend's UtteranceIntent so GLiNER classifies intent once."""
 
-        ext, organ = _build(
+        ext, extraction = _build(
             intent_responses={"ada lives in rome": [("statement", 0.93)]},
             relation_responses={
                 "ada lives in rome": [
@@ -259,14 +259,14 @@ class TestEvidenceIncludesIntentTrace:
                 ],
             },
         )
-        gate = IntentGate(organ)
+        gate = IntentGate(extraction)
         cached = gate.classify("Ada lives in Rome")
-        organ.classify_calls.clear()
+        extraction.classify_calls.clear()
         claim = ext.extract_claim(
             "Ada lives in Rome",
             ["ada", "lives", "in", "rome"],
             utterance_intent=cached,
         )
         assert claim is not None
-        assert organ.classify_calls == [], "passed UtteranceIntent must not invoke organ.classify again"
-        assert organ.relation_calls == ["Ada lives in Rome"]
+        assert extraction.classify_calls == [], "passed UtteranceIntent must not invoke extraction.classify again"
+        assert extraction.relation_calls == ["Ada lives in Rome"]

@@ -1,4 +1,4 @@
-"""Organ-backed relation extractor that respects the intent gate.
+"""Encoder-backed relation extractor that respects the intent gate.
 
 Replaces :class:`LLMRelationExtractor` (few-shot SVO via the host LLM, which
 happily turned imperatives like "Tell me a joke" into the triple
@@ -8,7 +8,7 @@ happily turned imperatives like "Tell me a joke" into the triple
      — request, command, greeting, feedback, question — the extractor
      immediately returns ``None``. The router will fall through to other
      faculties (active inference, causal effect) without inventing a fact.
-  2. For storable utterances, :class:`ExtractionOrgan` produces zero or more
+  2. For storable utterances, :class:`ExtractionEncoder` produces zero or more
      ``ExtractedRelation`` triples. The highest-confidence triple becomes a
      :class:`ParsedClaim`; ties are broken by score, then by the order
      GLiNER returned them.
@@ -23,7 +23,7 @@ from __future__ import annotations
 import logging
 from typing import Any, Sequence
 
-from ..organs.extraction import ExtractionOrgan, ExtractedRelation
+from ..encoders.extraction import ExtractionEncoder, ExtractedRelation
 from ..system.event_bus import get_default_bus
 from .intent_gate import IntentGate, UtteranceIntent
 
@@ -37,18 +37,18 @@ def _publish(topic: str, payload: dict) -> None:
         pass
 
 
-class OrganRelationExtractor:
-    """Implements the :class:`RelationExtractor` protocol via organs.
+class EncoderRelationExtractor:
+    """Implements the :class:`RelationExtractor` protocol via GLiNER extraction.
 
     The class is intentionally small: composition over inheritance, no host
     LLM, no caching beyond what GLiNER does internally. Construction takes a
-    pre-built :class:`IntentGate` and :class:`ExtractionOrgan` because both
+    pre-built :class:`IntentGate` and :class:`ExtractionEncoder` because both
     are shared with other substrate paths (affect, comprehend()).
     """
 
-    def __init__(self, *, intent_gate: IntentGate, organ: ExtractionOrgan):
+    def __init__(self, *, intent_gate: IntentGate, extraction: ExtractionEncoder):
         self._intent_gate = intent_gate
-        self._organ = organ
+        self._extraction = extraction
 
     def extract_claim(
         self,
@@ -69,7 +69,7 @@ class OrganRelationExtractor:
         intent = utterance_intent if utterance_intent is not None else self._intent_gate.classify(text)
         if not intent.allows_storage:
             logger.debug(
-                "OrganRelationExtractor: gated out utterance=%r label=%s conf=%.3f",
+                "EncoderRelationExtractor: gated out utterance=%r label=%s conf=%.3f",
                 text[:160],
                 intent.label,
                 intent.confidence,
@@ -84,10 +84,10 @@ class OrganRelationExtractor:
                 },
             )
             return None
-        relations = self._organ.extract_relations(text)
+        relations = self._extraction.extract_relations(text)
         if not relations:
             logger.debug(
-                "OrganRelationExtractor: no relations utterance=%r intent=%s",
+                "EncoderRelationExtractor: no relations utterance=%r intent=%s",
                 text[:160],
                 intent.label,
             )
@@ -148,7 +148,7 @@ class OrganRelationExtractor:
         toks: Sequence[str],
     ) -> dict[str, Any]:
         return {
-            "parser": "organ_relation_extractor",
+            "parser": "encoder_relation_extractor",
             "predicate_surface": best.predicate,
             "source_words": list(toks),
             "utterance": utterance,

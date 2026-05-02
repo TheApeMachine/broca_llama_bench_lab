@@ -96,8 +96,8 @@ from ..natives.native_tools import NativeTool, NativeToolRegistry, ToolSandbox, 
 from ..grafting.dynamic_grafts import DynamicGraftSynthesizer, CapturedActivationMode, ACTIVATION_MODE_KIND
 from ..system.event_bus import EventBus, get_default_bus
 from ..memory import SQLiteActivationMemory
-from ..organs.extraction import ExtractionOrgan
-from ..organs.affect import AffectOrgan, AffectState
+from ..encoders.extraction import ExtractionEncoder
+from ..encoders.affect import AffectEncoder, AffectState
 
 from .constants import (
     DEFAULT_CHAT_MODEL_ID,
@@ -106,7 +106,7 @@ from .constants import (
     BELIEF_REVISION_MIN_CLAIMS,
 )
 from .intent_gate import IntentGate, UtteranceIntent
-from .organ_relation_extractor import OrganRelationExtractor
+from .encoder_relation_extractor import EncoderRelationExtractor
 from .derived_strength import DerivedStrength, StrengthInputs
 from .multimodal_perception import MultimodalPerceptionPipeline
 from .observation import CognitiveObservation
@@ -218,7 +218,7 @@ class RelationExtractor:
 
     When ``utterance_intent`` is supplied (same value as ``comprehend`` already
     computed), implementations must **not** re-run intent classification —
-    avoids duplicate organ cost and contradictory labels.
+    avoids duplicate encoder compute and contradictory labels.
     """
 
     def extract_claim(  # pragma: no cover - protocol
@@ -2997,26 +2997,26 @@ class SubstrateController:
         self.host.add_graft("final_hidden", self.feature_graft)
         self.logit_bias_graft = SubstrateLogitBiasGraft()
         self.host.add_graft("logits", self.logit_bias_graft)
-        organ_device = (
+        encoder_device = (
             host_param.device
             if host_param is not None
             else device
             if isinstance(device, torch.device)
             else pick_torch_device(device)
         )
-        self.multimodal_perception = MultimodalPerceptionPipeline(device=organ_device)
+        self.multimodal_perception = MultimodalPerceptionPipeline(device=encoder_device)
         self.workspace = GlobalWorkspace()
-        self.extraction_organ = ExtractionOrgan()
-        self.affect_organ = AffectOrgan()
+        self.extraction_encoder = ExtractionEncoder()
+        self.affect_encoder = AffectEncoder()
         self.affect_trace = PersistentAffectTrace(rp, namespace=f"{namespace}__affect")
-        self.intent_gate = IntentGate(self.extraction_organ)
+        self.intent_gate = IntentGate(self.extraction_encoder)
         self._last_intent: UtteranceIntent | None = None
         self._last_affect: AffectState | None = None
         self._last_user_affect_trace_id: int | None = None
         self.router = CognitiveRouter(
-            extractor=OrganRelationExtractor(
+            extractor=EncoderRelationExtractor(
                 intent_gate=self.intent_gate,
-                organ=self.extraction_organ,
+                extraction=self.extraction_encoder,
             )
         )
         self.pomdp = build_tiger_pomdp()
@@ -3270,10 +3270,10 @@ class SubstrateController:
             snap["substrate"] = {"error": True}
 
         try:
-            snap["organs"] = self.multimodal_perception.stats()
+            snap["encoders"] = self.multimodal_perception.stats()
         except Exception:
-            logger.exception("snapshot.organs failed")
-            snap["organs"] = {"error": True}
+            logger.exception("snapshot.encoders failed")
+            snap["encoders"] = {"error": True}
 
         try:
             snap["affect"] = self.affect_trace.summary()
@@ -3498,14 +3498,14 @@ class SubstrateController:
         return out
 
     def perceive_image(self, image: Any, *, source: str = "image") -> CognitiveFrame:
-        """Run the visual organs and commit their fused observation."""
+        """Run the vision encoders and commit their fused observation."""
 
         return self._commit_observation(
             self.multimodal_perception.perceive_image(image, source=source)
         )
 
     def perceive_video(self, frames: Any, *, source: str = "video") -> CognitiveFrame:
-        """Run temporal + visual organs and commit their fused observation."""
+        """Run temporal + vision encoders and commit their fused observation."""
 
         return self._commit_observation(
             self.multimodal_perception.perceive_video(frames, source=source)
@@ -3519,7 +3519,7 @@ class SubstrateController:
         source: str = "audio",
         language: str | None = None,
     ) -> CognitiveFrame:
-        """Run Whisper/ImageBind audio organs, then route transcripts through language memory."""
+        """Run Whisper/ImageBind audio encoders, then route transcripts through language memory."""
 
         observation = self.multimodal_perception.perceive_audio(
             audio,
@@ -3955,7 +3955,7 @@ class SubstrateController:
         with self._cognitive_state_lock:
             self._intrinsic_scan(toks)
             intent = self.intent_gate.classify(utterance)
-            affect = self.affect_organ.detect(utterance)
+            affect = self.affect_encoder.detect(utterance)
             self._last_intent = intent
             self._last_affect = affect
             if not intent.is_actionable:
@@ -4121,7 +4121,7 @@ class SubstrateController:
             substrate_confidence=confidence,
             substrate_target_snr_scale=float(derived_scale),
         )
-        assistant_affect = self.affect_organ.detect(text)
+        assistant_affect = self.affect_encoder.detect(text)
         if self._last_affect is None:
             raise RuntimeError("chat_reply cannot align affect before user affect has been recorded")
         affect_alignment = self.affect_trace.alignment(self._last_affect, assistant_affect)

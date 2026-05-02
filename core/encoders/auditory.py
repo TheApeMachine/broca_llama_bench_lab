@@ -1,14 +1,13 @@
-"""Auditory organ: frozen Whisper encoder for speech and audio perception.
+"""Auditory encoder: frozen Whisper encoder for speech and audio perception.
 
-Brain analogy: Auditory cortex (primary A1 + association areas).
-Processes audio input into rich representations for the substrate.
+Processes audio input into representations for the substrate.
 
 Model: openai/whisper-large-v3-turbo (809M, ~1.6GB fp16)
 - Full 32-layer encoder + 4 decoder layers (vs 32 in full large-v3)
 - Near-identical accuracy at 50% memory cost
 - Supports 99 languages
 
-The organ provides:
+Provides:
 - Transcription (speech → text for routing through the substrate)
 - Audio embeddings (encoder features for cross-modal binding)
 - Language detection
@@ -24,7 +23,7 @@ import torch
 import torch.nn.functional as F
 
 from ..system.event_bus import get_default_bus
-from .base import BaseOrgan, OrganOutput
+from .base import BaseEncoder, EncoderOutput
 
 logger = logging.getLogger(__name__)
 
@@ -39,11 +38,11 @@ _WHISPER_MODEL = "openai/whisper-large-v3-turbo"
 _WHISPER_DIM = 1280  # Whisper-large encoder hidden size
 
 
-class AuditoryOrgan(BaseOrgan):
+class AuditoryEncoder(BaseEncoder):
     """Frozen Whisper encoder for audio/speech perception.
 
     Usage:
-        organ = AuditoryOrgan()
+        organ = AuditoryEncoder()
         organ.load()
 
         # Transcribe speech
@@ -135,7 +134,7 @@ class AuditoryOrgan(BaseOrgan):
         self._record_call(latency, method="transcribe")
         stripped = text.strip()
         _publish(
-            "organ.auditory.transcribe",
+            "encoder.auditory.transcribe",
             {
                 "transcription": stripped[:160],
                 "language": language or "auto",
@@ -151,7 +150,7 @@ class AuditoryOrgan(BaseOrgan):
         audio: Any,
         *,
         sampling_rate: int = 16000,
-    ) -> OrganOutput:
+    ) -> EncoderOutput:
         """Encode audio to a feature vector via the Whisper encoder.
 
         Returns the encoder's pooled hidden states — useful for cross-modal
@@ -162,7 +161,7 @@ class AuditoryOrgan(BaseOrgan):
             sampling_rate: Sample rate (16kHz expected).
 
         Returns:
-            OrganOutput with features=[1280] encoder representation.
+            EncoderOutput with features=[1280] encoder representation.
         """
         self._ensure_loaded()
         start = time.time()
@@ -184,7 +183,7 @@ class AuditoryOrgan(BaseOrgan):
         elapsed = (time.time() - start) * 1000
         self._record_call(elapsed, method="encode")
         _publish(
-            "organ.auditory.encode",
+            "encoder.auditory.encode",
             {
                 "n_frames": int(hidden.shape[0]),
                 "feature_dim": int(features.numel()),
@@ -193,15 +192,15 @@ class AuditoryOrgan(BaseOrgan):
             },
         )
 
-        return OrganOutput(
+        return EncoderOutput(
             features=features,
             metadata={"model": self._model_id, "n_frames": hidden.shape[0]},
             confidence=1.0,
             latency_ms=elapsed,
-            organ_name=self._name,
+            encoder_name=self._name,
         )
 
-    def process(self, audio: Any, **kwargs: Any) -> OrganOutput:
+    def process(self, audio: Any, **kwargs: Any) -> EncoderOutput:
         """Full pipeline: transcribe + encode."""
         self._ensure_loaded()
         start = time.time()

@@ -14,7 +14,7 @@ This test asserts the new behavior, end to end:
   :func:`SubstrateController._derived_target_snr_scale` returns 0.0 →
   no broca features, no logit bias, the LLM speaks freely.
 
-We stub the actual organ models so the test stays fast — the *wiring* is
+We stub the actual encoder weights so the test stays fast — the *wiring* is
 what's under test, not GLiNER's classification accuracy.
 """
 
@@ -28,11 +28,11 @@ import pytest
 
 import core.cognition.substrate as substrate_mod
 from core.cognition.intent_gate import IntentGate
-from core.cognition.organ_relation_extractor import OrganRelationExtractor
+from core.cognition.encoder_relation_extractor import EncoderRelationExtractor
 from core.cli import build_substrate_controller
 from core.cognition.substrate import SubstrateController
-from core.organs.affect import AffectState
-from core.organs.extraction import ExtractedRelation
+from core.encoders.affect import AffectState
+from core.encoders.extraction import ExtractedRelation
 
 from conftest import make_stub_llm_pair
 
@@ -68,8 +68,8 @@ def fake_host_loader(monkeypatch: pytest.MonkeyPatch):
     return _make
 
 
-class StubExtractionOrgan:
-    """Same shape as :class:`ExtractionOrgan`, returns canned data."""
+class StubExtractionEncoder:
+    """Same shape as :class:`ExtractionEncoder`, returns canned data."""
 
     def __init__(
         self,
@@ -111,7 +111,7 @@ class StubExtractionOrgan:
         return []
 
 
-class StubAffectOrgan:
+class StubAffectEncoder:
     """Returns a canned :class:`AffectState` so substrate doesn't load weights."""
 
     def __init__(self, state: AffectState):
@@ -130,19 +130,19 @@ def _wire_stubs(
     intent_responses: dict[str, list[tuple[str, float]]],
     relation_responses: dict[str, list[ExtractedRelation]] | None = None,
     affect: AffectState | None = None,
-) -> StubExtractionOrgan:
-    """Replace the substrate's organs with stubs and rebuild dependent wiring."""
+) -> StubExtractionEncoder:
+    """Replace the substrate's encoders with stubs and rebuild dependent wiring."""
 
-    extraction = StubExtractionOrgan(
+    extraction = StubExtractionEncoder(
         intent_responses=intent_responses,
         relation_responses=relation_responses,
     )
-    mind.extraction_organ = extraction  # type: ignore[assignment]
-    mind.affect_organ = StubAffectOrgan(affect or AffectState())  # type: ignore[assignment]
+    mind.extraction_encoder = extraction  # type: ignore[assignment]
+    mind.affect_encoder = StubAffectEncoder(affect or AffectState())  # type: ignore[assignment]
     mind.intent_gate = IntentGate(extraction)  # type: ignore[arg-type]
-    mind.router.extractor = OrganRelationExtractor(
+    mind.router.extractor = EncoderRelationExtractor(
         intent_gate=mind.intent_gate,
-        organ=extraction,  # type: ignore[arg-type]
+        extraction=extraction,  # type: ignore[arg-type]
     )
     return extraction
 

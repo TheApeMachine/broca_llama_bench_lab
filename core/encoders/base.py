@@ -1,12 +1,12 @@
-"""Base protocol for frozen specialist model organs.
+"""Base protocol for frozen specialist encoders.
 
-Every organ follows the same lifecycle:
+Every encoder follows the same lifecycle:
 1. Construct (specifies model ID, device preference — does NOT load weights)
 2. Load (downloads/loads weights on first use — lazy)
-3. Process (accepts modality-specific input, returns OrganOutput)
-4. Project (optional: map organ output to substrate's cognitive frame dim)
+3. Process (accepts modality-specific input, returns EncoderOutput)
+4. Project (optional: map encoder output to substrate's cognitive frame dim)
 
-The OrganRegistry manages all loaded organs and provides device budgeting.
+The EncoderRegistry manages all loaded encoders and provides device budgeting.
 """
 
 from __future__ import annotations
@@ -34,32 +34,32 @@ def _publish(topic: str, payload: dict) -> None:
 
 
 @dataclass
-class OrganOutput:
-    """Uniform output from any organ.
+class EncoderOutput:
+    """Uniform output from any frozen encoder.
 
     Attributes:
-        features: The organ's raw output embedding [d_organ].
+        features: The encoder's raw output embedding [d_encoder].
         projected: Optional projection to substrate dim [d_substrate].
-        metadata: Organ-specific structured output (entities, emotions, etc).
-        confidence: How confident the organ is in its output (0-1).
-        latency_ms: How long the organ took to process.
-        organ_name: Which organ produced this.
+        metadata: Encoder-specific structured output (entities, emotions, etc).
+        confidence: How confident the encoder is in its output (0-1).
+        latency_ms: How long the encoder took to process.
+        encoder_name: Which encoder produced this.
     """
     features: torch.Tensor | None = None
     projected: torch.Tensor | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
     confidence: float = 1.0
     latency_ms: float = 0.0
-    organ_name: str = ""
+    encoder_name: str = ""
 
 
 @runtime_checkable
-class Organ(Protocol):
-    """Protocol that all frozen specialist organs implement."""
+class Encoder(Protocol):
+    """Protocol that all frozen specialist encoders implement."""
 
     @property
     def name(self) -> str:
-        """Human-readable organ name (e.g. 'visual_cortex', 'auditory_cortex')."""
+        """Stable encoder id (e.g. 'visual_cortex', 'auditory_cortex')."""
         ...
 
     @property
@@ -74,7 +74,7 @@ class Organ(Protocol):
 
     @property
     def output_dim(self) -> int:
-        """Dimensionality of the organ's feature output."""
+        """Dimensionality of the encoder's feature output."""
         ...
 
     def load(self, device: torch.device | None = None) -> None:
@@ -86,8 +86,8 @@ class Organ(Protocol):
         ...
 
 
-class BaseOrgan(ABC):
-    """Abstract base class for organ implementations.
+class BaseEncoder(ABC):
+    """Abstract base class for encoder implementations.
 
     Handles common concerns: lazy loading, device management, timing.
     Subclasses implement _load_model() and the modality-specific process methods.
@@ -162,11 +162,11 @@ class BaseOrgan(ABC):
             self._loaded = True
             elapsed = (time.time() - start) * 1000
             logger.info(
-                "Organ loaded: %s (%s) on %s in %.0fms",
+                "Encoder loaded: %s (%s) on %s in %.0fms",
                 self._name, self._model_id, self.device, elapsed,
             )
             _publish(
-                "organ.load",
+                "encoder.load",
                 {
                     "name": self._name,
                     "model_id": self._model_id,
@@ -183,8 +183,8 @@ class BaseOrgan(ABC):
             self._loaded = False
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
-            logger.info("Organ unloaded: %s", self._name)
-            _publish("organ.unload", {"name": self._name})
+            logger.info("Encoder unloaded: %s", self._name)
+            _publish("encoder.unload", {"name": self._name})
 
     def _ensure_loaded(self) -> None:
         """Load on first use if not already loaded."""
@@ -195,7 +195,7 @@ class BaseOrgan(ABC):
         self._total_calls += 1
         self._total_latency_ms += latency_ms
         _publish(
-            "organ.call",
+            "encoder.call",
             {
                 "name": self._name,
                 "method": method or "process",
@@ -211,18 +211,18 @@ class BaseOrgan(ABC):
         ...
 
 
-class OrganRegistry:
-    """Central registry managing all loaded organs.
+class EncoderRegistry:
+    """Central registry managing all loaded encoders.
 
     Provides:
-    - Lazy loading of organs on first access
+    - Lazy loading of encoders on first access
     - Device budgeting (track total VRAM usage)
     - Bulk load/unload for session management
     - Stats reporting
     """
 
     def __init__(self, *, default_device: torch.device | str | None = None):
-        self._organs: dict[str, BaseOrgan] = {}
+        self._encoders: dict[str, BaseEncoder] = {}
         self._default_device = (
             torch.device(default_device) if default_device else None
         )
@@ -235,54 +235,54 @@ class OrganRegistry:
         from ..system.device import pick_torch_device
         return pick_torch_device()
 
-    def register(self, organ: BaseOrgan) -> None:
-        """Register an organ (does not load it)."""
+    def register(self, encoder: BaseEncoder) -> None:
+        """Register an encoder (does not load it)."""
         with self._lock:
-            self._organs[organ.name] = organ
-            logger.debug("Registered organ: %s (%s)", organ.name, organ.model_id)
+            self._encoders[encoder.name] = encoder
+            logger.debug("Registered encoder: %s (%s)", encoder.name, encoder.model_id)
 
-    def get(self, name: str) -> BaseOrgan | None:
-        """Get an organ by name. Returns None if not registered."""
-        return self._organs.get(name)
+    def get(self, name: str) -> BaseEncoder | None:
+        """Get an encoder by name. Returns None if not registered."""
+        return self._encoders.get(name)
 
-    def get_or_load(self, name: str) -> BaseOrgan | None:
-        """Get an organ, loading it if needed."""
-        organ = self._organs.get(name)
-        if organ is not None and not organ.is_loaded:
-            organ.load(self.default_device)
-        return organ
+    def get_or_load(self, name: str) -> BaseEncoder | None:
+        """Get an encoder, loading it if needed."""
+        encoder = self._encoders.get(name)
+        if encoder is not None and not encoder.is_loaded:
+            encoder.load(self.default_device)
+        return encoder
 
     def load_all(self) -> None:
-        """Load all registered organs."""
-        for organ in self._organs.values():
-            if not organ.is_loaded:
-                organ.load(self.default_device)
+        """Load all registered encoders."""
+        for encoder in self._encoders.values():
+            if not encoder.is_loaded:
+                encoder.load(self.default_device)
 
     def unload_all(self) -> None:
-        """Unload all organs to free memory."""
-        for organ in self._organs.values():
-            if organ.is_loaded:
-                organ.unload()
+        """Unload all encoders to free memory."""
+        for encoder in self._encoders.values():
+            if encoder.is_loaded:
+                encoder.unload()
 
     @property
-    def loaded_organs(self) -> list[str]:
-        return [name for name, o in self._organs.items() if o.is_loaded]
+    def loaded_encoders(self) -> list[str]:
+        return [name for name, o in self._encoders.items() if o.is_loaded]
 
     @property
-    def all_organs(self) -> list[str]:
-        return list(self._organs.keys())
+    def all_encoders(self) -> list[str]:
+        return list(self._encoders.keys())
 
     def stats(self) -> dict[str, Any]:
-        """Report stats for all organs."""
+        """Report stats for all encoders."""
         return {
-            "n_registered": len(self._organs),
-            "n_loaded": len(self.loaded_organs),
+            "n_registered": len(self._encoders),
+            "n_loaded": len(self.loaded_encoders),
             "default_device": str(self.default_device),
-            "organs": {name: organ.stats for name, organ in self._organs.items()},
+            "encoders": {name: encoder.stats for name, encoder in self._encoders.items()},
         }
 
     def __contains__(self, name: str) -> bool:
-        return name in self._organs
+        return name in self._encoders
 
     def __len__(self) -> int:
-        return len(self._organs)
+        return len(self._encoders)

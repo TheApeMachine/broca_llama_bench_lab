@@ -36,18 +36,18 @@ class StubMultimodalPipeline:
         self.calls: list[tuple[str, str]] = []
 
     @property
-    def registered_organs(self) -> list[str]:
+    def registered_encoders(self) -> list[str]:
         return ["visual_cortex", "auditory_cortex", "association_cortex"]
 
     @property
-    def loaded_organs(self) -> list[str]:
+    def loaded_encoders(self) -> list[str]:
         return []
 
     def stats(self) -> dict[str, Any]:
         return {
-            "n_registered": len(self.registered_organs),
+            "n_registered": len(self.registered_encoders),
             "n_loaded": 0,
-            "organs": {},
+            "encoders": {},
         }
 
     def perceive_image(self, image: Any, *, source: str = "image") -> CognitiveObservation:
@@ -134,8 +134,8 @@ def test_controller_registers_full_multimodal_pipeline(tmp_path: Path, fake_host
         "spatial_cortex",
         "auditory_cortex",
         "association_cortex",
-    }.issubset(set(mind.multimodal_perception.registered_organs))
-    assert mind.snapshot()["organs"]["n_registered"] >= 6
+    }.issubset(set(mind.multimodal_perception.registered_encoders))
+    assert mind.snapshot()["encoders"]["n_registered"] >= 6
 
 
 def test_perceive_image_commits_workspace_journal_and_hopfield(

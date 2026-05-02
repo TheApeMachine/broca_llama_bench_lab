@@ -1,7 +1,7 @@
 """Frozen Llama-family hosts with Broca graft slots.
 
 Loads ``meta-llama/Llama-3.2-1B-Instruct`` through Hugging Face transformers.
-The host intentionally treats the model as the language organ: weights are
+The host treats the model as the speech decoder: weights are
 frozen, and external faculties can write into named residual-stream slots.
 
 Supported graft slots:

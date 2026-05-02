@@ -9,7 +9,7 @@ These tests verify:
 1. Requests/commands do NOT activate grafts (no memory write, no bias)
 2. Factual statements DO get stored and recalled correctly
 3. Questions about stored facts DO activate grafts with derived confidence
-4. The affect organ detects emotional state on every utterance
+4. The affect encoder detects emotional state on every utterance
 5. Graft strength is derived from substrate knowledge, not static confidence
 """
 
@@ -19,8 +19,8 @@ from pathlib import Path
 import pytest
 
 from core.cognition.intent_gate import INTENT_LABELS
-from core.organs.extraction import ExtractionOrgan, ExtractedEntity, ExtractedRelation
-from core.organs.affect import AffectOrgan, AffectState
+from core.encoders.extraction import ExtractionEncoder, ExtractedEntity, ExtractedRelation
+from core.encoders.affect import AffectEncoder, AffectState
 
 
 def _intent_schema(*wanted: str) -> list[str]:
@@ -30,12 +30,12 @@ def _intent_schema(*wanted: str) -> list[str]:
     return [lab for lab in INTENT_LABELS if lab in w]
 
 
-class TestExtractionOrganIntentClassification:
-    """The extraction organ must distinguish requests from statements."""
+class TestExtractionEncoderIntentClassification:
+    """The extraction encoder must distinguish requests from statements."""
 
     @pytest.fixture
     def organ(self):
-        organ = ExtractionOrgan()
+        organ = ExtractionEncoder()
         organ.load()
         return organ
 
@@ -95,12 +95,12 @@ class TestExtractionOrganIntentClassification:
         assert top_label in ("request", "command"), f"Expected request/command, got '{top_label}'"
 
 
-class TestExtractionOrganRelations:
+class TestExtractionEncoderRelations:
     """Relation extraction should only fire on actual declarative content."""
 
     @pytest.fixture
     def organ(self):
-        organ = ExtractionOrgan()
+        organ = ExtractionEncoder()
         organ.load()
         return organ
 
@@ -133,12 +133,12 @@ class TestExtractionOrganRelations:
             assert len(relations) == 0, f"'{utterance}' produced relations: {relations}"
 
 
-class TestAffectOrganDetection:
-    """The affect organ must provide emotional signal on every utterance."""
+class TestAffectEncoderDetection:
+    """The affect encoder must provide emotional signal on every utterance."""
 
     @pytest.fixture
     def organ(self):
-        organ = AffectOrgan()
+        organ = AffectEncoder()
         organ.load()
         return organ
 

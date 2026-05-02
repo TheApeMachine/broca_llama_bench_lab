@@ -12,7 +12,7 @@ import torch
 
 @dataclass(frozen=True)
 class CognitiveObservation:
-    """A frozen-organ observation before it becomes a workspace frame."""
+    """A frozen-encoder observation before it becomes a workspace frame."""
 
     modality: str
     source: str

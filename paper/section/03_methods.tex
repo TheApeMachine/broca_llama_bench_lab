@@ -1,7 +1,7 @@
 \section{Methods}
 \label{sec:methods}
 
-\subsection{Architectural Philosophy: The Frozen Language Organ}
+\subsection{Architectural Philosophy: The Frozen Language Decoder}
 
 The central design decision in \textsc{Mosaic} is the complete separation of
 language generation from cognition.  The LLM's weights are \emph{never updated}.
@@ -21,10 +21,10 @@ orthogonalization and Gram--Schmidt), the graft forces the LLM to \emph{invent a
 metaphor}---to describe the negative space of the novel concept using its
 existing subword repertoire.
 
-\subsection{Perceptual Organ Models}
+\subsection{Frozen Modality Encoders}
 
-Beyond the frozen LLM (Broca's area), the architecture deploys a constellation
-of frozen pre-trained specialist models as sensory organs:
+Beyond the frozen LLM, the architecture deploys a constellation
+of frozen pre-trained specialist models as modality encoders:
 
 \begin{itemize}[nosep]
   \item \textbf{Visual cortex} (DINOv2-Large, 307M): general-purpose visual
@@ -48,9 +48,9 @@ of frozen pre-trained specialist models as sensory organs:
     annoyance) to the active-inference loop.
 \end{itemize}
 
-All organs are frozen, loaded lazily, and communicate with the substrate via
-uniform \texttt{OrganOutput} dataclasses carrying features, metadata, and
-confidence.  The total memory footprint for all organs loaded simultaneously is
+All encoders are frozen, loaded lazily, and communicate with the substrate via
+uniform \texttt{EncoderOutput} dataclasses carrying features, metadata, and
+confidence.  The total memory footprint for all encoders loaded simultaneously is
 ${\sim}10.7$\,GB at fp16---well within a single-GPU or M-series Mac budget.
 
 \subsection{Algebraic Substrate Components}

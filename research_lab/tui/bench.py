@@ -298,7 +298,7 @@ class BenchApp(App):
         self._lm_eval_summary: dict[str, Any] | None = None
         self._arch_summary: dict[str, Any] | None = None
         self._acc_trend: deque[float] = deque(maxlen=80)
-        # --- live cognition / organ state for the new panels --------------
+        # --- live cognition / frozen-encoder state for the new panels ---------
         self._last_intent: dict[str, Any] | None = None
         self._intent_label_counts: dict[str, int] = {}
         self._last_derived_strength: dict[str, Any] | None = None
@@ -332,9 +332,9 @@ class BenchApp(App):
             "n_constraints": 0,
             "last": None,
         }
-        # organ name -> {"calls": int, "avg_ms": float, "last_ms": float, "method": str}
-        self._organ_stats: dict[str, dict[str, Any]] = {}
-        self._loaded_organs: dict[str, dict[str, Any]] = {}
+        # encoder name -> {"calls": int, "avg_ms": float, "last_ms": float, "method": str}
+        self._encoder_stats: dict[str, dict[str, Any]] = {}
+        self._loaded_encoders: dict[str, dict[str, Any]] = {}
         self._last_affect: dict[str, Any] | None = None
         self._last_extraction: dict[str, Any] | None = None
         self._last_perception: dict[str, dict[str, Any]] = {}
@@ -372,7 +372,7 @@ class BenchApp(App):
                 yield StatePanel("Substrate (DMN / frames)", id="panel-substrate")
                 yield StatePanel("Cognition (intent / strength / relation)", id="panel-cognition")
                 yield StatePanel("Top-down control", id="panel-topdown")
-                yield StatePanel("Organs", id="panel-organs")
+                yield StatePanel("Encoders", id="panel-encoders")
                 yield StatePanel("Suite summary", id="panel-summary")
         yield Static("", id="status")
         yield Footer()
@@ -726,28 +726,28 @@ class BenchApp(App):
                 f"[cyan]{ts_s}[/cyan] causal constraint  do({payload.get('treatment')}={payload.get('treatment_value')!r})"
                 f" → {payload.get('outcome')}  total={payload.get('n_constraints')}"
             )
-        # ------------------ organs ----------------------------------------
-        elif topic == "organ.load":
-            self._loaded_organs[str(payload.get("name"))] = {
+        # ------------------ frozen encoders ---------------------------------
+        elif topic == "encoder.load":
+            self._loaded_encoders[str(payload.get("name"))] = {
                 "model_id": payload.get("model_id"),
                 "device": payload.get("device"),
                 "load_ms": float(payload.get("load_ms") or 0.0),
             }
             activity.write(
-                f"[cyan]{ts_s}[/cyan] organ load  {payload.get('name')}  "
+                f"[cyan]{ts_s}[/cyan] encoder load  {payload.get('name')}  "
                 f"({payload.get('model_id')})  {float(payload.get('load_ms') or 0.0):.0f}ms"
             )
-        elif topic == "organ.unload":
-            self._loaded_organs.pop(str(payload.get("name")), None)
-            activity.write(f"[dim]{ts_s}[/dim] organ unload {payload.get('name')}")
-        elif topic == "organ.call":
+        elif topic == "encoder.unload":
+            self._loaded_encoders.pop(str(payload.get("name")), None)
+            activity.write(f"[dim]{ts_s}[/dim] encoder unload {payload.get('name')}")
+        elif topic == "encoder.call":
             name = str(payload.get("name") or "—")
-            stats = self._organ_stats.setdefault(name, {"calls": 0, "avg_ms": 0.0, "last_ms": 0.0, "method": ""})
+            stats = self._encoder_stats.setdefault(name, {"calls": 0, "avg_ms": 0.0, "last_ms": 0.0, "method": ""})
             stats["calls"] = int(payload.get("total_calls") or stats["calls"] + 1)
             stats["avg_ms"] = float(payload.get("avg_latency_ms") or stats["avg_ms"])
             stats["last_ms"] = float(payload.get("latency_ms") or 0.0)
             stats["method"] = str(payload.get("method") or "process")
-        elif topic == "organ.affect":
+        elif topic == "encoder.affect":
             self._last_affect = dict(payload)
             activity.write(
                 f"[cyan]{ts_s}[/cyan] affect [b]{payload.get('dominant_emotion')}[/b]"
@@ -756,7 +756,7 @@ class BenchApp(App):
                 f"  ar={_fmt_float(payload.get('arousal'))}"
                 f"  pref={payload.get('preference_signal') or '—'}"
             )
-        elif topic.startswith("organ.extraction."):
+        elif topic.startswith("encoder.extraction."):
             self._last_extraction = {"topic": topic, **dict(payload)}
             kind = topic.split(".")[-1]
             n_key = {"entities": "n_entities", "relations": "n_relations", "classify": "selected"}.get(kind)
@@ -769,19 +769,19 @@ class BenchApp(App):
                 f"[cyan]{ts_s}[/cyan] extraction.{kind}  n={count_str}"
                 f"  ms={_fmt_float(payload.get('latency_ms'), prec=0)}"
             )
-        elif topic.startswith("organ.perception."):
+        elif topic.startswith("encoder.perception."):
             stream = topic.split(".")[-1]
             self._last_perception[stream] = dict(payload)
             activity.write(
                 f"[cyan]{ts_s}[/cyan] perception.{stream}  ms={_fmt_float(payload.get('latency_ms'), prec=0)}"
             )
-        elif topic == "organ.binding.encode":
+        elif topic == "encoder.binding.encode":
             self._last_binding = dict(payload)
             activity.write(
                 f"[cyan]{ts_s}[/cyan] binding {payload.get('modality')}"
                 f"  ms={_fmt_float(payload.get('latency_ms'), prec=0)}"
             )
-        elif topic.startswith("organ.auditory."):
+        elif topic.startswith("encoder.auditory."):
             kind = topic.split(".")[-1]
             self._last_auditory = {"topic": topic, **dict(payload)}
             extra = (
@@ -922,7 +922,7 @@ class BenchApp(App):
             "panel-substrate",
             "panel-cognition",
             "panel-topdown",
-            "panel-organs",
+            "panel-encoders",
             "panel-summary",
         ):
             self.query_one(f"#{pid}", StatePanel).set_lines([])
@@ -1162,18 +1162,18 @@ class BenchApp(App):
             td_lines.append("[dim]no top-down control events yet[/dim]")
         self.query_one("#panel-topdown", StatePanel).set_lines(td_lines)
 
-        # Organs panel — per-organ call counters and last-emotion / last-perception
+        # Encoders panel — per-encoder call counters and last-emotion / last-perception
         org_lines: list[str] = []
-        if self._loaded_organs:
-            org_lines.append(f"loaded: {len(self._loaded_organs)}")
-            for name, info in sorted(self._loaded_organs.items()):
+        if self._loaded_encoders:
+            org_lines.append(f"loaded: {len(self._loaded_encoders)}")
+            for name, info in sorted(self._loaded_encoders.items()):
                 org_lines.append(
                     f"  [b]{name}[/b]  {str(info.get('model_id') or '')[:24]}"
                     f"  load={float(info.get('load_ms') or 0.0):.0f}ms"
                 )
-        if self._organ_stats:
+        if self._encoder_stats:
             org_lines.append("activity:")
-            for name, st in sorted(self._organ_stats.items(), key=lambda kv: -int(kv[1].get("calls", 0))):
+            for name, st in sorted(self._encoder_stats.items(), key=lambda kv: -int(kv[1].get("calls", 0))):
                 org_lines.append(
                     f"  {name:<18} n={st['calls']:4d}"
                     f"  avg={st['avg_ms']:5.0f}ms  last={st['last_ms']:5.0f}ms"
@@ -1209,8 +1209,8 @@ class BenchApp(App):
                 f"auditory: {str(self._last_auditory.get('topic', '')).split('.')[-1]}"
             )
         if not org_lines:
-            org_lines.append("[dim]no organ activity yet[/dim]")
-        self.query_one("#panel-organs", StatePanel).set_lines(org_lines)
+            org_lines.append("[dim]no encoder activity yet[/dim]")
+        self.query_one("#panel-encoders", StatePanel).set_lines(org_lines)
 
         # Suite summary
         sum_lines: list[str] = []

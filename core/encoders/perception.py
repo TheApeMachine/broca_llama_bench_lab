@@ -1,10 +1,10 @@
-"""Perception organs: frozen vision encoders as visual cortex.
+"""Frozen vision encoders (DINOv2, I-JEPA, V-JEPA, depth).
 
-Brain analogies:
-- V-JEPA (dorsal stream / area MT): motion, temporal dynamics, world prediction
-- I-JEPA (ventral stream / V4-IT): object recognition, semantic features
-- DINOv2 (primary visual cortex V1-V2): general-purpose visual features
-- Depth Anything (parietal 'where' pathway): spatial reasoning, depth
+Streams (registry keys):
+- ``dorsal_stream``: V-JEPA — motion and temporal dynamics
+- ``ventral_stream``: I-JEPA — semantic / recognition features
+- ``visual_cortex``: DINOv2 — general visual features
+- ``spatial_cortex``: Depth Anything — depth / spatial structure
 
 All models are ViT-based, produce fixed-dim feature vectors, and run as a
 single forward pass (no autoregressive decoding). On M4 Max with 128GB,
@@ -27,7 +27,7 @@ import torch
 import torch.nn.functional as F
 
 from ..system.event_bus import get_default_bus
-from .base import BaseOrgan, OrganOutput
+from .base import BaseEncoder, EncoderOutput
 
 logger = logging.getLogger(__name__)
 
@@ -50,7 +50,7 @@ _VIT_L_DIM = 1024  # ViT-Large hidden size (DINOv2-large, Depth)
 _VIT_G_DIM = 1536  # ViT-Giant hidden size (DINOv2-giant)
 
 
-class DINOv2Organ(BaseOrgan):
+class DINOv2Encoder(BaseEncoder):
     """Frozen DINOv2 encoder — general-purpose visual features.
 
     Brain analogy: Primary + early association visual cortex (V1-V4).
@@ -58,9 +58,9 @@ class DINOv2Organ(BaseOrgan):
     any task-specific training.
 
     Usage:
-        organ = DINOv2Organ()
+        organ = DINOv2Encoder()
         organ.load()
-        output = organ.encode(image_tensor)  # [3, H, W] -> OrganOutput
+        output = organ.encode(image_tensor)  # [3, H, W] -> EncoderOutput
     """
 
     def __init__(self, *, model_id: str | None = None, device: str | None = None):
@@ -77,14 +77,14 @@ class DINOv2Organ(BaseOrgan):
             param.requires_grad = False
 
     @torch.no_grad()
-    def encode(self, image: Any) -> OrganOutput:
+    def encode(self, image: Any) -> EncoderOutput:
         """Encode an image to a global feature vector.
 
         Args:
             image: PIL Image, torch tensor [3,H,W], or file path.
 
         Returns:
-            OrganOutput with features=[d_model] global CLS token representation.
+            EncoderOutput with features=[d_model] global CLS token representation.
         """
         self._ensure_loaded()
         start = time.time()
@@ -102,7 +102,7 @@ class DINOv2Organ(BaseOrgan):
         self._record_call(elapsed, method="encode")
         n_patches = int(outputs.last_hidden_state.shape[1] - 1)
         _publish(
-            "organ.perception.visual",
+            "encoder.perception.visual",
             {
                 "stream": "visual_cortex",
                 "n_patches": n_patches,
@@ -111,20 +111,20 @@ class DINOv2Organ(BaseOrgan):
             },
         )
 
-        return OrganOutput(
+        return EncoderOutput(
             features=features,
             metadata={"model": self._model_id, "n_patches": n_patches},
             confidence=1.0,
             latency_ms=elapsed,
-            organ_name=self._name,
+            encoder_name=self._name,
         )
 
     @torch.no_grad()
-    def encode_patches(self, image: Any) -> tuple[torch.Tensor, OrganOutput]:
+    def encode_patches(self, image: Any) -> tuple[torch.Tensor, EncoderOutput]:
         """Return both patch-level features and global CLS token.
 
         Returns:
-            (patch_features [n_patches, d_model], global OrganOutput)
+            (patch_features [n_patches, d_model], global EncoderOutput)
         """
         self._ensure_loaded()
         start = time.time()
@@ -140,7 +140,7 @@ class DINOv2Organ(BaseOrgan):
         elapsed = (time.time() - start) * 1000
         self._record_call(elapsed, method="encode_patches")
         _publish(
-            "organ.perception.visual",
+            "encoder.perception.visual",
             {
                 "stream": "visual_cortex",
                 "mode": "patches",
@@ -149,20 +149,20 @@ class DINOv2Organ(BaseOrgan):
             },
         )
 
-        output = OrganOutput(
+        output = EncoderOutput(
             features=cls_features,
             metadata={"n_patches": patch_features.shape[0]},
             confidence=1.0,
             latency_ms=elapsed,
-            organ_name=self._name,
+            encoder_name=self._name,
         )
         return patch_features, output
 
-    def process(self, image: Any, **kwargs: Any) -> OrganOutput:
+    def process(self, image: Any, **kwargs: Any) -> EncoderOutput:
         return self.encode(image)
 
 
-class IJEPAOrgan(BaseOrgan):
+class IJEPAEncoder(BaseEncoder):
     """Frozen I-JEPA encoder — semantic visual features via predictive learning.
 
     Brain analogy: Ventral visual stream (V4 / inferotemporal cortex).
@@ -171,7 +171,7 @@ class IJEPAOrgan(BaseOrgan):
     (object identity, category, scene) rather than texture.
 
     Usage:
-        organ = IJEPAOrgan()
+        organ = IJEPAEncoder()
         organ.load()
         output = organ.encode(image_tensor)
     """
@@ -192,7 +192,7 @@ class IJEPAOrgan(BaseOrgan):
             param.requires_grad = False
 
     @torch.no_grad()
-    def encode(self, image: Any) -> OrganOutput:
+    def encode(self, image: Any) -> EncoderOutput:
         """Encode image to semantic feature vector."""
         self._ensure_loaded()
         start = time.time()
@@ -212,7 +212,7 @@ class IJEPAOrgan(BaseOrgan):
         elapsed = (time.time() - start) * 1000
         self._record_call(elapsed, method="encode")
         _publish(
-            "organ.perception.ventral",
+            "encoder.perception.ventral",
             {
                 "stream": "ventral_stream",
                 "n_tokens": int(hidden.shape[0]),
@@ -221,19 +221,19 @@ class IJEPAOrgan(BaseOrgan):
             },
         )
 
-        return OrganOutput(
+        return EncoderOutput(
             features=features,
             metadata={"model": self._model_id},
             confidence=1.0,
             latency_ms=elapsed,
-            organ_name=self._name,
+            encoder_name=self._name,
         )
 
-    def process(self, image: Any, **kwargs: Any) -> OrganOutput:
+    def process(self, image: Any, **kwargs: Any) -> EncoderOutput:
         return self.encode(image)
 
 
-class VJEPAOrgan(BaseOrgan):
+class VJEPAEncoder(BaseEncoder):
     """Frozen V-JEPA encoder — temporal/motion features from video.
 
     Brain analogy: Dorsal visual stream (area MT/MST).
@@ -244,7 +244,7 @@ class VJEPAOrgan(BaseOrgan):
     abstract representation space.
 
     Usage:
-        organ = VJEPAOrgan()
+        organ = VJEPAEncoder()
         organ.load()
         output = organ.encode_frames(video_frames)  # [T, 3, H, W]
     """
@@ -272,14 +272,14 @@ class VJEPAOrgan(BaseOrgan):
             param.requires_grad = False
 
     @torch.no_grad()
-    def encode_frames(self, frames: torch.Tensor | list) -> OrganOutput:
+    def encode_frames(self, frames: torch.Tensor | list) -> EncoderOutput:
         """Encode video frames to temporal feature vector.
 
         Args:
             frames: Video tensor [T, 3, H, W] or list of PIL images.
 
         Returns:
-            OrganOutput with features representing temporal dynamics.
+            EncoderOutput with features representing temporal dynamics.
         """
         self._ensure_loaded()
         start = time.time()
@@ -296,7 +296,7 @@ class VJEPAOrgan(BaseOrgan):
         self._record_call(elapsed, method="encode_frames")
         n_frames = len(frames) if hasattr(frames, "__len__") else 0
         _publish(
-            "organ.perception.dorsal",
+            "encoder.perception.dorsal",
             {
                 "stream": "dorsal_stream",
                 "mode": "frames",
@@ -306,16 +306,16 @@ class VJEPAOrgan(BaseOrgan):
             },
         )
 
-        return OrganOutput(
+        return EncoderOutput(
             features=features,
             metadata={"model": self._model_id, "n_frames": n_frames},
             confidence=1.0,
             latency_ms=elapsed,
-            organ_name=self._name,
+            encoder_name=self._name,
         )
 
     @torch.no_grad()
-    def encode_single_frame(self, image: Any) -> OrganOutput:
+    def encode_single_frame(self, image: Any) -> EncoderOutput:
         """Encode a single image through the video model (treats as 1-frame clip)."""
         self._ensure_loaded()
         start = time.time()
@@ -331,7 +331,7 @@ class VJEPAOrgan(BaseOrgan):
         elapsed = (time.time() - start) * 1000
         self._record_call(elapsed, method="encode_single_frame")
         _publish(
-            "organ.perception.dorsal",
+            "encoder.perception.dorsal",
             {
                 "stream": "dorsal_stream",
                 "mode": "single_frame",
@@ -340,21 +340,21 @@ class VJEPAOrgan(BaseOrgan):
             },
         )
 
-        return OrganOutput(
+        return EncoderOutput(
             features=features,
             metadata={"model": self._model_id, "mode": "single_frame"},
             confidence=1.0,
             latency_ms=elapsed,
-            organ_name=self._name,
+            encoder_name=self._name,
         )
 
-    def process(self, input_data: Any, **kwargs: Any) -> OrganOutput:
+    def process(self, input_data: Any, **kwargs: Any) -> EncoderOutput:
         if isinstance(input_data, torch.Tensor) and input_data.ndim == 4:
             return self.encode_frames(input_data)
         return self.encode_single_frame(input_data)
 
 
-class DepthOrgan(BaseOrgan):
+class DepthEncoder(BaseEncoder):
     """Frozen Depth Anything V2 — monocular depth estimation.
 
     Brain analogy: Parietal 'where' pathway.
@@ -362,7 +362,7 @@ class DepthOrgan(BaseOrgan):
     The depth map can be used for spatial reasoning queries.
 
     Usage:
-        organ = DepthOrgan()
+        organ = DepthEncoder()
         organ.load()
         output = organ.estimate_depth(image)
         # output.metadata["depth_map"] = [H, W] tensor
@@ -384,11 +384,11 @@ class DepthOrgan(BaseOrgan):
             param.requires_grad = False
 
     @torch.no_grad()
-    def estimate_depth(self, image: Any) -> OrganOutput:
+    def estimate_depth(self, image: Any) -> EncoderOutput:
         """Estimate depth map from a single image.
 
         Returns:
-            OrganOutput with:
+            EncoderOutput with:
             - features: global depth statistics vector
             - metadata["depth_map"]: [H, W] relative depth tensor
             - metadata["depth_stats"]: {mean, std, min, max, median}
@@ -433,7 +433,7 @@ class DepthOrgan(BaseOrgan):
         elapsed = (time.time() - start) * 1000
         self._record_call(elapsed, method="estimate_depth")
         _publish(
-            "organ.perception.spatial",
+            "encoder.perception.spatial",
             {
                 "stream": "spatial_cortex",
                 "depth_stats": stats,
@@ -442,7 +442,7 @@ class DepthOrgan(BaseOrgan):
             },
         )
 
-        return OrganOutput(
+        return EncoderOutput(
             features=padded,
             metadata={
                 "depth_map": depth_normalized,
@@ -451,37 +451,37 @@ class DepthOrgan(BaseOrgan):
             },
             confidence=1.0,
             latency_ms=elapsed,
-            organ_name=self._name,
+            encoder_name=self._name,
         )
 
-    def process(self, image: Any, **kwargs: Any) -> OrganOutput:
+    def process(self, image: Any, **kwargs: Any) -> EncoderOutput:
         return self.estimate_depth(image)
 
 
 # Convenience factory
-def create_perception_organs(
+def create_perception_encoders(
     *,
     device: str | None = None,
     include: set[str] | None = None,
-) -> dict[str, BaseOrgan]:
-    """Create all perception organs (or a subset).
+) -> dict[str, BaseEncoder]:
+    """Create all perception encoders (or a subset).
 
     Args:
         device: Torch device string.
-        include: Set of organ names to include. None = all.
+        include: Set of encoder registry keys to include. None = all.
             Valid names: "visual_cortex", "ventral_stream", "dorsal_stream", "spatial_cortex"
 
     Returns:
-        Dict mapping organ name to organ instance (not yet loaded).
+        Dict mapping registry key to encoder instance (not yet loaded).
     """
-    all_organs = {
-        "visual_cortex": lambda: DINOv2Organ(device=device),
-        "ventral_stream": lambda: IJEPAOrgan(device=device),
-        "dorsal_stream": lambda: VJEPAOrgan(device=device),
-        "spatial_cortex": lambda: DepthOrgan(device=device),
+    all_encoders = {
+        "visual_cortex": lambda: DINOv2Encoder(device=device),
+        "ventral_stream": lambda: IJEPAEncoder(device=device),
+        "dorsal_stream": lambda: VJEPAEncoder(device=device),
+        "spatial_cortex": lambda: DepthEncoder(device=device),
     }
 
     if include is None:
-        include = set(all_organs.keys())
+        include = set(all_encoders.keys())
 
-    return {name: factory() for name, factory in all_organs.items() if name in include}
+    return {name: factory() for name, factory in all_encoders.items() if name in include}

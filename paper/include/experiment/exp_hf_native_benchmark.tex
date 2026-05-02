@@ -2,7 +2,7 @@
 \label{subsec:exp-hf-native}
 
 \paragraph{Protocol.}
-We evaluate the frozen language organ on publicly available NLP benchmarks using the in-repository HuggingFace \texttt{datasets} harness. Multiple-choice items are scored by length-normalized continuation log-likelihood; generation-style items use deterministic greedy decode with normalized exact matching. The evaluation checkpoint is \texttt{meta-llama/Llama-3.2-1B-Instruct}, run on tasks \texttt{boolq, piqa, arc\_easy, winogrande} with limit $= 50$ items per task and seed $= 0$ (UTC~\texttt{20260501T161127Z}).
+We evaluate the frozen causal language model on publicly available NLP benchmarks using the in-repository HuggingFace \texttt{datasets} harness. Multiple-choice items are scored by length-normalized continuation log-likelihood; generation-style items use deterministic greedy decode with normalized exact matching. The evaluation checkpoint is \texttt{meta-llama/Llama-3.2-1B-Instruct}, run on tasks \texttt{boolq, piqa, arc\_easy, winogrande} with limit $= 50$ items per task and seed $= 0$ (UTC~\texttt{20260501T161127Z}).
 
 \begin{table}[htbp]
 \centering

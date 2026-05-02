@@ -1,11 +1,8 @@
-"""Affect organ: emotion detection and pragmatic intent classification.
+"""Affect encoder: emotion detection and pragmatic intent classification.
 
 Replaces regex-based sentiment patterns (_POSITIVE_SENTIMENT, _NEGATIVE_SENTIMENT)
 with proper neural models that detect 28 fine-grained emotions and arbitrary
 dynamic intent labels.
-
-Brain analogy: Limbic system / insula — emotional processing, interoception,
-and subjective feeling states that modulate decision-making.
 
 Models:
 - GoEmotions (SamLowe/roberta-base-go_emotions): 28-label multi-label emotion
@@ -13,7 +10,7 @@ Models:
 - comprehend_it (Knowledgator/comprehend_it-base): Zero-shot NLI-based
   classification with arbitrary dynamic labels. 184M params.
 
-The organ exposes emotions as cognitive signals that the substrate uses for:
+This encoder exposes emotions as cognitive signals that the substrate uses for:
 - Preference learning (DirichletPreference updates)
 - Active inference (modulating exploration/exploitation via arousal)
 - Intrinsic cues (confusion → clarifying question, frustration → strategy shift)
@@ -32,7 +29,7 @@ import numpy as np
 import torch
 
 from ..system.event_bus import get_default_bus
-from .base import BaseOrgan, OrganOutput
+from .base import BaseEncoder, EncoderOutput
 
 logger = logging.getLogger(__name__)
 
@@ -97,7 +94,7 @@ class EmotionScore:
 
 @dataclass
 class AffectState:
-    """Complete affective state from the organ."""
+    """Complete affective state from the encoder."""
     dominant_emotion: str = "neutral"
     dominant_score: float = 0.0
     confidences: list[EmotionScore] = field(default_factory=list)
@@ -116,7 +113,7 @@ class AffectState:
         return {item.label: float(item.score) for item in self.confidences}
 
 
-class AffectOrgan(BaseOrgan):
+class AffectEncoder(BaseEncoder):
     """Frozen emotion/affect detection model.
 
     Detects 28 fine-grained emotions per utterance and maps them to
@@ -124,7 +121,7 @@ class AffectOrgan(BaseOrgan):
     modulation, and intrinsic cue generation.
 
     Usage:
-        organ = AffectOrgan()
+        organ = AffectEncoder()
         organ.load()
         state = organ.detect("I can't believe they did that, it's so frustrating!")
         # state.dominant_emotion = "annoyance"
@@ -159,7 +156,7 @@ class AffectOrgan(BaseOrgan):
             from transformers import AutoTokenizer, pipeline
         except ImportError as exc:
             raise ImportError(
-                "AffectOrgan requires `transformers`. Install with: pip install transformers"
+                "AffectEncoder requires `transformers`. Install with: pip install transformers"
             ) from exc
 
         if self._use_onnx:
@@ -183,7 +180,7 @@ class AffectOrgan(BaseOrgan):
                 providers=["CPUExecutionProvider"],
             )
             self._pipeline = self._run_onnx_text_classification
-            logger.info("AffectOrgan: loaded ONNX quantized %s", onnx_model_id)
+            logger.info("AffectEncoder: loaded ONNX quantized %s", onnx_model_id)
             return
 
         self._pipeline = pipeline(
@@ -197,7 +194,7 @@ class AffectOrgan(BaseOrgan):
             str(config.id2label[i])
             for i in sorted(getattr(config, "id2label", {}))
         ] if config is not None else []
-        logger.info("AffectOrgan: loaded standard %s", self._model_id)
+        logger.info("AffectEncoder: loaded standard %s", self._model_id)
 
     def _run_onnx_text_classification(self, text: str) -> list[dict[str, float | str]]:
         encoded = self._tokenizer(
@@ -210,7 +207,7 @@ class AffectOrgan(BaseOrgan):
         inputs = {name: encoded[name] for name in input_names if name in encoded}
         missing = input_names.difference(inputs)
         if missing:
-            raise RuntimeError(f"AffectOrgan ONNX session missing tokenizer inputs: {sorted(missing)}")
+            raise RuntimeError(f"AffectEncoder ONNX session missing tokenizer inputs: {sorted(missing)}")
         logits = self._session.run(None, inputs)[0][0].astype(np.float32)
         scores = 1.0 / (1.0 + np.exp(-logits))
         id2label = getattr(self._config, "id2label", {})
@@ -315,7 +312,7 @@ class AffectOrgan(BaseOrgan):
         latency = (time.time() - start) * 1000
         self._record_call(latency, method="detect")
         _publish(
-            "organ.affect",
+            "encoder.affect",
             {
                 "text": text[:120],
                 "dominant_emotion": state.dominant_emotion,
@@ -385,8 +382,8 @@ class AffectOrgan(BaseOrgan):
         self._record_call((time.time() - start) * 1000)
         return results
 
-    def process(self, text: str, **kwargs: Any) -> OrganOutput:
-        """Unified organ interface."""
+    def process(self, text: str, **kwargs: Any) -> EncoderOutput:
+        """Unified encoder process entrypoint."""
         state = self.detect(text)
 
         # Encode affect state as a feature vector for substrate integration
@@ -403,7 +400,7 @@ class AffectOrgan(BaseOrgan):
         features[-2] = state.arousal
         features[-1] = state.certainty
 
-        return OrganOutput(
+        return EncoderOutput(
             features=features,
             metadata={
                 "dominant_emotion": state.dominant_emotion,
@@ -420,5 +417,5 @@ class AffectOrgan(BaseOrgan):
             },
             confidence=state.certainty,
             latency_ms=0.0,  # Already recorded internally
-            organ_name=self._name,
+            encoder_name=self._name,
         )

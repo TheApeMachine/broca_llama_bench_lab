@@ -29,7 +29,7 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass
 
-from ..organs.extraction import ExtractionOrgan
+from ..encoders.extraction import ExtractionEncoder
 from ..system.event_bus import get_default_bus
 
 logger = logging.getLogger(__name__)
@@ -76,17 +76,17 @@ class UtteranceIntent:
 
 
 class IntentGate:
-    """Zero-shot intent classifier backed by :class:`ExtractionOrgan`.
+    """Zero-shot intent classifier backed by :class:`ExtractionEncoder`.
 
     The gate exposes a single :meth:`classify` method that returns an
     :class:`UtteranceIntent`. Implementation is intentionally thin — the gate
     is responsible for *deciding*, not for owning a model. All ML capacity
-    lives in the organ.
+    lives in the extraction encoder.
     """
 
     def __init__(
         self,
-        organ: ExtractionOrgan,
+        extraction: ExtractionEncoder,
         *,
         labels: tuple[str, ...] = INTENT_LABELS,
         actionable_labels: frozenset[str] = ACTIONABLE_LABELS,
@@ -104,7 +104,7 @@ class IntentGate:
             raise ValueError(
                 f"storable_labels {sorted(unknown_storable)} not in labels {labels}"
             )
-        self._organ = organ
+        self._extraction = extraction
         self._labels = tuple(labels)
         self._actionable = frozenset(actionable_labels)
         self._storable = frozenset(storable_labels)
@@ -123,7 +123,7 @@ class IntentGate:
                 allows_storage=False,
                 scores={l: 0.0 for l in self._labels},
             )
-        ranked = self._organ.classify(
+        ranked = self._extraction.classify(
             text,
             labels=self._labels,
             multi_label=False,

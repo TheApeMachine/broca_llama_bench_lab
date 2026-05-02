@@ -157,19 +157,19 @@ def test_consolidation_still_revises_when_challengers_have_low_surprise(tmp_path
     assert current is not None and current[0] == challenger.lower()
 
 
-def test_runtime_router_uses_organ_relation_extractor(tmp_path: Path, fake_host_loader):
-    """Chat pipeline must route through the organ-backed extractor.
+def test_runtime_router_uses_encoder_relation_extractor(tmp_path: Path, fake_host_loader):
+    """Chat pipeline must route through the encoder-backed extractor.
 
     Knowledge ingestion (``core.knowledge.pipelines``) keeps using
     :class:`LLMRelationExtractor` because trusted documents need different
     parsing assumptions than adversarial chat input. The conversational
-    substrate must use :class:`OrganRelationExtractor` so requests like
+    substrate must use :class:`EncoderRelationExtractor` so requests like
     "Tell me a joke" can never be parsed into a triple and stored.
     """
 
-    from core.cognition.organ_relation_extractor import OrganRelationExtractor
+    from core.cognition.encoder_relation_extractor import EncoderRelationExtractor
 
     fake_host_loader()
     mind = build_substrate_controller(seed=0, db_path=tmp_path / "router_extractor.sqlite", namespace="ext", device="cpu", hf_token=False)
 
-    assert isinstance(mind.router.extractor, OrganRelationExtractor)
+    assert isinstance(mind.router.extractor, EncoderRelationExtractor)

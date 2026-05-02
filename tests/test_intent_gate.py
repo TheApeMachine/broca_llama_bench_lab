@@ -8,10 +8,10 @@ confidence 0.92. The gate must cleanly partition utterances into actionable
 feedback / acknowledgment) categories so the relation extractor downstream
 never even sees the non-actionable ones.
 
-These tests use a stub organ rather than the real GLiNER2 weights so the
+These tests use a stub classifier rather than the real GLiNER2 weights so the
 suite stays fast and the gate's *policy* — not the classifier's accuracy —
 is what is under test. A separate, slower test file exercises the actual
-ExtractionOrgan.classify call.
+:class:`ExtractionEncoder` ``classify`` call.
 """
 
 from __future__ import annotations
@@ -28,10 +28,10 @@ from core.cognition.intent_gate import (
 )
 
 
-class StubExtractionOrgan:
-    """Pretends to be an :class:`ExtractionOrgan` for the gate's purposes.
+class StubExtractionEncoder:
+    """Pretends to be an :class:`ExtractionEncoder` for the gate's purposes.
 
-    The gate only calls :meth:`classify` on the organ. The stub stores a
+    The gate only calls :meth:`classify` on the extraction encoder. The stub stores a
     canned response per text fragment so each test can spell out exactly
     what the classifier "sees" without any model weights.
     """
@@ -56,7 +56,7 @@ class StubExtractionOrgan:
 
 
 def _gate(responses: dict[str, list[tuple[str, float]]]) -> IntentGate:
-    return IntentGate(StubExtractionOrgan(responses))
+    return IntentGate(StubExtractionEncoder(responses))
 
 
 class TestIntentClassification:
@@ -109,7 +109,7 @@ class TestEdgeCases:
         intent = gate.classify("   \n\t  ")
         assert intent.is_actionable is False
 
-    def test_organ_returning_no_results_falls_to_first_label(self):
+    def test_classifier_returning_no_results_falls_to_first_label(self):
         gate = _gate({})  # no fragment matches → stub returns one (label, 0.0)
         intent = gate.classify("totally unmatched text")
         assert intent.label in INTENT_LABELS
@@ -143,27 +143,27 @@ class TestScoresAreAlwaysComplete:
 
 class TestConfigurationValidation:
     def test_actionable_labels_must_be_subset_of_labels(self):
-        organ = StubExtractionOrgan({})
+        extraction = StubExtractionEncoder({})
         with pytest.raises(ValueError, match="actionable_labels"):
             IntentGate(
-                organ,
+                extraction,
                 labels=("statement", "question"),
                 actionable_labels=frozenset({"statement", "command"}),
             )
 
     def test_storable_labels_must_be_subset_of_labels(self):
-        organ = StubExtractionOrgan({})
+        extraction = StubExtractionEncoder({})
         with pytest.raises(ValueError, match="storable_labels"):
             IntentGate(
-                organ,
+                extraction,
                 labels=("statement", "question"),
                 storable_labels=frozenset({"statement", "command"}),
             )
 
     def test_empty_labels_rejected(self):
-        organ = StubExtractionOrgan({})
+        extraction = StubExtractionEncoder({})
         with pytest.raises(ValueError, match="at least one label"):
-            IntentGate(organ, labels=())
+            IntentGate(extraction, labels=())
 
 
 class TestActionableLabelsExportedConstant:

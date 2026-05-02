@@ -28,7 +28,7 @@ When you fine-tune a model to learn a new fact, you degrade its existing
 knowledge. When you inject knowledge through a graft, the base model's
 capabilities remain bit-for-bit identical. The substrate can learn
 continuously — accumulate memories, revise beliefs, discover causal
-structure, compile habits — while the language organ stays pristine.
+structure, compile habits — while the frozen decoder stays pristine.
 
 ```
 ┌─────────────────────────────────────────────────────────┐
@@ -55,33 +55,33 @@ structure, compile habits — while the language organ stays pristine.
 
 ---
 
-## The cognitive organ matrix
+## The component matrix
 
-Every component has a **job title**. The matrix defines what each organ
-does, what it outputs, and where that output flows next.
+Every component has a **job title**. The matrix defines what each encoder or
+substrate module does, what it outputs, and where that output flows next.
 
-### Perceptual organs (frozen pre-trained models)
+### Perceptual encoders (frozen pre-trained)
 
-| Organ | Brain analogy | Model | Output | Flows to |
+| Encoder | Role | Model | Output | Flows to |
 |-------|---------------|-------|--------|----------|
-| **Language** (Broca's) | Broca's area | Llama 3.2 1B | Token stream | User |
-| **Visual cortex** | V1–V4 | DINOv2-Large (307M) | `[1024]` feature vector | Substrate frames |
-| **Ventral stream** | Inferotemporal | I-JEPA ViT-H (632M) | `[1280]` semantic features | Substrate frames |
-| **Dorsal stream** | Area MT/MST | V-JEPA2 ViT-H (632M) | `[1280]` temporal prediction | World model / SCM |
-| **Spatial cortex** | Parietal | Depth Anything V2 (335M) | `[1024]` depth + spatial stats | Substrate frames |
-| **Auditory cortex** | A1 + association | Whisper-turbo (809M) | Transcription + `[1280]` audio embedding | Extraction organ → Memory |
-| **Association cortex** | Superior temporal sulcus | ImageBind (1.13B) | `[1024]` shared multi-modal embedding | Cross-modal Hopfield retrieval |
+| **Language** (Broca's) | Speech interface | Llama 3.2 1B | Token stream | User |
+| **Visual cortex** | General vision | DINOv2-Large (307M) | `[1024]` feature vector | Substrate frames |
+| **Ventral stream** | Semantic vision | I-JEPA ViT-H (632M) | `[1280]` semantic features | Substrate frames |
+| **Dorsal stream** | Temporal / motion | V-JEPA2 ViT-H (632M) | `[1280]` temporal prediction | World model / SCM |
+| **Spatial cortex** | Depth / layout | Depth Anything V2 (335M) | `[1024]` depth + spatial stats | Substrate frames |
+| **Auditory cortex** | Speech + audio | Whisper-turbo (809M) | Transcription + `[1280]` audio embedding | Extraction encoder → Memory |
+| **Association cortex** | Cross-modal bind | ImageBind (1.13B) | `[1024]` shared multi-modal embedding | Cross-modal Hopfield retrieval |
 
-### Language understanding organs (frozen encoders, <10ms per utterance)
+### Language encoders (frozen, <10ms per utterance)
 
-| Organ | Brain analogy | Model | Output | Flows to |
+| Encoder | Role | Model | Output | Flows to |
 |-------|---------------|-------|--------|----------|
-| **Extraction** (Wernicke's) | Wernicke's area | GLiNER2 (205M) | Entities + relations + intent labels | Semantic memory, SCM, Router |
-| **Affect** | Limbic / insula | GoEmotions (125M) | 28 emotions + valence + arousal | Preference learning, Hawkes, Active inference |
+| **Extraction** | NER + relations + intent | GLiNER2 (205M) | Entities + relations + intent labels | Semantic memory, SCM, Router |
+| **Affect** | Emotion + state | GoEmotions (125M) | 28 emotions + valence + arousal | Preference learning, Hawkes, Active inference |
 
 ### Algebraic substrate (pure math, no learned weights)
 
-| Organ | Brain analogy | Job title | Input → Output |
+| Component | Role | Job title | Input → Output |
 |-------|---------------|-----------|----------------|
 | **VSA / HRR** | Hippocampal binding | Zero-shot analogy via circular convolution | Concepts → `[10000]` bound hypervector |
 | **Hopfield** | Hippocampal retrieval | Content-addressable pattern completion | Noisy query → nearest stored pattern |
@@ -106,7 +106,7 @@ does, what it outputs, and where that output flows next.
 
 | System | Job title | Data flow |
 |--------|-----------|-----------|
-| **EventBus** | Global workspace / blackboard | All organs publish; all organs subscribe |
+| **EventBus** | Global workspace / blackboard | All encoders publish; all encoders subscribe |
 | **Swarm** | Inter-node UDP multicast | Every EventBus event flows to LAN peers and back |
 | **Knowledge crawler** | Web perception | URLs → Trafilatura → GLiNER2 → Semantic memory |
 | **DMN** | Background processing | Consolidation, separation, discovery, chunking, tool foraging, REM |
@@ -116,18 +116,18 @@ does, what it outputs, and where that output flows next.
 
 ## The lifecycle of a thought
 
-To understand how these organs cooperate, trace a single piece of
+To understand how these components cooperate, trace a single piece of
 knowledge from first encounter through to compiled reflex.
 
 ### Phase 1: Perception (System 2 — deliberate, slow)
 
 The user says: *"Ada lives in Rome."*
 
-1. The **Extraction organ** (GLiNER2) fires in <10ms:
+1. The **Extraction encoder** (GLiNER2) fires in <10ms:
    - Entities: `[("Ada", person, 0.94), ("Rome", location, 0.97)]`
    - Relation: `(ada, lives_in, rome, 0.91)`
 
-2. The **Affect organ** (GoEmotions) fires in <5ms:
+2. The **Affect encoder** (GoEmotions) fires in <5ms:
    - Dominant: `neutral` (0.72)
    - No cognitive state signals above threshold
 
@@ -135,7 +135,7 @@ The user says: *"Ada lives in Rome."*
    `CognitiveFrame(intent="memory_write", subject="ada", answer="rome")`.
 
 4. **Semantic memory** stores the triple with confidence 0.91 and provenance
-   from the extraction organ. The **VSA codebook** binds
+   from the extraction encoder. The **VSA codebook** binds
    `subject ⊗ ada + predicate ⊗ lives_in + object ⊗ rome` into a single
    10,000-dim hypervector and stores it in the **Hopfield memory**.
 
@@ -146,7 +146,7 @@ The user says: *"Ada lives in Rome."*
 
 Later, the user asks: *"Where is Ada?"*
 
-1. **Extraction organ**: `intent=question`, entities: `[("Ada", person)]`
+1. **Extraction encoder**: `intent=question`, entities: `[("Ada", person)]`
 2. **Router**: `CognitiveFrame(intent="memory_lookup", subject="ada")`
 3. **Semantic memory**: recalls `(ada, lives_in, rome, confidence=0.91)`
 4. **Conformal predictor**: `|C| = 1` (only "rome" in the prediction set) → high confidence
@@ -202,7 +202,7 @@ Peers discover each other automatically via heartbeat (2s interval, 8s
 timeout). The substrate decides what to do with what it hears.
 
 ```
-Node A (LLM + visual organs)  ←──UDP multicast──→  Node B (extraction + affect + memory)
+Node A (LLM + visual encoders)  ←──UDP multicast──→  Node B (extraction + affect + memory)
          ↕                                                    ↕
 Node C (causal SCM + active inference)  ←────────→  Node D (knowledge crawler)
 ```
@@ -226,7 +226,7 @@ make paper                         # regenerate LaTeX paper from benchmarks
 
 ```
 core/
-├── organs/              # Frozen specialist models (perception, affect, extraction)
+├── encoders/            # Frozen specialist models (perception, affect, extraction)
 ├── cognition/           # Substrate controller, top-down control, predictive coding
 ├── causal/              # FiniteSCM, PC discovery, DAG utilities
 ├── memory/              # Hopfield, SQLite activation memory
@@ -274,7 +274,7 @@ downloads.
 
 | Term | Definition |
 |------|-----------|
-| **Graft** | A module spliced into the frozen LLM's forward pass. The substrate's only channel into the language organ. |
+| **Graft** | A module spliced into the frozen LLM's forward pass. The substrate's only channel into decoder activations. |
 | **Cognitive frame** | A non-linguistic content packet (`intent`, `subject`, `answer`, `confidence`, `evidence`) that the grafts translate into residual-stream and logit biases. |
 | **SCM** | Structural Causal Model. DAG + structural equations. Supports `do(·)` interventions, counterfactuals, backdoor/frontdoor adjustment. |
 | **EFE** | Expected Free Energy. The quantity active inference minimizes — balancing pragmatic value (reach preferred observations) with epistemic value (reduce uncertainty). |
@@ -284,4 +284,4 @@ downloads.
 | **Conformal** | Split-conformal prediction. Turns any scoring model into a set predictor with marginal coverage guarantee `P[y ∈ C(x)] ≥ 1−α`. Set size > 1 = Fristonian ambiguity signal. |
 | **DMN** | Default Mode Network. Background daemon that runs consolidation, separation, latent discovery, chunk compilation, and tool foraging between user turns. |
 | **Swarm** | UDP multicast peer communication. All events flow freely between LAN nodes. No orchestration. |
-| **Organ** | A frozen pre-trained model serving a specific cognitive function. The LLM is one organ (language production). DINOv2, Whisper, GLiNER2, GoEmotions are others. |
+| **Encoder** | A frozen pre-trained model for a specific modality or analytic task (vision, audio, GLiNER2, GoEmotions). Implemented under `core/encoders/`. The LLM is the separate speech decoder. |

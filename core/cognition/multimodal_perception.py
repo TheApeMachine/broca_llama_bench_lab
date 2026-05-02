@@ -1,4 +1,4 @@
-"""Multimodal organ routing for substrate observations."""
+"""Multimodal frozen-encoder routing for substrate observations."""
 
 from __future__ import annotations
 
@@ -8,33 +8,33 @@ from typing import Any, Mapping
 import torch
 import torch.nn.functional as F
 
-from ..organs.base import BaseOrgan, OrganOutput, OrganRegistry
+from ..encoders.base import BaseEncoder, EncoderOutput, EncoderRegistry
 from .observation import CognitiveObservation
 
 
 class MultimodalPerceptionPipeline:
-    """Runs frozen sensory organs and returns typed substrate observations."""
+    """Runs frozen modality encoders and returns typed substrate observations."""
 
     def __init__(
         self,
         *,
         device: torch.device | str | None = None,
-        organs: Mapping[str, BaseOrgan] | None = None,
+        encoders: Mapping[str, BaseEncoder] | None = None,
     ) -> None:
-        self.registry = OrganRegistry(default_device=device)
-        if organs is None:
-            self._register_default_organs(device=device)
+        self.registry = EncoderRegistry(default_device=device)
+        if encoders is None:
+            self._register_default_encoders(device=device)
         else:
-            for organ in organs.values():
-                self.registry.register(organ)
+            for encoder in encoders.values():
+                self.registry.register(encoder)
 
     @property
-    def registered_organs(self) -> list[str]:
-        return self.registry.all_organs
+    def registered_encoders(self) -> list[str]:
+        return self.registry.all_encoders
 
     @property
-    def loaded_organs(self) -> list[str]:
-        return self.registry.loaded_organs
+    def loaded_encoders(self) -> list[str]:
+        return self.registry.loaded_encoders
 
     def stats(self) -> dict[str, Any]:
         return self.registry.stats()
@@ -79,13 +79,13 @@ class MultimodalPerceptionPipeline:
         source: str = "audio",
         language: str | None = None,
     ) -> CognitiveObservation:
-        auditory = self._organ("auditory_cortex")
+        auditory = self._encoder("auditory_cortex")
         transcript = str(
             self._call(auditory, "transcribe", audio, sampling_rate=int(sampling_rate), language=language)
         ).strip()
         audio_output = self._call(auditory, "encode", audio, sampling_rate=int(sampling_rate))
-        if not isinstance(audio_output, OrganOutput):
-            raise TypeError("AuditoryOrgan.encode must return OrganOutput")
+        if not isinstance(audio_output, EncoderOutput):
+            raise TypeError("AuditoryEncoder.encode must return EncoderOutput")
 
         outputs = {
             "auditory_cortex": audio_output,
@@ -107,41 +107,41 @@ class MultimodalPerceptionPipeline:
             },
         )
 
-    def _register_default_organs(self, *, device: torch.device | str | None) -> None:
-        from ..organs.auditory import AuditoryOrgan
-        from ..organs.binding import BindingOrgan
-        from ..organs.perception import DINOv2Organ, DepthOrgan, IJEPAOrgan, VJEPAOrgan
+    def _register_default_encoders(self, *, device: torch.device | str | None) -> None:
+        from ..encoders.auditory import AuditoryEncoder
+        from ..encoders.binding import BindingEncoder
+        from ..encoders.perception import DINOv2Encoder, DepthEncoder, IJEPAEncoder, VJEPAEncoder
 
-        for organ in (
-            DINOv2Organ(device=str(device) if device is not None else None),
-            IJEPAOrgan(device=str(device) if device is not None else None),
-            VJEPAOrgan(device=str(device) if device is not None else None),
-            DepthOrgan(device=str(device) if device is not None else None),
-            AuditoryOrgan(device=str(device) if device is not None else None),
-            BindingOrgan(device=str(device) if device is not None else None),
+        for encoder in (
+            DINOv2Encoder(device=str(device) if device is not None else None),
+            IJEPAEncoder(device=str(device) if device is not None else None),
+            VJEPAEncoder(device=str(device) if device is not None else None),
+            DepthEncoder(device=str(device) if device is not None else None),
+            AuditoryEncoder(device=str(device) if device is not None else None),
+            BindingEncoder(device=str(device) if device is not None else None),
         ):
-            self.registry.register(organ)
+            self.registry.register(encoder)
 
-    def _organ(self, name: str) -> BaseOrgan:
-        organ = self.registry.get_or_load(name)
-        if organ is None:
-            raise RuntimeError(f"multimodal organ {name!r} is not registered")
-        return organ
+    def _encoder(self, name: str) -> BaseEncoder:
+        encoder = self.registry.get_or_load(name)
+        if encoder is None:
+            raise RuntimeError(f"multimodal encoder {name!r} is not registered")
+        return encoder
 
-    def _run(self, name: str, method: str, *args: Any, **kwargs: Any) -> OrganOutput:
-        organ = self._organ(name)
-        output = self._call(organ, method, *args, **kwargs)
-        if not isinstance(output, OrganOutput):
-            raise TypeError(f"{name}.{method} must return OrganOutput")
+    def _run(self, name: str, method: str, *args: Any, **kwargs: Any) -> EncoderOutput:
+        encoder = self._encoder(name)
+        output = self._call(encoder, method, *args, **kwargs)
+        if not isinstance(output, EncoderOutput):
+            raise TypeError(f"{name}.{method} must return EncoderOutput")
         if output.features is None:
             raise ValueError(f"{name}.{method} returned no features")
         return output
 
     @staticmethod
-    def _call(organ: BaseOrgan, method: str, *args: Any, **kwargs: Any) -> Any:
-        fn = getattr(organ, method, None)
+    def _call(encoder: BaseEncoder, method: str, *args: Any, **kwargs: Any) -> Any:
+        fn = getattr(encoder, method, None)
         if not callable(fn):
-            raise RuntimeError(f"organ {organ.name!r} does not implement {method!r}")
+            raise RuntimeError(f"encoder {encoder.name!r} does not implement {method!r}")
         return fn(*args, **kwargs)
 
     def _observation(
@@ -149,15 +149,15 @@ class MultimodalPerceptionPipeline:
         modality: str,
         source: str,
         answer: str,
-        outputs: Mapping[str, OrganOutput],
+        outputs: Mapping[str, EncoderOutput],
         *,
         evidence: dict[str, Any],
     ) -> CognitiveObservation:
         if not outputs:
-            raise ValueError("multimodal observation requires at least one organ output")
+            raise ValueError("multimodal observation requires at least one encoder output")
         features = self._combine_features(outputs)
         confidence = min(self._confidence(output) for output in outputs.values())
-        organ_evidence = {
+        encoder_evidence = {
             name: self._output_evidence(output)
             for name, output in outputs.items()
         }
@@ -169,38 +169,38 @@ class MultimodalPerceptionPipeline:
             answer=answer,
             evidence={
                 **dict(evidence),
-                "organ_outputs": organ_evidence,
+                "encoder_outputs": encoder_evidence,
             },
         )
 
     @staticmethod
-    def _combine_features(outputs: Mapping[str, OrganOutput]) -> torch.Tensor:
+    def _combine_features(outputs: Mapping[str, EncoderOutput]) -> torch.Tensor:
         parts: list[torch.Tensor] = []
         for output in outputs.values():
             if output.features is None:
-                raise ValueError(f"organ output {output.organ_name!r} has no features")
+                raise ValueError(f"encoder output {output.encoder_name!r} has no features")
             part = output.features.detach().float().cpu().flatten()
             if part.numel() <= 0:
-                raise ValueError(f"organ output {output.organ_name!r} has empty features")
+                raise ValueError(f"encoder output {output.encoder_name!r} has empty features")
             if not torch.isfinite(part).all():
-                raise ValueError(f"organ output {output.organ_name!r} has non-finite features")
+                raise ValueError(f"encoder output {output.encoder_name!r} has non-finite features")
             parts.append(F.normalize(part, dim=0))
         return F.normalize(torch.cat(parts), dim=0)
 
     @staticmethod
-    def _confidence(output: OrganOutput) -> float:
+    def _confidence(output: EncoderOutput) -> float:
         conf = float(output.confidence)
         if not math.isfinite(conf):
-            raise ValueError(f"organ output {output.organ_name!r} confidence is not finite")
+            raise ValueError(f"encoder output {output.encoder_name!r} confidence is not finite")
         if conf < 0.0 or conf > 1.0:
-            raise ValueError(f"organ output {output.organ_name!r} confidence must be in [0, 1]")
+            raise ValueError(f"encoder output {output.encoder_name!r} confidence must be in [0, 1]")
         return conf
 
-    def _output_evidence(self, output: OrganOutput) -> dict[str, Any]:
+    def _output_evidence(self, output: EncoderOutput) -> dict[str, Any]:
         if output.features is None:
-            raise ValueError(f"organ output {output.organ_name!r} has no features")
+            raise ValueError(f"encoder output {output.encoder_name!r} has no features")
         return {
-            "organ_name": output.organ_name,
+            "encoder_name": output.encoder_name,
             "feature_dim": int(output.features.numel()),
             "confidence": self._confidence(output),
             "latency_ms": float(output.latency_ms),

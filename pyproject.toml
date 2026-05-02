@@ -44,5 +44,5 @@ include = ["core", "core.*", "research_lab", "research_lab.*"]
 testpaths = ["tests"]
 pythonpath = ["."]
 markers = [
-    "real_organs: opt out of automatic organ stubbing; the test must load the real ExtractionOrgan / AffectOrgan model weights",
+    "real_encoders: opt out of automatic encoder stubbing; the test must load the real ExtractionEncoder / AffectEncoder model weights",
 ]

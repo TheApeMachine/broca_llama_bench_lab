@@ -10,9 +10,9 @@ import pytest
 import core.cognition.substrate as substrate_mod
 from core.cli import build_substrate_controller
 from core.cognition.affect_trace import PersistentAffectTrace
-from core.organs.affect import AffectOrgan, AffectState, EmotionScore
+from core.encoders.affect import AffectEncoder, AffectState, EmotionScore
 
-from conftest import make_stub_llm_pair, stub_substrate_organs
+from conftest import make_stub_llm_pair, stub_substrate_encoders
 
 
 def _emotion(label: str, score: float) -> EmotionScore:
@@ -68,7 +68,7 @@ class FakeTokenizer:
         self.inner = stub_inner
 
 
-class SequenceAffectOrgan:
+class SequenceAffectEncoder:
     def __init__(self, states: list[AffectState]) -> None:
         self.states = list(states)
         self.calls: list[str] = []
@@ -77,7 +77,7 @@ class SequenceAffectOrgan:
         _ = threshold
         self.calls.append(text)
         if not self.states:
-            raise RuntimeError("SequenceAffectOrgan exhausted")
+            raise RuntimeError("SequenceAffectEncoder exhausted")
         return self.states.pop(0)
 
 
@@ -96,17 +96,17 @@ def fake_host_loader(monkeypatch: pytest.MonkeyPatch):
     return _make
 
 
-def test_affect_organ_preserves_full_confidence_distribution() -> None:
-    organ = AffectOrgan(use_onnx=False, threshold=0.15)
-    organ._loaded = True
-    organ._pipeline = lambda text: [
+def test_affect_encoder_preserves_full_confidence_distribution() -> None:
+    encoder = AffectEncoder(use_onnx=False, threshold=0.15)
+    encoder._loaded = True
+    encoder._pipeline = lambda text: [
         {"label": "anger", "score": 0.499},
         {"label": "annoyance", "score": 0.348},
         {"label": "disapproval", "score": 0.273},
         {"label": "neutral", "score": 0.039},
     ]
 
-    state = organ.detect("That is not acceptable")
+    state = encoder.detect("That is not acceptable")
 
     assert [item.label for item in state.confidences] == [
         "anger",
@@ -118,7 +118,7 @@ def test_affect_organ_preserves_full_confidence_distribution() -> None:
     assert state.distribution()["neutral"] == pytest.approx(0.039)
     assert 0.0 <= state.preference_strength <= 1.0
     assert state.certainty == pytest.approx(
-        AffectOrgan._distribution_certainty(state.confidences, entropy=state.entropy)
+        AffectEncoder._distribution_certainty(state.confidences, entropy=state.entropy)
     )
 
 
@@ -171,7 +171,7 @@ def test_chat_reply_records_user_and_assistant_affect_alignment(
         device="cpu",
         hf_token=False,
     )
-    stub_substrate_organs(
+    stub_substrate_encoders(
         mind,
         intent_responses={"please help": [("request", 0.98)]},
     )
@@ -189,7 +189,7 @@ def test_chat_reply_records_user_and_assistant_affect_alignment(
         arousal=0.2,
         confidences=[("anger", 0.05), ("annoyance", 0.1), ("neutral", 0.85)],
     )
-    mind.affect_organ = SequenceAffectOrgan([user, assistant])  # type: ignore[assignment]
+    mind.affect_encoder = SequenceAffectEncoder([user, assistant])  # type: ignore[assignment]
     monkeypatch.setattr(
         mind,
         "_stream_substrate_chat",

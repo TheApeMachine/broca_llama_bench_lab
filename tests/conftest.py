@@ -37,22 +37,22 @@ def _mosaic_test_sqlite(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None
 
 
 @pytest.fixture(autouse=True)
-def _autostub_substrate_organs(request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch) -> None:
-    """Replace organs with canned stubs whenever a test builds a ``SubstrateController``.
+def _autostub_substrate_encoders(request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Replace heavy encoders with canned stubs whenever a test builds a ``SubstrateController``.
 
-    ``SubstrateController.__init__`` instantiates :class:`ExtractionOrgan`
-    and :class:`AffectOrgan`, which lazy-load HuggingFace weights on first
+    ``SubstrateController.__init__`` instantiates :class:`ExtractionEncoder`
+    and :class:`AffectEncoder`, which lazy-load HuggingFace weights on first
     use. The first ``comprehend`` call therefore tries to download
     ``fastino/gliner2-base-v1`` and SamLowe's GoEmotions model, neither of
     which the unit suite should depend on. We wrap ``__init__`` with a
-    post-step that swaps the freshly-built organs out for canned stubs so
+    post-step that swaps the freshly-built encoders out for canned stubs so
     every test gets a substrate that *functions* without network access.
 
-    Tests that genuinely want the real organs (e.g. ``test_organ_integration``)
-    can opt out by adding the ``real_organs`` marker.
+    Tests that genuinely want the real weights (e.g. ``test_encoder_integration``)
+    can opt out by adding the ``real_encoders`` marker.
     """
 
-    if request.node.get_closest_marker("real_organs"):
+    if request.node.get_closest_marker("real_encoders"):
         return
 
     import core.cognition.substrate as substrate_mod
@@ -61,7 +61,7 @@ def _autostub_substrate_organs(request: pytest.FixtureRequest, monkeypatch: pyte
 
     def patched_init(self, *args, **kwargs):
         real_init(self, *args, **kwargs)
-        stub_substrate_organs(self)
+        stub_substrate_encoders(self)
 
     monkeypatch.setattr(substrate_mod.SubstrateController, "__init__", patched_init)
 
@@ -174,27 +174,27 @@ def make_stub_llm_pair(extractor: Callable[[str], tuple[str, str, str] | None] |
 
 
 # ---------------------------------------------------------------------------
-# Substrate organ stubbing.
+# Substrate encoder stubbing.
 #
 # Every ``SubstrateController.comprehend`` call now runs through the intent
-# gate (``ExtractionOrgan.classify``) and the affect organ
-# (``AffectOrgan.detect``), which lazy-load model weights from HuggingFace on
+# gate (``ExtractionEncoder.classify``) and the affect encoder
+# (``AffectEncoder.detect``), which lazy-load model weights from HuggingFace on
 # first use. Tests that exercise memory, journals, or grafts do not care
 # about the gate's accuracy — they only need a substrate that *functions*.
-# ``stub_substrate_organs`` swaps in tiny canned implementations so those
+# ``stub_substrate_encoders`` swaps in tiny canned implementations so those
 # tests stay fast and deterministic.
 #
-# Tests that DO want to exercise the real organs (``test_organ_integration``,
+# Tests that DO want to exercise the real weights (``test_encoder_integration``,
 # ``test_substrate_intent_gating`` opting into stubs explicitly) should not
 # call this helper.
 # ---------------------------------------------------------------------------
 
 
-class _CannedExtractionOrgan:
-    """Minimal stand-in for :class:`core.organs.extraction.ExtractionOrgan`.
+class _CannedExtractionEncoder:
+    """Minimal stand-in for :class:`core.encoders.extraction.ExtractionEncoder`.
 
     Defaults ``classify`` to "statement" so the substrate's intent gate
-    routes everything as actionable, which matches the pre-organ behavior
+    routes everything as actionable, which matches the pre-extractor behavior
     that legacy tests expect. Tests can pass per-fragment overrides for
     either ``classify`` or ``extract_relations`` results.
     """
@@ -238,11 +238,11 @@ class _CannedExtractionOrgan:
         return _heuristic_extract_relations(text)
 
 
-class _CannedAffectOrgan:
-    """Returns a fixed neutral :class:`core.organs.affect.AffectState`."""
+class _CannedAffectEncoder:
+    """Returns a fixed neutral :class:`core.encoders.affect.AffectState`."""
 
     def __init__(self, state=None):
-        from core.organs.affect import AffectState
+        from core.encoders.affect import AffectState
 
         self._state = state if state is not None else AffectState(
             dominant_emotion="neutral",
@@ -264,10 +264,10 @@ def _heuristic_extract_relations(text: str):
     This mirrors the ``_default_stub_extract`` behavior used by the legacy
     LLM extractor stubs in this conftest, so memory-layer tests that send
     sentences like ``"ada is in rome ."`` continue to produce a triple
-    after we route extraction through the organ.
+    after we route extraction through the encoder.
     """
 
-    from core.organs.extraction import ExtractedRelation
+    from core.encoders.extraction import ExtractedRelation
 
     import re
 
@@ -286,7 +286,7 @@ def _heuristic_extract_relations(text: str):
     ]
 
 
-def stub_substrate_organs(
+def stub_substrate_encoders(
     mind,
     *,
     intent_responses: "dict[str, list[tuple[str, float]]] | None" = None,
@@ -294,27 +294,27 @@ def stub_substrate_organs(
     affect_state=None,
     default_intent_label: str = "statement",
     default_intent_score: float = 0.95,
-) -> _CannedExtractionOrgan:
-    """Replace a substrate's organs with deterministic canned stubs.
+) -> _CannedExtractionEncoder:
+    """Replace a substrate's encoders with deterministic canned stubs.
 
-    Returns the canned extraction organ so tests can inspect ``classify_calls``
+    Returns the canned extraction encoder so tests can inspect ``classify_calls``
     or ``relation_calls`` after the fact.
     """
 
     from core.cognition.intent_gate import IntentGate
-    from core.cognition.organ_relation_extractor import OrganRelationExtractor
+    from core.cognition.encoder_relation_extractor import EncoderRelationExtractor
 
-    extraction = _CannedExtractionOrgan(
+    extraction = _CannedExtractionEncoder(
         intent_responses=intent_responses,
         relation_responses=relation_responses,
         default_intent_label=default_intent_label,
         default_intent_score=default_intent_score,
     )
-    mind.extraction_organ = extraction
-    mind.affect_organ = _CannedAffectOrgan(affect_state)
+    mind.extraction_encoder = extraction
+    mind.affect_encoder = _CannedAffectEncoder(affect_state)
     mind.intent_gate = IntentGate(extraction)
-    mind.router.extractor = OrganRelationExtractor(
+    mind.router.extractor = EncoderRelationExtractor(
         intent_gate=mind.intent_gate,
-        organ=extraction,
+        extraction=extraction,
     )
     return extraction

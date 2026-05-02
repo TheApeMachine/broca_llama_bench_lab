@@ -1,8 +1,7 @@
-"""Binding organ: ImageBind for multi-sensory association and cross-modal retrieval.
+"""Binding encoder: ImageBind for multi-sensory association and cross-modal retrieval.
 
-Brain analogy: Multi-sensory association cortex (superior temporal sulcus, insula).
-Binds what you see with what you hear, feel, and sense into a unified embedding
-space — enabling cross-modal transfer (audio → image retrieval, depth → text, etc.).
+Maps multiple input modalities into a shared embedding space for cross-modal
+retrieval and similarity.
 
 Model: nielsr/imagebind-huge (1.13B params, ~2.3GB fp16)
 - Single shared embedding space across 6 modalities
@@ -11,7 +10,7 @@ Model: nielsr/imagebind-huge (1.13B params, ~2.3GB fp16)
 
 License: CC-BY-NC-SA 4.0 (NON-COMMERCIAL ONLY)
 
-The organ enables the substrate to:
+Provides:
 - Bind visual observations with audio context (video understanding)
 - Ground language in multi-sensory experience
 - Retrieve memories across modalities (hear a sound → recall an image)
@@ -28,7 +27,7 @@ import torch
 import torch.nn.functional as F
 
 from ..system.event_bus import get_default_bus
-from .base import BaseOrgan, OrganOutput
+from .base import BaseEncoder, EncoderOutput
 
 logger = logging.getLogger(__name__)
 
@@ -46,7 +45,7 @@ _IMAGEBIND_DIM = 1024  # ImageBind's shared embedding dimension
 Modality = Literal["image", "text", "audio", "depth", "thermal", "imu"]
 
 
-class BindingOrgan(BaseOrgan):
+class BindingEncoder(BaseEncoder):
     """Frozen ImageBind model for multi-sensory embedding.
 
     Maps inputs from any of 6 modalities into a shared 1024-dim space
@@ -55,7 +54,7 @@ class BindingOrgan(BaseOrgan):
     will have high cosine similarity.
 
     Usage:
-        organ = BindingOrgan()
+        organ = BindingEncoder()
         organ.load()
 
         # Encode different modalities into same space
@@ -85,7 +84,7 @@ class BindingOrgan(BaseOrgan):
             from imagebind.models.imagebind_model import ModalityType
         except ImportError as exc:
             raise ImportError(
-                "BindingOrgan requires the native `imagebind` package "
+                "BindingEncoder requires the native `imagebind` package "
                 "(pip install git+https://github.com/facebookresearch/ImageBind). "
                 "The transformers backend is not used because it cannot encode all wired modalities."
             ) from exc
@@ -97,16 +96,16 @@ class BindingOrgan(BaseOrgan):
         # Freeze
         for param in self._model.parameters():
             param.requires_grad = False
-        logger.info("BindingOrgan: loaded via %s backend", self._backend)
+        logger.info("BindingEncoder: loaded via %s backend", self._backend)
 
     @torch.no_grad()
-    def encode_image(self, image: Any) -> OrganOutput:
+    def encode_image(self, image: Any) -> EncoderOutput:
         """Encode an image into the shared embedding space."""
         self._ensure_loaded()
         start = time.time()
 
         if self._backend != "imagebind_native":
-            raise RuntimeError("BindingOrgan must be loaded with the native ImageBind backend")
+            raise RuntimeError("BindingEncoder must be loaded with the native ImageBind backend")
 
         from imagebind import data as ib_data
         if isinstance(image, str):
@@ -119,19 +118,19 @@ class BindingOrgan(BaseOrgan):
         elapsed = (time.time() - start) * 1000
         self._record_call(elapsed, method="encode_image")
         _publish(
-            "organ.binding.encode",
+            "encoder.binding.encode",
             {"modality": "image", "latency_ms": elapsed, "feature_dim": int(features.numel())},
         )
-        return OrganOutput(features=features, metadata={"modality": "image"}, latency_ms=elapsed, organ_name=self._name)
+        return EncoderOutput(features=features, metadata={"modality": "image"}, latency_ms=elapsed, encoder_name=self._name)
 
     @torch.no_grad()
-    def encode_text(self, text: str) -> OrganOutput:
+    def encode_text(self, text: str) -> EncoderOutput:
         """Encode text into the shared embedding space."""
         self._ensure_loaded()
         start = time.time()
 
         if self._backend != "imagebind_native":
-            raise RuntimeError("BindingOrgan must be loaded with the native ImageBind backend")
+            raise RuntimeError("BindingEncoder must be loaded with the native ImageBind backend")
 
         from imagebind import data as ib_data
         inputs = {self._modality_type.TEXT: ib_data.load_and_transform_text([text], self.device)}
@@ -141,7 +140,7 @@ class BindingOrgan(BaseOrgan):
         elapsed = (time.time() - start) * 1000
         self._record_call(elapsed, method="encode_text")
         _publish(
-            "organ.binding.encode",
+            "encoder.binding.encode",
             {
                 "modality": "text",
                 "text": text[:120],
@@ -149,16 +148,16 @@ class BindingOrgan(BaseOrgan):
                 "feature_dim": int(features.numel()),
             },
         )
-        return OrganOutput(features=features, metadata={"modality": "text", "text": text[:100]}, latency_ms=elapsed, organ_name=self._name)
+        return EncoderOutput(features=features, metadata={"modality": "text", "text": text[:100]}, latency_ms=elapsed, encoder_name=self._name)
 
     @torch.no_grad()
-    def encode_audio(self, audio: Any) -> OrganOutput:
+    def encode_audio(self, audio: Any) -> EncoderOutput:
         """Encode audio into the shared embedding space."""
         self._ensure_loaded()
         start = time.time()
 
         if self._backend != "imagebind_native":
-            raise RuntimeError("BindingOrgan must be loaded with the native ImageBind backend")
+            raise RuntimeError("BindingEncoder must be loaded with the native ImageBind backend")
 
         from imagebind import data as ib_data
         if isinstance(audio, str):
@@ -171,14 +170,14 @@ class BindingOrgan(BaseOrgan):
         elapsed = (time.time() - start) * 1000
         self._record_call(elapsed, method="encode_audio")
         _publish(
-            "organ.binding.encode",
+            "encoder.binding.encode",
             {"modality": "audio", "latency_ms": elapsed, "feature_dim": int(features.numel())},
         )
-        return OrganOutput(features=features, metadata={"modality": "audio"}, latency_ms=elapsed, organ_name=self._name)
+        return EncoderOutput(features=features, metadata={"modality": "audio"}, latency_ms=elapsed, encoder_name=self._name)
 
     @torch.no_grad()
-    def cross_modal_similarity(self, output_a: OrganOutput, output_b: OrganOutput) -> float:
-        """Compute cosine similarity between two organ outputs from any modalities."""
+    def cross_modal_similarity(self, output_a: EncoderOutput, output_b: EncoderOutput) -> float:
+        """Compute cosine similarity between two encoder outputs from any modalities."""
         if output_a.features is None or output_b.features is None:
             raise ValueError("cross_modal_similarity requires features from both outputs")
         return float(F.cosine_similarity(
@@ -186,7 +185,7 @@ class BindingOrgan(BaseOrgan):
             output_b.features.unsqueeze(0),
         ).item())
 
-    def process(self, input_data: Any, **kwargs: Any) -> OrganOutput:
+    def process(self, input_data: Any, **kwargs: Any) -> EncoderOutput:
         """Route to appropriate encoder based on input type."""
         modality = kwargs.get("modality", "auto")
 

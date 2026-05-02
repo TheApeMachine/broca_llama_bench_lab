@@ -13,7 +13,7 @@ prompt---conflates two fundamentally different concerns: \emph{what to say}
 inference, control).
 
 This paper proposes an alternative division of labour.  We treat the LLM as a
-\textbf{language organ}: a frozen decoder whose only responsibility is to
+\textbf{frozen language decoder}: its only responsibility is to
 produce fluent, well-formed language.  All cognitive operations---persistent
 memory, causal reasoning, decision-making under uncertainty, belief revision,
 and top-down control---are handled by a separate \textbf{cognitive substrate}
@@ -47,7 +47,7 @@ guarantees rather than from learned or heuristic modules:
 
 The LLM's weights are \emph{never updated}.  Behavioural changes arise entirely
 from the substrate's reads and writes through grafts.  This design has three
-practical advantages: (1)~the language organ can be swapped (e.g.\ Llama~3.2
+practical advantages: (1)~the frozen decoder can be swapped (e.g.\ Llama~3.2
 $\to$ a future checkpoint) without retraining any cognitive component;
 (2)~the substrate's state is fully persistent (SQLite WAL), surviving restarts
 and enabling long-running agents; and (3)~every cognitive claim---retrieval

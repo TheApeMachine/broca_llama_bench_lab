@@ -9,7 +9,7 @@ import time
 from pathlib import Path
 from typing import Any
 
-from ..organs.affect import AffectState
+from ..encoders.affect import AffectState
 
 
 class PersistentAffectTrace:

@@ -58,7 +58,7 @@ class StrengthInputs:
             — in that case the function falls back on memory confidence alone
             (no separate sharpness factor).
         affect_certainty:     ``1 - normalized_uncertainty`` from the affect
-            organ (one minus the entropy of its emotion distribution divided
+            encoder (one minus the entropy of its emotion distribution divided
             by ``log(n_emotions)``). High when one emotion dominates, low when
             the user's affect is ambiguous; multiplied so an ambiguous user
             cools the bias even if memory is confident.

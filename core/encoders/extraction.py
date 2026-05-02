@@ -1,12 +1,10 @@
-"""Extraction organ: zero-shot NER, relation extraction, and classification.
+"""Extraction encoder: zero-shot NER, relation extraction, and classification.
 
 Replaces the LLM-based ``LLMRelationExtractor`` and regex intent detection with
 a single GLiNER2 encoder that handles entities, relations, and classification
 in one model call. There is no fallback chain — if the model cannot be loaded
-or a method is missing, the organ raises so the flaw is exposed rather than
+or a method is missing, this module raises so the flaw is exposed rather than
 papered over.
-
-Brain analogy: Wernicke's area — language comprehension and semantic parsing.
 
 Model: ``fastino/gliner2-base-v1`` (205M params, ~400MB, CPU-first design),
 loaded via the ``gliner2`` package — *not* ``gliner``. The two libraries
@@ -23,7 +21,7 @@ from dataclasses import dataclass, field
 from typing import Any, Sequence
 
 from ..system.event_bus import get_default_bus
-from .base import BaseOrgan, OrganOutput
+from .base import BaseEncoder, EncoderOutput
 
 logger = logging.getLogger(__name__)
 
@@ -87,7 +85,7 @@ class ExtractionResult:
     raw_text: str = ""
 
 
-class ExtractionOrgan(BaseOrgan):
+class ExtractionEncoder(BaseEncoder):
     """Frozen GLiNER2 model for structured information extraction."""
 
     def __init__(
@@ -116,10 +114,10 @@ class ExtractionOrgan(BaseOrgan):
         for required in _REQUIRED_GLINER2_METHODS:
             if not callable(getattr(self._model, required, None)):
                 raise RuntimeError(
-                    f"ExtractionOrgan requires GLiNER2 with `{required}`; "
+                    f"ExtractionEncoder requires GLiNER2 with `{required}`; "
                     f"loaded model {self._model_id!r} does not expose it."
                 )
-        logger.info("ExtractionOrgan: loaded %s", self._model_id)
+        logger.info("ExtractionEncoder: loaded %s", self._model_id)
 
     def extract_entities(
         self,
@@ -164,7 +162,7 @@ class ExtractionOrgan(BaseOrgan):
         latency = (time.time() - start) * 1000
         self._record_call(latency, method="extract_entities")
         _publish(
-            "organ.extraction.entities",
+            "encoder.extraction.entities",
             {
                 "text": text[:120],
                 "n_entities": len(entities),
@@ -196,24 +194,24 @@ class ExtractionOrgan(BaseOrgan):
         ol = obj_clean.strip().lower()
         if not sl or not ol:
             raise ValueError(
-                "ExtractionOrgan._predicate_gap_from_source: empty subject or object span"
+                "ExtractionEncoder._predicate_gap_from_source: empty subject or object span"
             )
         i = tl.find(sl)
         j = tl.find(ol)
         if i < 0 or j < 0:
             raise ValueError(
-                f"ExtractionOrgan._predicate_gap_from_source: substring not located "
+                f"ExtractionEncoder._predicate_gap_from_source: substring not located "
                 f"subject={subj_clean!r} object={obj_clean!r}"
             )
         if j <= i + len(sl):
             raise ValueError(
-                "ExtractionOrgan._predicate_gap_from_source: object does not follow subject span"
+                "ExtractionEncoder._predicate_gap_from_source: object does not follow subject span"
             )
         gap_raw = text_full[i + len(sl) : j].strip().strip(",").strip()
         gap_norm = gap_raw.strip().lower()
         if not gap_norm:
             raise ValueError(
-                "ExtractionOrgan._predicate_gap_from_source: empty gap between grounded entities"
+                "ExtractionEncoder._predicate_gap_from_source: empty gap between grounded entities"
             )
         return gap_norm
 
@@ -283,7 +281,7 @@ class ExtractionOrgan(BaseOrgan):
         latency = (time.time() - start) * 1000
         self._record_call(latency, method="extract_relations")
         _publish(
-            "organ.extraction.relations",
+            "encoder.extraction.relations",
             {
                 "text": text[:120],
                 "n_relations": len(relations),
@@ -344,7 +342,7 @@ class ExtractionOrgan(BaseOrgan):
         latency = (time.time() - start) * 1000
         self._record_call(latency, method="classify")
         _publish(
-            "organ.extraction.classify",
+            "encoder.extraction.classify",
             {
                 "text": text[:120],
                 "labels": list(label_list),
@@ -355,7 +353,7 @@ class ExtractionOrgan(BaseOrgan):
         )
         return results
 
-    def process(self, text: str, **kwargs: Any) -> OrganOutput:
+    def process(self, text: str, **kwargs: Any) -> EncoderOutput:
         _ = kwargs
         self._ensure_loaded()
         start = time.time()
@@ -367,7 +365,7 @@ class ExtractionOrgan(BaseOrgan):
             labels=("question", "statement", "request", "complaint", "praise"),
         )
         elapsed = (time.time() - start) * 1000
-        return OrganOutput(
+        return EncoderOutput(
             features=None,
             metadata={
                 "entities": [
@@ -382,7 +380,7 @@ class ExtractionOrgan(BaseOrgan):
             },
             confidence=max((e.score for e in result.entities), default=0.5),
             latency_ms=elapsed,
-            organ_name=self._name,
+            encoder_name=self._name,
         )
 
     @staticmethod

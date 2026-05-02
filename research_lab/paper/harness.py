@@ -427,7 +427,7 @@ def write_hf_native_experiment_tex(
         "",
         r"\paragraph{Protocol.}",
         (
-            "We evaluate the frozen language organ on publicly available NLP benchmarks "
+            "We evaluate the frozen causal language model on publicly available NLP benchmarks "
             "using the in-repository HuggingFace \\texttt{datasets} harness. "
             f"Multiple-choice items are scored by {mc_rule}; "
             f"generation-style items use {gen_rule}. "
