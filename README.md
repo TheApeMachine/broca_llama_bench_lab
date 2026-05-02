@@ -1,678 +1,256 @@
 # MOSAIC
 
-> **A frozen Llama treated as a *language organ*. All cognition — memory,
-> inference, causal reasoning, planning, self-improvement — lives in a
-> persistent substrate that biases the LLM token by token through grafts,
-> never through the prompt.**
+> **The LLM is locked in a glass box. It only speaks. Everything else —
+> memory, reasoning, perception, planning, emotion, causal inference —
+> lives in a persistent cognitive substrate that slips intelligent notes
+> through the vents of the residual stream.**
 
-The lab is a research playground for an opinionated thesis: that today's
-LLMs are extraordinary surface-form generators trapped inside an
-architecture that asks them to *also* be world models, planners,
-schedulers, and memory. Pull those jobs out into a separate substrate
-with proper algebra (POMDPs, SCMs, VSA, Hopfield, Hawkes, conformal
-prediction, predictive coding) and the LLM is freed to do what it is
-actually best at: produce fluent, well-formed language.
+---
 
-The Llama checkpoint is **frozen**. Nothing in this repo trains its
-weights. Behavior changes come from the substrate's reads/writes and
-from a small set of trainable *grafts* that splice into the host's
-residual stream and logits.
+## The thesis
+
+Today's LLMs are extraordinary surface-form generators trapped inside an
+architecture that asks them to *also* be world models, planners, memory
+stores, and causal reasoners. They are none of those things. They are
+associative language cortex — and that is all this system asks of them.
+
+MOSAIC demotes the LLM to a **speech interface**: a frozen decoder whose
+weights are never updated, whose only job is to produce fluent language.
+All higher cognition is handled by a **cognitive substrate** built from
+components with published mathematical guarantees. The substrate
+communicates with the LLM exclusively through **grafts** — small modules
+that bias the residual stream and logit distribution at every decoding
+step, without consuming prompt tokens and without touching frozen weights.
+
+This is not an engineering shortcut to save on training cost. It is a
+**deliberate architectural choice** that prevents catastrophic forgetting.
+When you fine-tune a model to learn a new fact, you degrade its existing
+knowledge. When you inject knowledge through a graft, the base model's
+capabilities remain bit-for-bit identical. The substrate can learn
+continuously — accumulate memories, revise beliefs, discover causal
+structure, compile habits — while the language organ stays pristine.
 
 ```
-memory · active inference · causal substrate · workspace
-                       │
-                       ▼
-            latent cognitive frame
-                       │
-                       ▼
-                  Broca grafts
-                       │
-                       ▼
-            frozen Llama language organ
+┌─────────────────────────────────────────────────────────┐
+│  Cognitive Substrate (System 2 — learns continuously)   │
+│                                                         │
+│  perception · memory · reasoning · planning · emotion   │
+│                                                         │
+│         ┌──────────────────────────────┐                │
+│         │    Trainable Grafts          │                │
+│         │  (residual bias, logit bias, │                │
+│         │   lexical plan — per step)   │                │
+│         └──────────────┬───────────────┘                │
+└────────────────────────┼────────────────────────────────┘
+                         ▼
+┌─────────────────────────────────────────────────────────┐
+│  Frozen LLM (System 1 — never changes)                  │
+│                                                         │
+│  "The glass box" — produces fluent language, nothing    │
+│  else. Weights locked. Vocabulary locked. The graft     │
+│  forces it to describe ideas it has no words for by     │
+│  inventing metaphors from its existing subword space.   │
+└─────────────────────────────────────────────────────────┘
 ```
 
 ---
 
-## Table of contents
+## The cognitive organ matrix
 
-- [Quick start](#quick-start)
-- [The big picture](#the-big-picture)
-- [Architecture](#architecture)
-  - [The frozen language host and its grafts](#the-frozen-language-host-and-its-grafts)
-  - [Cognitive frames and the global workspace](#cognitive-frames-and-the-global-workspace)
-  - [Persistent semantic memory and the journal](#persistent-semantic-memory-and-the-journal)
-  - [The Default Mode Network](#the-default-mode-network)
-  - [Active inference, POMDPs, and the SCM](#active-inference-pomdps-and-the-scm)
-  - [The substrate's algebra](#the-substrates-algebra)
-  - [Top-down cognitive control](#top-down-cognitive-control)
-  - [Meta-learning: macros, native tools, dynamic grafts](#meta-learning-macros-native-tools-dynamic-grafts)
-  - [Self-improvement](#self-improvement)
-  - [The substrate writes its own paper](#the-substrate-writes-its-own-paper)
-- [Live observability](#live-observability)
-- [Running things](#running-things)
-- [Benchmarks](#benchmarks)
-- [Tests](#tests)
-- [Project layout](#project-layout)
-- [Glossary](#glossary)
+Every component has a **job title**. The matrix defines what each organ
+does, what it outputs, and where that output flows next.
+
+### Perceptual organs (frozen pre-trained models)
+
+| Organ | Brain analogy | Model | Output | Flows to |
+|-------|---------------|-------|--------|----------|
+| **Language** (Broca's) | Broca's area | Llama 3.2 1B | Token stream | User |
+| **Visual cortex** | V1–V4 | DINOv2-Large (307M) | `[1024]` feature vector | Substrate frames |
+| **Ventral stream** | Inferotemporal | I-JEPA ViT-H (632M) | `[1280]` semantic features | Substrate frames |
+| **Dorsal stream** | Area MT/MST | V-JEPA2 ViT-H (632M) | `[1280]` temporal prediction | World model / SCM |
+| **Spatial cortex** | Parietal | Depth Anything V2 (335M) | `[1024]` depth + spatial stats | Substrate frames |
+| **Auditory cortex** | A1 + association | Whisper-turbo (809M) | Transcription + `[1280]` audio embedding | Extraction organ → Memory |
+| **Association cortex** | Superior temporal sulcus | ImageBind (1.13B) | `[1024]` shared multi-modal embedding | Cross-modal Hopfield retrieval |
+
+### Language understanding organs (frozen encoders, <10ms per utterance)
+
+| Organ | Brain analogy | Model | Output | Flows to |
+|-------|---------------|-------|--------|----------|
+| **Extraction** (Wernicke's) | Wernicke's area | GLiNER2 (205M) | Entities + relations + intent labels | Semantic memory, SCM, Router |
+| **Affect** | Limbic / insula | GoEmotions (125M) | 28 emotions + valence + arousal | Preference learning, Hawkes, Active inference |
+
+### Algebraic substrate (pure math, no learned weights)
+
+| Organ | Brain analogy | Job title | Input → Output |
+|-------|---------------|-----------|----------------|
+| **VSA / HRR** | Hippocampal binding | Zero-shot analogy via circular convolution | Concepts → `[10000]` bound hypervector |
+| **Hopfield** | Hippocampal retrieval | Content-addressable pattern completion | Noisy query → nearest stored pattern |
+| **Hawkes** | Working memory heat | Temporal intuition — conversational pacing | Event stream → decay-weighted intensity `float` |
+| **Conformal** | Uncertainty estimation | Coverage-guaranteed set prediction | Softmax dist → prediction set with `P[y∈C] ≥ 1−α` |
+| **SCM** | Causal reasoning | `do(·)` calculus, counterfactuals, backdoor adjustment | Intervention query → probability `float` |
+| **Active inference** | Decision-making | EFE minimization over POMDPs | Belief state → action + posterior entropy |
+| **Dirichlet preference** | Personality / values | Bayesian preference learning | Feedback signal → updated `C` vector |
+
+### Control pathways (grafts — the corticocortical connections)
+
+| Graft | Where it injects | What it does |
+|-------|-----------------|--------------|
+| **TrainableFeatureGraft** | `final_hidden` | Projects cognitive frame into residual stream at calibrated SNR |
+| **LexicalPlanGraft** | `final_hidden` | Biases toward a speech plan of substrate-chosen tokens |
+| **LogitBiasGraft** | `logits` | Content-aware subword bonus from frame subject/predicate/answer |
+| **HypothesisMaskingGraft** | `logits` | Physically blocks rejected tokens via negative logit bias |
+| **CausalConstraintGraft** | KV memory | Pulls LLM toward SCM's `P(Y|do(T=t))` when attending cause concept |
+| **ModalityShiftGraft** | `final_hidden` | Injects cognitive mood direction (analytical, fluent, etc.) |
+
+### Infrastructure
+
+| System | Job title | Data flow |
+|--------|-----------|-----------|
+| **EventBus** | Global workspace / blackboard | All organs publish; all organs subscribe |
+| **Swarm** | Inter-node UDP multicast | Every EventBus event flows to LAN peers and back |
+| **Knowledge crawler** | Web perception | URLs → Trafilatura → GLiNER2 → Semantic memory |
+| **DMN** | Background processing | Consolidation, separation, discovery, chunking, tool foraging, REM |
+| **Self-improve** | Meta-learning daemon | Propose patch → Docker validate → PR → re-benchmark |
+
+---
+
+## The lifecycle of a thought
+
+To understand how these organs cooperate, trace a single piece of
+knowledge from first encounter through to compiled reflex.
+
+### Phase 1: Perception (System 2 — deliberate, slow)
+
+The user says: *"Ada lives in Rome."*
+
+1. The **Extraction organ** (GLiNER2) fires in <10ms:
+   - Entities: `[("Ada", person, 0.94), ("Rome", location, 0.97)]`
+   - Relation: `(ada, lives_in, rome, 0.91)`
+
+2. The **Affect organ** (GoEmotions) fires in <5ms:
+   - Dominant: `neutral` (0.72)
+   - No cognitive state signals above threshold
+
+3. The substrate's **CognitiveRouter** receives both outputs and constructs a
+   `CognitiveFrame(intent="memory_write", subject="ada", answer="rome")`.
+
+4. **Semantic memory** stores the triple with confidence 0.91 and provenance
+   from the extraction organ. The **VSA codebook** binds
+   `subject ⊗ ada + predicate ⊗ lives_in + object ⊗ rome` into a single
+   10,000-dim hypervector and stores it in the **Hopfield memory**.
+
+5. The **Hawkes process** records a `memory_write` event — the intensity on
+   that channel spikes and begins exponential decay.
+
+### Phase 2: Retrieval (System 2 — but getting faster)
+
+Later, the user asks: *"Where is Ada?"*
+
+1. **Extraction organ**: `intent=question`, entities: `[("Ada", person)]`
+2. **Router**: `CognitiveFrame(intent="memory_lookup", subject="ada")`
+3. **Semantic memory**: recalls `(ada, lives_in, rome, confidence=0.91)`
+4. **Conformal predictor**: `|C| = 1` (only "rome" in the prediction set) → high confidence
+5. **Grafts activate**: The `TrainableFeatureGraft` injects the frame features into the
+   residual stream. The `LexicalPlanGraft` biases toward tokens `["ada", "is", "in", "rome"]`.
+   The `LogitBiasGraft` boosts subwords of "rome".
+6. **Frozen LLM** generates: *"Ada is in Rome."* — the grafts won, the LLM spoke what
+   the substrate knew, without ever seeing "Ada" or "Rome" in its prompt.
+
+### Phase 3: Consolidation (DMN — background, between turns)
+
+While the user is silent, the Default Mode Network ticks:
+
+1. **Consolidation**: Episode graph PageRank boosts confidence of central facts.
+2. **Separation**: If another entity also has `lives_in = rome`, the DMN detects
+   ambiguity (binary entropy) and prepares a clarifying-question cue.
+3. **Latent discovery**: Random `do(·)` interventions on the SCM check if `ada.lives_in`
+   causally affects any other variable.
+
+### Phase 4: Compilation (System 2 → System 1)
+
+After the pattern `memory_write → memory_lookup → answer` repeats many times:
+
+1. The **DMNChunkingCompiler** detects the repeated intent sequence.
+2. It averages the feature vectors of every instance into a single **compiled macro**.
+3. On the next occurrence, the substrate skips the multi-step routing and injects
+   the macro's feature vector directly — the thought has become a reflex.
+
+This is the musician who no longer looks at the fretboard. The causal discovery
+that was once slow, deliberate, conscious reasoning has been compiled into a
+fast, automatic System 1 response. The documentation of this progression — from
+first encounter through deliberate analysis to automatic execution — is the
+architecture's most compelling feature.
+
+### Phase 5: Ontological expansion (when the LLM has no words)
+
+When the substrate discovers a novel concept via the PC algorithm — a causal
+node that has no English name — the **Hebbian orthogonalization** module
+(Gram-Schmidt) creates a new, mathematically independent axis in concept space.
+The frozen LLM has no token for this concept. But the `TrainableFeatureGraft`
+maps the new orthogonal vector into the closest available approximation within
+the LLM's residual stream, forcing it to *invent a metaphor* — to describe the
+negative space of the new idea using the subwords it already possesses.
+
+---
+
+## The swarm
+
+Multiple MOSAIC instances on a LAN communicate freely via UDP multicast
+(`239.255.77.1:50077`, TTL=1). There is no orchestration. Every EventBus
+event flows to the network. Every network event flows to the local bus.
+Peers discover each other automatically via heartbeat (2s interval, 8s
+timeout). The substrate decides what to do with what it hears.
+
+```
+Node A (LLM + visual organs)  ←──UDP multicast──→  Node B (extraction + affect + memory)
+         ↕                                                    ↕
+Node C (causal SCM + active inference)  ←────────→  Node D (knowledge crawler)
+```
 
 ---
 
 ## Quick start
 
 ```bash
-# Bootstrap .venv and install deps (torch, HF stack, Textual, pytest) via uv:
-make install
-
-# Or manually: python3 -m venv .venv && source .venv/bin/activate &&
-#   uv sync --extra tui --extra test
-
-# Pip-only editable install:
-# pip install -e ".[tui,test]"
-
-# Authenticate for the gated Llama-3.2-1B-Instruct checkpoint:
-huggingface-cli login          # …or…
-export HF_TOKEN=hf_…
-
-# Talk to the substrate (full stack; canonical DB under ./runs/):
-make tui
-# or: python -m core.chat_tui
-
-make chat
-# or: python -m core.chat_cli
+make install                       # uv sync with all extras
+export HF_TOKEN=hf_…              # for gated Llama checkpoint
+make tui                           # full TUI with substrate
+make chat                          # plain streaming CLI
+make bench                         # benchmarks (standard + architecture probes)
+make paper                         # regenerate LaTeX paper from benchmarks
 ```
-
-Model checkpoint and device follow environment (`MODEL_ID` / `BENCHMARK_MODEL`, `M_DEVICE`). Persistent substrate state lives in **`runs/broca_substrate.sqlite`** (see [`core/substrate_runtime.py`](core/substrate_runtime.py)). Pytest uses an isolated DB via `MOSAIC_TEST_DB`.
-
-> **Logging.** `core` does not reconfigure global logging by default. Set
-> `AUTO_CONFIGURE_LAB_LOGGING=1` to apply the lab format on import, or
-> call `configure_lab_logging()` after import. The default attaches a
-> stderr stream **and** a rotating file handler at `runs/broca.log`.
-> The TUI silences stderr automatically so it does not fight the UI.
 
 ---
 
-## The big picture
-
-```mermaid
-flowchart TB
-    subgraph User["🧑 User"]
-      U[utterance]
-    end
-
-    subgraph Substrate["🧠 Cognitive substrate (System 2)"]
-      direction TB
-      Comp[Comprehend → CognitiveFrame]
-      Mem[(Persistent semantic memory<br/>SQLite + WAL)]
-      Journal[(Workspace journal<br/>+ episode graph)]
-      WS[GlobalWorkspace<br/>working memory + intrinsic cues]
-      DMN[Default Mode Network<br/>5 phases + REM]
-      AI[Active inference agents<br/>spatial · causal · tools]
-      SCM[Finite SCM<br/>+ PC discovery]
-      Algebra[VSA · Hopfield · Hawkes<br/>Conformal · Dirichlet]
-      Top[Top-down control<br/>masking · interruption · modality · do-calculus]
-      Meta[Macro chunks · Native tools<br/>Dynamic grafts]
-    end
-
-    subgraph Host["🗣 Frozen Llama (System 1)"]
-      G1[FeatureGraft<br/>residual bias]
-      G2[LexicalPlanGraft<br/>token-bridge]
-      G3[LogitBiasGraft<br/>content-token bonus]
-      LLM[Frozen Llama<br/>weights never updated]
-    end
-
-    U --> Comp
-    Comp <--> Mem
-    Comp --> Journal
-    Comp --> WS
-    WS --> DMN
-    DMN --> Mem
-    DMN --> Journal
-    DMN --> Meta
-    AI <--> SCM
-    SCM <--> Algebra
-    WS --> AI
-    Top --> G1
-    Top --> G3
-    Comp -- frame features --> G1
-    Comp -- speech plan --> G2
-    Comp -- content tokens --> G3
-    G1 --> LLM
-    G2 --> LLM
-    G3 --> LLM
-    LLM --> Reply[streamed reply]
-    Reply --> User
-```
-
-The thick line: the LLM never sees the substrate's **state**. It sees a
-biased residual stream and a biased logit distribution. The LLM is still
-free to choose surface form, fluency, and ordering — the substrate only
-nudges it toward saying the *right thing*.
-
----
-
-## Architecture
-
-### The frozen language host and its grafts
-
-`LlamaBrocaHost` ([core/llama_broca_host.py](core/llama_broca_host.py))
-is a thin wrapper around a Hugging Face causal LM. It exposes named
-*slots* that grafts can attach to:
-
-| Slot             | Where in the model              | Used by                                                   |
-|------------------|---------------------------------|-----------------------------------------------------------|
-| `layer.{i}.post` | Output of transformer layer `i` | Memory grafts, dynamic activation modes                   |
-| `final_hidden`   | Just before the LM head         | `TrainableBrocaGraft` (residual bias), `LexicalPlanGraft` |
-| `logits`         | LM head output                  | `SubstrateLogitBiasGraft`, `HypothesisMaskingGraft`       |
-
-Three grafts ship by default:
-
-- **`TrainableBrocaGraft`** — projects a continuous cognitive frame
-  vector into the host's residual stream with a target signal-to-noise
-  ratio so it can win over an arbitrarily deep autoregressive prefix.
-- **`LexicalPlanGraft`** — pushes the next-token distribution toward a
-  small "speech plan" of tokens the substrate would have liked the host
-  to emit, with confidence-modulated decay so the LLM is not held
-  hostage to the bias after the first hit.
-- **`SubstrateLogitBiasGraft`** — content-aware token bias derived from
-  the cognitive frame's subject / predicate / answer (encoded into
-  subwords).
-
-> **Why grafts and not prompt-stuffing?** Prompts cost tokens, fight the
-> chat template, and are read once. A graft is read **every step**, has
-> direct access to the host's hidden geometry, and its strength is
-> annealed by substrate confidence. The substrate's voice does not
-> compete with the user's text.
-
-The host also supports KV-style memory grafts and per-layer hooks; see
-[core/grafts.py](core/grafts.py) and [core/host.py](core/host.py).
-
----
-
-### Cognitive frames and the global workspace
-
-```python
-@dataclass
-class CognitiveFrame:
-    intent: str            # open vocabulary: "memory_lookup", "causal_effect", …
-    subject: str = ""
-    answer: str = "unknown"
-    confidence: float = 1.0
-    evidence: dict = …
-```
-
-Every utterance is routed to a **CognitiveFrame** by `CognitiveRouter`
-([core/broca.py](core/broca.py)). The router uses an
-`LLMRelationExtractor` (the host itself, used as a parser — not as a
-generator) to extract subject / predicate / object triples; questions
-turn into `memory_lookup`, declarations into `memory_write`, and
-abstract queries into `active_action` or `causal_effect`.
-
-Frames are published to a `GlobalWorkspace` — a small in-memory
-blackboard that also carries `IntrinsicCue`s (memory gaps, low
-confidence, causal uncertainty). The DMN reads cues to decide what to
-think about while the user is silent.
-
----
-
-### Persistent semantic memory and the journal
-
-Everything important is durable. SQLite WAL is the storage substrate;
-the same database file is shared across components under namespaces.
-
-| Component                        | Role                                                                                |
-|----------------------------------|-------------------------------------------------------------------------------------|
-| `PersistentSemanticMemory`       | Subject-predicate-object claims with confidence + provenance                        |
-| `WorkspaceJournal`               | Append-only log of every (utterance, frame) pair                                    |
-| `EpisodeAssociationGraph`        | Weighted edges between consecutive episodes — fuel for PageRank-based consolidation |
-| `PersistentHawkes`               | Excitation matrix + last-event times across restarts                                |
-| `PersistentConformalCalibration` | Nonconformity scores per channel                                                    |
-| `PersistentPreference`           | Dirichlet concentrations per active-inference faculty                               |
-| `PersistentOntologicalRegistry`  | Promoted orthogonal axes for frequent concepts                                      |
-| `MacroChunkRegistry`             | Compiled cognitive macros (System 2 → System 1)                                     |
-| `NativeToolRegistry`             | Synthesized callable tools registered as SCM equations                              |
-| `SQLiteActivationMemory`         | Captured activation modes for dynamic grafts                                        |
-
-Belief revision uses log-odds aggregation and is *resistant to
-high-surprise spam*: three poisoned challengers with high prediction
-gap will not flip a trusted belief, but two corroborating low-surprise
-ones will. See [tests/test_relation_extraction_and_consolidation.py](tests/test_relation_extraction_and_consolidation.py).
-
----
-
-### The Default Mode Network
-
-The substrate runs a daemon thread — `CognitiveBackgroundWorker` — that
-ticks every few seconds even when the user is silent. It is the
-cognitive equivalent of what a brain does between turns:
-re-organization, dream-like exploration, preference updating.
-
-```mermaid
-flowchart LR
-    Tick(("DMN tick")) --> P1[1 · Consolidation]
-    P1 --> P2[2 · Separation]
-    P2 --> P3[3 · Latent discovery]
-    P3 --> P4[4 · Chunk compilation]
-    P4 --> P5[5 · Tool foraging]
-    P5 --> CC[Belief revision]
-    CC -. user idle ≥ N s .-> REM[REM sleep<br/>replay · PC discovery · Hawkes refit]
-```
-
-| Phase                   | What it does                                                                                 |
-|-------------------------|----------------------------------------------------------------------------------------------|
-| **1 Consolidation**     | Decay episode edges → PageRank → boost confidence of facts cited by central episodes         |
-| **2 Separation**        | Detect ambiguous subjects via binary entropy → emit clarifying-question cue                  |
-| **3 Latent discovery**  | Random `do(·)` interventions on the SCM; transitive closure on the episode graph             |
-| **4 Chunk compilation** | Average feature vectors of repeated motifs → register a macro                                |
-| **5 Tool foraging**     | EFE-driven decision to synthesize a new native tool when existing ones are insufficient      |
-| **REM (idle)**          | Replay journal samples; refit Hawkes excitation; rerun PC algorithm to grow a discovered SCM |
-
-Each phase emits structured reflections (visible in the TUI activity
-feed and the SQLite reflections table) so you can audit what the
-substrate did between turns.
-
----
-
-### Active inference, POMDPs, and the SCM
-
-The substrate decides what to do by minimizing **Expected Free Energy**
-(Friston). Two POMDPs run in parallel:
-
-1. **Spatial / action POMDP** — derived from `build_tiger_pomdp`, used
-   for "what should I do" queries.
-2. **Causal POMDP** — derived from `build_causal_epistemic_pomdp(scm)`,
-   used for "does X cause Y" queries.
-
-A `CoupledEFEAgent` arbitrates which faculty wins on each turn, and the
-winning posterior entropy modulates the LLM's sampling temperature:
-*confused substrate → exploratory LLM; decisive substrate → near-greedy LLM*.
-
-The world model is a **`FiniteSCM`** ([core/causal.py](core/causal.py))
-— a discrete structural causal model with exact `do(·)` and
-counterfactual evaluation. It starts as Simpson's paradox (a sanity
-benchmark) and grows in two ways:
-
-- **PC algorithm** ([core/causal_discovery.py](core/causal_discovery.py))
-  — constraint-based discovery using G² conditional-independence tests
-  and Meek's orientation rules. Run during REM sleep over journal
-  observations to learn a fresh SCM matching the user's actual data.
-- **Native tools** — synthesized Python functions that become
-  endogenous SCM equations (see below).
-
-Preferences (the SCM's `C` vector) are **online-Bayesian**:
-`DirichletPreference` keeps a posterior over preferred observations
-and updates from explicit user feedback or derived signals. The
-preference is the substrate's "personality" — but it learns.
-
----
-
-### The substrate's algebra
-
-The mathematical layer that makes the whole thing not just a vector DB:
-
-| Component                                                                                      | What it gives you                                                                                                                                      |
-|------------------------------------------------------------------------------------------------|--------------------------------------------------------------------------------------------------------------------------------------------------------|
-| **VSA / HRR** ([core/vsa.py](core/vsa.py))                                                     | Holographic Reduced Representations. Bind triples, unbind roles, bundle without re-encoding. O(d log d) via FFT. Capacity ≈ 0.5·d/log d at d = 10 000. |
-| **Modern Continuous Hopfield** ([core/hopfield.py](core/hopfield.py))                          | Ramsauer et al. 2020. Exponential storage in `d`, one-step retrieval. β derived from store geometry — no hand tuning.                                  |
-| **Multivariate Hawkes** ([core/hawkes.py](core/hawkes.py))                                     | Self- and mutually-exciting event channels — the substrate's working-memory "heat". O(1) per arrival via running exponential cache.                    |
-| **Split-conformal prediction** ([core/conformal.py](core/conformal.py))                        | Vovk-style coverage guarantee `P[y ∈ C(x)] ≥ 1−α`. \|C\| > 1 raises an intrinsic cue → clarifying question.                                            |
-| **Dirichlet preference** ([core/preference_learning.py](core/preference_learning.py))          | Conjugate-Bayesian online updates of the active-inference `C`.                                                                                         |
-| **Hebbian orthogonalization** ([core/ontological_expansion.py](core/ontological_expansion.py)) | Frequent concepts are promoted to dedicated unit axes via Gram–Schmidt, sharpening retrieval over time.                                                |
-| **Predictive coding** ([core/predictive_coding.py](core/predictive_coding.py))                 | Teacher-forced cross-entropy gap between graft-on / graft-off — the substrate's surprise signal.                                                       |
-
-> **Why so many systems?** Each one has a published mathematical
-> guarantee. Stack them and you get a substrate where every interesting
-> claim — retrieval correctness, coverage, capacity, convergence — has
-> a paper trail rather than a vibe.
-
----
-
-### Top-down cognitive control
-
-Predictive-coding-inspired override channels for when the substrate
-needs to put its foot down ([core/top_down_control.py](core/top_down_control.py)):
-
-| Mechanism                          | Effect                                                                                                                                                                                   |
-|------------------------------------|------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
-| **`HypothesisMaskingGraft`**       | Negative logit bias that *physically* blocks rejected hypothesis tokens. Paired with `IterativeHypothesisSearch` to prune the hypothesis space until something passes the evaluator.     |
-| **`EpistemicInterruptionMonitor`** | Streaming generator that runs an evaluator every `check_every` tokens. On a logical violation, truncates the last K tokens and re-injects a high-magnitude "re-evaluate" feature vector. |
-| **`ModalityShiftGraft`**           | Continuous bias toward a named cognitive mood (`analytical`, `fluent`, …) by injecting a unit-norm direction into the residual stream every step.                                        |
-| **`CausalConstraintGraft`**        | KV-memory graft pre-loaded with `P(Y \| do(T=t))` from the SCM. Whenever the LLM attends to the cause concept, it is invisibly pulled toward the SCM's verdict.                          |
-
-This is where the architecture earns its System 1 / System 2 framing:
-the LLM is the fast associative cortex, the substrate is the strict
-frontal cortex, and these grafts are the corticocortical pathway.
-
----
-
-### Meta-learning: macros, native tools, dynamic grafts
-
-The substrate is not just stateful — it builds new cognitive
-infrastructure as it goes.
-
-#### Macro chunks (System 2 → System 1)
-
-When the DMN sees the same intent prefix repeat across many episodes
-(e.g. `memory_lookup → causal_effect → active_action`), the
-`DMNChunkingCompiler` averages the feature vectors of every instance
-and registers a single compiled macro. On the next utterance whose
-intent prefix matches, the substrate skips the slow multi-step routing
-and injects the macro's compiled feature vector directly.
-
-#### Native tools
-
-When the SCM cannot answer a question with its existing equations and
-the EFE of `synthesize_tool` exceeds the EFE of `query_existing`, the
-substrate synthesizes Python source defining `def fn(values: dict) -> object`,
-compiles it under a restricted `__builtins__`, *verifies* it on sample
-inputs (and, optionally, against a per-tool conformal predictor), and —
-on success — calls `scm.add_endogenous(...)`. The new function is now
-**part of the world model**: every future `do(·)` query can use it.
-
-Run optionally inside `DockerToolSandbox`
-([core/docker_sandbox.py](core/docker_sandbox.py)) for resource
-isolation.
-
-#### Dynamic grafts
-
-`DynamicGraftSynthesizer` captures the *mean residual-stream
-activation* the host produces when conditioned on a priming prompt,
-stores it as a continuous addressable mode vector, and re-loads it
-into a `KVMemoryGraft` later. Loading the mode forces the host into
-that cognitive style instantly — no need to re-prepend the priming
-text every turn.
-
----
-
-### Self-improvement
-
-`SelfImproveDockerWorker`
-([core/docker_self_improve_worker.py](core/docker_self_improve_worker.py))
-is an opt-in second daemon (independent of the DMN) that periodically:
-
-1. Asks the substrate, via `chat_reply`, for a unified-diff patch and a
-   task summary.
-2. Spins up an isolated Docker container, clones the repo at
-   `BASE_BRANCH`, applies the patch, runs `pytest`, optionally runs
-   the demo.
-3. On success: commits, pushes a new branch, opens a PR through `gh`.
-
-Outcomes (success or failure) are written back into the substrate's
-semantic memory and reflections, so the next planning round sees its
-own track record.
-
-> **Opt-in and gated.** Requires `BROCA_SELF_IMPROVE=1` (or
-> `--self-improve`), `GITHUB_TOKEN` with `repo` scope, Docker, and a
-> resolvable `git` remote. Defaults are conservative: 1 cycle per
-> hour, 4 GiB memory, 2 CPUs, 30-minute timeout. Set
-> `BROCA_SELF_IMPROVE_RUN_PAPER=1` to also refresh the LaTeX
-> experiments after every successful Docker cycle (see below).
-
----
-
-### The substrate writes its own paper
-
-The lab ships a [LaTeX scaffold](paper/main.tex) and a benchmark-to-TeX
-harness ([core/paper/harness.py](core/paper/harness.py)) so the
-substrate can keep a continuously up-to-date technical report on
-itself. The narrative sections are hand-edited; everything that should
-be backed by **numbers** is auto-generated from a fresh benchmark run.
-
-```mermaid
-flowchart LR
-    subgraph Generated["paper/include/experiment/<br/>(auto-generated)"]
-      T1[hf_native_vanilla_table.tex]
-      T2[hf_native_comparison_table.tex]
-      F1[hf_native_accuracy_by_task.pdf]
-      J1[hf_native_summary.json]
-      X1[exp_hf_native_benchmark.tex]
-      X2[exp_broca_architecture.tex]
-      M[_inputs.tex<br/>auto-manifest]
-    end
-
-    subgraph Authored["paper/section/<br/>(hand-edited)"]
-      A1[01_abstract.tex]
-      A2[02_introduction.tex]
-      A3[03_methods.tex]
-      A4[04_discussion.tex]
-      A5[05_conclusion.tex]
-    end
-
-    BR[python -m core.paper] -->|HF datasets benchmark| Generated
-    BR -->|Broca architecture probes| Generated
-    Generated --> Main[paper/main.tex]
-    Authored --> Main
-    Main -->|latexmk / pdflatex| PDF[paper/main.pdf]
-
-    SI[SelfImproveDockerWorker<br/>after a green cycle] -. BROCA_SELF_IMPROVE_RUN_PAPER=1 .-> BR
-```
-
-**One command builds the PDF end-to-end:**
-
-```bash
-make paper
-# == make paper-bench  →  python -m core.paper
-# == make paper-pdf    →  latexmk -pdf paper/main.tex   (or pdflatex ×2)
-```
-
-| Make target | What it does |
-| --- | --- |
-| `make paper-bench` | Runs the native HF benchmark (preset / limit configurable via env) and the Broca architecture probes; writes per-task accuracy tables, the paired vanilla-vs-Broca-shell comparison, the matplotlib accuracy figure, and `summary.json` into `paper/include/experiment/`; auto-rebuilds the `_inputs.tex` manifest. |
-| `make paper-pdf` | Compiles `paper/main.tex` to `paper/main.pdf` with `latexmk` if available, otherwise two `pdflatex` passes. |
-| `make paper` | The full pipeline: refresh experiments, then build the PDF. |
-
-What the harness writes:
-
-- **Per-task accuracy table** for the vanilla decoder.
-- **Paired comparison table** vanilla decoder vs. `LlamaBrocaHost`-shell
-  on the same weights and items — wrapper-integrity check, surfaced as
-  table when both runs share at least one task.
-- **Per-task accuracy bar chart** copied straight from the benchmark
-  run directory (`accuracy_by_task.pdf`/`.png`).
-- **Architecture probe table** comparing `baseline_bare_language_host`
-  vs. `enhanced_broca_architecture` on speech-exact and answer-present
-  metrics, with a third row for the delta.
-- **Stub TeX with a status note** when a block cannot be refreshed
-  (missing HF token, missing Docker, GPT-2 backend, etc.) so the PDF
-  always builds and tells you *why* a section is empty.
-
-Tunables (all read from environment by the harness):
-
-| Variable | Effect | Default |
-| --- | --- | --- |
-| `PAPER_MODEL` / `BENCHMARK_MODEL` | Checkpoint to evaluate | `meta-llama/Llama-3.2-1B-Instruct` |
-| `PAPER_NATIVE_PRESET` | Native preset (`smoke` … `full`) | `quick` |
-| `PAPER_BENCH_LIMIT` | Items per task | `50` |
-| `PAPER_BENCH_SEED` / `BENCHMARK_SEED` | Sampling seed | `0` |
-| `PAPER_DEVICE` / `BENCHMARK_DEVICE` | Torch device override | auto |
-| `PAPER_SKIP_NATIVE=1` | Skip the HF benchmark step | off |
-| `PAPER_SKIP_ARCH_EVAL=1` | Skip the architecture probe step | off |
-| `HF_TOKEN` | For gated checkpoints | — |
-
-**Closing the loop with self-improvement.** Set
-`BROCA_SELF_IMPROVE_RUN_PAPER=1` and every successful Docker cycle of
-`SelfImproveDockerWorker` calls `refresh_paper_experiments()` after
-the validation passes. The substrate now ships a PR *and* updates its
-own paper to reflect the new metrics — a tight closed loop from
-"propose change" → "validate in container" → "land in master" →
-"re-run benchmarks" → "regenerate the paper".
-
-> **Why a paper, not just a metrics dump?** A paper forces structure:
-> abstract → introduction → methods → experiments → discussion →
-> conclusion. The substrate has to fit its results into a frame a human
-> can read top-to-bottom. Numbers without that frame rot in JSON files
-> nobody opens; numbers in a typeset PDF with a manifest of inputs and
-> a build pipeline get read, cited, and audited.
-
----
-
-## Live observability
-
-Two observability primitives are wired through the substrate so a UI
-or a debugger can watch it think:
-
-### `BrocaMind.snapshot()`
-
-A read-only, JSON-friendly dict aggregating model · memory · journal ·
-workspace · DMN · self-improve · substrate · preferences · last-chat
-state. Cheap (no SQL writes), thread-safe, and per-subsystem failures
-do not break the snapshot.
-
-### Event bus ([core/event_bus.py](core/event_bus.py))
-
-A thread-safe pub/sub with bounded per-subscriber ring buffers.
-Subsystems publish at the high-signal points:
-
-| Topic                                         | When                                                              |
-|-----------------------------------------------|-------------------------------------------------------------------|
-| `frame.comprehend`                            | Every utterance, post-routing                                     |
-| `intrinsic_cue`                               | Per cue raised by `_intrinsic_scan`                               |
-| `consolidation`                               | Each `consolidate_once` call                                      |
-| `dmn.tick`                                    | At the end of every DMN cycle, with per-phase summary             |
-| `chat.start` / `chat.complete`                | Around every `chat_reply`                                         |
-| `self_improve.cycle_start` / `cycle_complete` | Around each self-improve cycle                                    |
-| `log.<level>`                                 | Forwarded by `LogToBusHandler` from the standard `logging` stream |
-
-Subscribers register on one or more topics (or wildcard `"*"`) and
-drain events on a tick. The bus drops *oldest* on overflow — a slow UI
-cannot stall the substrate.
-
-### The Textual TUI
+## Project structure
 
 ```
-┌──────────────────────┬──────────────────────────────────────┬──────────────────────┐
-│  Cognitive frame     │           Chat (streaming)           │  Semantic memory     │
-│  Working memory      │                                      │  ▁▂▃▅▇█▇▅▃▂▁  conf   │
-│  Intrinsic cues      │                                      │  DMN background      │
-│  Logit bias (top)    │                                      │  ▁▁▂▃▂▁▁▂  tick ms   │
-│                      ├──────────────────────────────────────┤  Self-improve worker │
-│                      │  > Speak to the substrate.           │  Substrate           │
-│                      ├──────────────────────────────────────┤  Hawkes intensity    │
-│                      │  Activity feed (events + log tail)   │                      │
-└──────────────────────┴──────────────────────────────────────┴──────────────────────┘
-   model=…   device=…   db=runs/broca_substrate.sqlite   namespace=chat
+core/
+├── organs/              # Frozen specialist models (perception, affect, extraction)
+├── cognition/           # Substrate controller, top-down control, predictive coding
+├── causal/              # FiniteSCM, PC discovery, DAG utilities
+├── memory/              # Hopfield, SQLite activation memory
+├── symbolic/            # VSA / HRR algebra
+├── temporal/            # Hawkes processes
+├── calibration/         # Conformal prediction
+├── grafting/            # All graft types + dynamic graft synthesis
+├── host/                # Frozen LLM wrapper, tokenizer compatibility
+├── agent/               # Active inference, POMDPs, coupled EFE
+├── learning/            # Motor learning, preference learning
+├── idletime/            # DMN: chunking, ontological expansion, repository
+├── knowledge/           # Scrapy + Trafilatura web crawling pipeline
+├── swarm/               # UDP multicast peer communication
+├── frame/               # Continuous cognitive frame encoding
+├── substrate/           # Runtime config, episode graph
+├── workers/             # Self-improvement Docker daemon
+├── natives/             # Native tool synthesis + sandbox
+├── benchmarks/          # HF datasets, lm-eval, substrate-specific benchmarks
+├── paper/               # Benchmark-to-LaTeX harness
+├── tui/                 # Textual chat + benchmark dashboards
+├── chat/                # CLI REPL
+├── system/              # Device, event bus, control plane
+└── experiments/         # Demo runners
 ```
-
-Run with `make tui` or `python -m core.chat_tui`. There are **no chat tuning flags** on the CLI;
-decoding and DMN timing are fixed in [`core/substrate_runtime.py`](core/substrate_runtime.py)
-(`CHAT_*`, `BROCA_BACKGROUND_INTERVAL_S`). Optional **infrastructure** knobs use the environment only,
-for example:
-
-| Variable | Role |
-|----------|------|
-| `MODEL_ID` / `BENCHMARK_MODEL` | Hugging Face checkpoint id |
-| `M_DEVICE` | Torch device override (`cpu`, `mps`, `cuda:0`, …) |
-| `HF_TOKEN` | Hub auth when not using `huggingface-cli login` |
-| `TUI_LOG_LEVEL` | Log lines forwarded into the activity feed (default `INFO`) |
-| `BROCA_SELF_IMPROVE=1` | Enable the Docker/GitHub self-improve worker |
-
-| Keys | Action |
-|------|--------|
-| `Ctrl+C` | Quit |
-| `Ctrl+L` | Clear chat |
-
-The TUI sets `LOG_SILENT=1` automatically so the stderr handler does
-not fight the UI; the rotating file handler at `runs/broca.log` still
-records the full event stream for grep-after-the-fact debugging.
-
----
-
-## Running things
-
-### Architecture demo
-
-Tiny CPU-friendly backend, no model download:
-
-```bash
-python -m core.demo --mode broca --seed 0
-```
-
-Real Llama backend:
-
-```bash
-HF_TOKEN=… python -m core.demo \
-  --mode broca \
-  --broca-backend llama \
-  --broca-model-id meta-llama/Llama-3.2-1B-Instruct
-```
-
-### Plain chat CLI
-
-Streaming terminal chat with the **same** full substrate and canonical DB as the TUI (`runs/broca_substrate.sqlite`):
-
-```bash
-make chat
-# or
-HF_TOKEN=… python -m core.chat_cli
-```
-
-There is no separate “vanilla HF only” path: `chat_cli` always loads `BrocaMind`. For LLM-only vs full-stack **metrics**, use the [benchmarks](#benchmarks) leaderboard and architecture probes.
-
-### Refresh the paper
-
-```bash
-make paper                          # full pipeline → paper/main.pdf
-HF_TOKEN=… make paper-bench         # only refresh experiment TeX
-make paper-pdf                      # only rebuild the PDF
-PAPER_NATIVE_PRESET=quick PAPER_BENCH_LIMIT=50 make paper-bench
-```
-
-See [The substrate writes its own paper](#the-substrate-writes-its-own-paper)
-for what gets generated and the full env-var matrix.
-
----
-
-## Benchmarks
-
-The lab ships **one unified benchmark driver** (`python -m core.benchmarks`) that always runs the
-full mosaic: HF dataset sanity smoke, native leaderboard, Eleuther parity, plus Broca **architecture eval**
-(scored bare-language-host vs enhanced stack). Vanilla LM vs Broca-shell **paired leaderboard** comparison
-inside the native harness stays enabled for Llama checkpoints. Configuration is fixed in
-[`core/substrate_runtime.py`](core/substrate_runtime.py) (`BENCHMARK_ENGINE=both`,
-`BENCHMARK_NATIVE_PRESET` / `BENCHMARK_LM_EVAL_PRESET=standard`, `BENCHMARK_LIMIT=250`, canonical SQLite for probes).
-
-Implementations:
-
-- **Native HF datasets** ([core/benchmarks/hf_datasets_eval.py](core/benchmarks/hf_datasets_eval.py)) — MC tasks via length-normalized continuation LL; GSM8K via generation + normalized numeric match.
-- **LM-eval parity** ([core/benchmarks/lm_eval_pair.py](core/benchmarks/lm_eval_pair.py)) — vanilla HF logits vs the same checkpoint in an empty `LlamaBrocaHost` shell.
-
-Run from the Makefile or Python (no tuning flags — only `-h` / `--help`):
-
-```bash
-make bench-cli              # stdout
-make bench                  # Textual dashboard (core.bench_tui)
-HF_TOKEN=… python -m core.benchmarks
-python -m core.benchmarks -h     # prints fixed-configuration summary
-python -m core.bench_tui -h       # TUI help + same benchmark summary
-```
-
-**Infrastructure environment** (artifacts location, checkpoint, device) still uses vars such as `MODEL_ID`, `BENCHMARK_MODEL`, `BENCHMARK_OUTPUT_DIR` (default `runs/benchmarks`), `BENCHMARK_DEVICE`, `M_DEVICE`, `HF_TOKEN`.
-
-Artifacts land under:
-
-```text
-runs/benchmarks/hf_native_<timestamp>/
-  summary.json
-  boolq.jsonl
-  piqa.jsonl
-  …
-  benchmark_suite_manifest.json
-```
-
-The native harness module also defines **named presets** (for readers of the code and for the separate **paper harness**, which keeps its own `PAPER_*` env tuning):
-
-| Preset      | Tasks                                                                     |
-|-------------|---------------------------------------------------------------------------|
-| `smoke`     | `boolq`, `piqa`                                                           |
-| `quick`     | `boolq`, `piqa`, `arc_easy`, `winogrande`                                 |
-| `standard`  | `boolq`, `piqa`, `arc_easy`, `arc_challenge`, `winogrande`, `hellaswag`   |
-| `reasoning` | `arc_challenge`, `hellaswag`, `winogrande`, `commonsenseqa`, `openbookqa` |
-| `full`      | All registered tasks                                                      |
-
-Full registry: `boolq`, `piqa`, `arc_easy`, `arc_challenge`,
-`winogrande`, `hellaswag`, `commonsenseqa`, `openbookqa`,
-`mmlu_abstract_algebra`, `gsm8k`.
-
-Do **not** use `python -m core.benchmarks.hf_datasets_eval` for product runs — it only prints a pointer to `core.benchmarks`.
 
 ---
 
@@ -682,147 +260,28 @@ Do **not** use `python -m core.benchmarks.hf_datasets_eval` for product runs —
 pytest -q
 ```
 
-Tests do not download Llama or HF datasets. Pytest (`conftest.py`) sets `MOSAIC_UNDER_TEST=1` and `MOSAIC_TEST_DB` to a fresh SQLite file under each test's `tmp_path` whenever substrate code resolves the canonical path. Individual tests can still override with an explicit `db_path`. They cover the tiny
-backend, faculties, dataset row builders, scoring plumbing, the Llama
-host's real layer-hook graft slot via a fake Llama-like module, and
-the algebra modules end-to-end.
-
-Highlights:
-
-- [tests/test_relation_extraction_and_consolidation.py](tests/test_relation_extraction_and_consolidation.py) — belief revision is poison-resistant.
-- [tests/test_rem_sleep.py](tests/test_rem_sleep.py) — REM only fires when the user is idle past threshold.
-- [tests/test_hopfield.py](tests/test_hopfield.py) · [tests/test_vsa.py](tests/test_vsa.py) · [tests/test_hawkes.py](tests/test_hawkes.py) · [tests/test_conformal.py](tests/test_conformal.py) — algebra has the published guarantees.
-- [tests/test_top_down_control.py](tests/test_top_down_control.py) — masking, interruption, modality, and do-calculus grafts each move the host in the predicted direction.
-- [tests/test_event_bus.py](tests/test_event_bus.py) · [tests/test_broca_snapshot.py](tests/test_broca_snapshot.py) — observability primitives.
-
----
-
-## Project layout
-
-| File                                                                                                                                                       | Subsystem                                                  |
-|------------------------------------------------------------------------------------------------------------------------------------------------------------|------------------------------------------------------------|
-| [core/llama_broca_host.py](core/llama_broca_host.py)                                                                                                       | Frozen Llama wrapper with named graft slots                |
-| [core/host.py](core/host.py) · [core/grafts.py](core/grafts.py)                                                                                            | Tiny CPU-friendly backend + graft base classes             |
-| [core/broca.py](core/broca.py)                                                                                                                             | `BrocaMind`, frame router, workspace, DMN                  |
-| [core/substrate_runtime.py](core/substrate_runtime.py)                                                                                                     | Canonical DB path, fixed chat/bench defaults               |
-| [core/active_inference.py](core/active_inference.py)                                                                                                       | POMDPs, EFE, coupled agent                                 |
-| [core/causal.py](core/causal.py) · [core/causal_discovery.py](core/causal_discovery.py)                                                                    | `FiniteSCM`, `do(·)`, PC algorithm                         |
-| [core/vsa.py](core/vsa.py) · [core/hopfield.py](core/hopfield.py) · [core/hawkes.py](core/hawkes.py) · [core/conformal.py](core/conformal.py)              | The algebra                                                |
-| [core/predictive_coding.py](core/predictive_coding.py)                                                                                                     | Surprise / prediction-gap                                  |
-| [core/preference_learning.py](core/preference_learning.py)                                                                                                 | Dirichlet preference                                       |
-| [core/ontological_expansion.py](core/ontological_expansion.py)                                                                                             | Hebbian axis promotion                                     |
-| [core/top_down_control.py](core/top_down_control.py)                                                                                                       | Hypothesis masking · interruption · modality · do-calculus |
-| [core/chunking.py](core/chunking.py)                                                                                                                       | Macro chunking compiler                                    |
-| [core/native_tools.py](core/native_tools.py) · [core/docker_sandbox.py](core/docker_sandbox.py)                                                            | Native tool synthesis + sandbox                            |
-| [core/dynamic_grafts.py](core/dynamic_grafts.py) · [core/memory.py](core/memory.py)                                                                        | Captured activation modes                                  |
-| [core/motor_learning.py](core/motor_learning.py)                                                                                                           | Online graft training (LLM stays frozen)                   |
-| [core/substrate_graph.py](core/substrate_graph.py)                                                                                                         | Episode association graph                                  |
-| [core/continuous_frame.py](core/continuous_frame.py) · [core/tokenizer.py](core/tokenizer.py) · [core/hf_tokenizer_compat.py](core/hf_tokenizer_compat.py) | Frame ↔ subword projector                                  |
-| [core/vision.py](core/vision.py)                                                                                                                           | Visual encoder (placeholder for multimodal)                |
-| [core/event_bus.py](core/event_bus.py)                                                                                                                     | Thread-safe pub/sub + log handler                          |
-| [core/chat_tui.py](core/chat_tui.py) · [core/bench_tui.py](core/bench_tui.py)                                                                              | Textual chat + benchmark dashboards                      |
-| [core/chat_cli.py](core/chat_cli.py)                                                                                                                       | Plain streaming CLI                                        |
-| [core/demo.py](core/demo.py)                                                                                                                               | Architecture demo                                          |
-| [core/benchmarks/](core/benchmarks/)                                                                                                                       | Native HF + lm-eval harnesses                              |
-| [core/docker_self_improve_worker.py](core/docker_self_improve_worker.py)                                                                                   | Self-improve daemon                                        |
-| [core/paper/](core/paper/) · [paper/](paper/)                                                                                                              | Benchmark-to-LaTeX harness + auto-refreshing tech report   |
-| [Makefile](Makefile)                                                                                                                                       | `make chat / bench / paper / paper-bench / paper-pdf`      |
-| [core/logging_setup.py](core/logging_setup.py)                                                                                                             | Stream + rotating-file logging config                      |
+Tests exercise the algebra (VSA capacity, Hopfield retrieval, Hawkes
+excitation, conformal coverage), the belief revision engine (poison
+resistance), top-down control (masking converges, interruption fires,
+modality shifts direction, causal constraints pull toward SCM verdict),
+the DMN lifecycle (REM only fires when idle), and the graft slot system
+(hooks install/remove correctly, SNR scaling matches target). No model
+downloads.
 
 ---
 
 ## Glossary
 
-<details>
-<summary><b>Active inference / Expected Free Energy</b></summary>
-
-Friston's account of decision-making: an agent picks the action that
-minimizes expected free energy, balancing pragmatic value (reach
-preferred observations) with epistemic value (reduce uncertainty). The
-substrate runs two such agents (spatial, causal) and arbitrates between
-them.
-
-</details>
-
-<details>
-<summary><b>Conformal prediction</b></summary>
-
-A distribution-free wrapper that turns any scoring model into a set
-predictor with a marginal coverage guarantee `P[y ∈ C(x)] ≥ 1−α`. The
-substrate uses |C| as a Fristonian ambiguity signal — when the
-prediction set is bigger than one, the LLM is steered toward a
-clarifying question.
-
-</details>
-
-<details>
-<summary><b>DMN (Default Mode Network)</b></summary>
-
-The brain network most active when the subject is *not* doing a task.
-Here, a daemon that runs five phases plus REM sleep between user
-turns: consolidation, separation, latent discovery, chunk compilation,
-tool foraging, REM replay.
-
-</details>
-
-<details>
-<summary><b>EFE</b></summary>
-
-Expected Free Energy — the quantity active inference minimizes.
-
-</details>
-
-<details>
-<summary><b>Graft</b></summary>
-
-A small module that splices into a named slot of the frozen language
-host (`logits`, `final_hidden`, `layer.{i}.post`) and modifies the
-forward pass without touching the host's weights. The substrate's only
-channel into the LLM.
-
-</details>
-
-<details>
-<summary><b>HRR (Holographic Reduced Representations)</b></summary>
-
-Plate's VSA flavor that uses circular convolution for binding and
-correlation for unbinding. The exact-inverse property is what makes
-zero-shot analogy and fact unbinding possible.
-
-</details>
-
-<details>
-<summary><b>Modern Continuous Hopfield Network</b></summary>
-
-Ramsauer et al.'s rigorous generalization of attention. One-step
-retrieval to the closest stored pattern under cosine similarity, with
-exponential storage capacity in the embedding dimension.
-
-</details>
-
-<details>
-<summary><b>POMDP</b></summary>
-
-Partially Observable Markov Decision Process — the formalism the
-active-inference faculties live inside.
-
-</details>
-
-<details>
-<summary><b>SCM (Structural Causal Model)</b></summary>
-
-A directed acyclic graph of variables plus structural equations for
-the endogenous nodes. Supports `do(·)` interventions and counterfactual
-queries. The substrate ships with Simpson's paradox as the bootstrap
-SCM and grows new ones via the PC algorithm.
-
-</details>
-
-<details>
-<summary><b>Substrate</b></summary>
-
-Everything in this repo that is not the frozen Llama. Memory, world
-model, agents, algebra, control. The "System 2" half of the
-architecture.
-
-</details>
+| Term | Definition |
+|------|-----------|
+| **Graft** | A module spliced into the frozen LLM's forward pass. The substrate's only channel into the language organ. |
+| **Cognitive frame** | A non-linguistic content packet (`intent`, `subject`, `answer`, `confidence`, `evidence`) that the grafts translate into residual-stream and logit biases. |
+| **SCM** | Structural Causal Model. DAG + structural equations. Supports `do(·)` interventions, counterfactuals, backdoor/frontdoor adjustment. |
+| **EFE** | Expected Free Energy. The quantity active inference minimizes — balancing pragmatic value (reach preferred observations) with epistemic value (reduce uncertainty). |
+| **VSA/HRR** | Vector Symbolic Architecture / Holographic Reduced Representations. Bind and unbind concepts via circular convolution in O(d log d). |
+| **Hopfield** | Modern Continuous Hopfield Network. One-step content-addressable retrieval with exponential storage capacity in the embedding dimension. |
+| **Hawkes** | Multivariate self-exciting point process. Each event raises the intensity of future events on the same and related channels, with exponential decay. The substrate's sense of conversational "heat." |
+| **Conformal** | Split-conformal prediction. Turns any scoring model into a set predictor with marginal coverage guarantee `P[y ∈ C(x)] ≥ 1−α`. Set size > 1 = Fristonian ambiguity signal. |
+| **DMN** | Default Mode Network. Background daemon that runs consolidation, separation, latent discovery, chunk compilation, and tool foraging between user turns. |
+| **Swarm** | UDP multicast peer communication. All events flow freely between LAN nodes. No orchestration. |
+| **Organ** | A frozen pre-trained model serving a specific cognitive function. The LLM is one organ (language production). DINOv2, Whisper, GLiNER2, GoEmotions are others. |
