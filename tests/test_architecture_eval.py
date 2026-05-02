@@ -1,6 +1,6 @@
 from pathlib import Path
 
-from core.benchmarks.architecture_eval import run_broca_architecture_eval
+from research_lab.benchmarks.architecture_eval import run_broca_architecture_eval
 
 
 def test_broca_architecture_eval_writes_metrics(tmp_path: Path, llama_broca_loaded: None):

@@ -38,26 +38,42 @@ def _cmd_chat_tui(argv: list[str]) -> None:
     run_chat_tui(argv)
 
 
+def _research_lab_or_exit(name: str):
+    try:
+        import research_lab  # noqa: F401
+    except ImportError as exc:
+        print(
+            f"`mosaic {name}` requires the research_lab package. "
+            f"Install benchmark extras: pip install -e \".[benchmark]\".",
+            file=sys.stderr,
+        )
+        raise SystemExit(2) from exc
+
+
 def _cmd_bench(argv: list[str]) -> None:
-    from .benchmarks.__main__ import main as bench_main
+    _research_lab_or_exit("bench")
+    from research_lab.benchmarks.__main__ import main as bench_main
 
     bench_main(argv)
 
 
 def _cmd_bench_tui(argv: list[str]) -> None:
-    from .tui.bench import run_bench_tui
+    _research_lab_or_exit("bench-tui")
+    from research_lab.tui.bench import run_bench_tui
 
     run_bench_tui(argv)
 
 
 def _cmd_demo(argv: list[str]) -> None:
-    from .experiments.demo import main as demo_main
+    _research_lab_or_exit("demo")
+    from research_lab.demo import main as demo_main
 
     demo_main(_strip_optional_ddash(argv))
 
 
 def _cmd_paper(argv: list[str]) -> None:
-    from .paper.__main__ import main as paper_main
+    _research_lab_or_exit("paper")
+    from research_lab.paper.__main__ import main as paper_main
 
     paper_main(_strip_optional_ddash(argv))
 
@@ -67,7 +83,7 @@ _COMMANDS: dict[str, tuple[str, Handler]] = {
     "chat-tui": ("Textual chat dashboard.", _cmd_chat_tui),
     "tui": ("Alias for chat-tui.", _cmd_chat_tui),
     "bench": ("Unified benchmark harness (fixed configuration).", _cmd_bench),
-    "bench-tui": ("Textual benchmark dashboard (wraps core.benchmarks).", _cmd_bench_tui),
+    "bench-tui": ("Textual benchmark dashboard (wraps research_lab.benchmarks).", _cmd_bench_tui),
     "demo": ("Faculty experiments and Broca architecture benchmark.", _cmd_demo),
     "paper": ("Regenerate paper experiment TeX from benchmark harness.", _cmd_paper),
 }

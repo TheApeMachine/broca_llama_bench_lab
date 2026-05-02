@@ -27,11 +27,20 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Sequence
 
+import numpy as np
 import torch
 
+from ..system.event_bus import get_default_bus
 from .base import BaseOrgan, OrganOutput
 
 logger = logging.getLogger(__name__)
+
+
+def _publish(topic: str, payload: dict) -> None:
+    try:
+        get_default_bus().publish(topic, payload)
+    except Exception:
+        pass
 
 # Primary emotion model
 _GOEMOTION_MODEL = "SamLowe/roberta-base-go_emotions"
@@ -134,57 +143,77 @@ class AffectOrgan(BaseOrgan):
         self._zero_shot: Any = None
 
     def _load_model(self) -> None:
-        """Load GoEmotions pipeline (ONNX if available, else standard)."""
+        """Load the configured GoEmotions backend without silent fallback."""
+
         try:
-            from transformers import pipeline, AutoTokenizer
-
-            # Try ONNX quantized version first (faster on CPU)
-            if self._use_onnx:
-                try:
-                    from optimum.onnxruntime import ORTModelForSequenceClassification
-                    onnx_model_id = self._model_id + "-onnx" if not self._model_id.endswith("-onnx") else self._model_id
-                    model = ORTModelForSequenceClassification.from_pretrained(
-                        onnx_model_id,
-                        file_name="onnx/model_quantized.onnx",
-                    )
-                    tokenizer = AutoTokenizer.from_pretrained(self._model_id)
-                    self._pipeline = pipeline(
-                        "text-classification", model=model, tokenizer=tokenizer, top_k=None
-                    )
-                    logger.info("AffectOrgan: loaded ONNX quantized %s", onnx_model_id)
-                    return
-                except Exception as exc:
-                    logger.debug("ONNX load failed, falling back to standard: %s", exc)
-
-            # Standard PyTorch pipeline
-            self._pipeline = pipeline(
-                "text-classification",
-                model=self._model_id,
-                top_k=None,
-                device=self.device if self.device.type != "cpu" else -1,
-            )
-            logger.info("AffectOrgan: loaded standard %s", self._model_id)
-
+            from transformers import AutoTokenizer, pipeline
         except ImportError as exc:
             raise ImportError(
-                "AffectOrgan requires `transformers`. "
-                "Install with: pip install transformers\n"
-                "For faster CPU inference: pip install optimum[onnxruntime]"
+                "AffectOrgan requires `transformers`. Install with: pip install transformers"
             ) from exc
+
+        if self._use_onnx:
+            import onnxruntime as ort
+            from huggingface_hub import hf_hub_download
+            from transformers import AutoConfig
+
+            onnx_model_id = self._model_id + "-onnx" if not self._model_id.endswith("-onnx") else self._model_id
+            model_path = hf_hub_download(
+                repo_id=onnx_model_id,
+                filename="onnx/model_quantized.onnx",
+            )
+            self._tokenizer = AutoTokenizer.from_pretrained(self._model_id)
+            self._config = AutoConfig.from_pretrained(self._model_id)
+            self._session = ort.InferenceSession(
+                model_path,
+                providers=["CPUExecutionProvider"],
+            )
+            self._pipeline = self._run_onnx_text_classification
+            logger.info("AffectOrgan: loaded ONNX quantized %s", onnx_model_id)
+            return
+
+        self._pipeline = pipeline(
+            "text-classification",
+            model=self._model_id,
+            top_k=None,
+            device=self.device if self.device.type != "cpu" else -1,
+        )
+        logger.info("AffectOrgan: loaded standard %s", self._model_id)
+
+    def _run_onnx_text_classification(self, text: str) -> list[dict[str, float | str]]:
+        encoded = self._tokenizer(
+            text,
+            truncation=True,
+            max_length=512,
+            return_tensors="np",
+        )
+        input_names = {inp.name for inp in self._session.get_inputs()}
+        inputs = {name: encoded[name] for name in input_names if name in encoded}
+        missing = input_names.difference(inputs)
+        if missing:
+            raise RuntimeError(f"AffectOrgan ONNX session missing tokenizer inputs: {sorted(missing)}")
+        logits = self._session.run(None, inputs)[0][0].astype(np.float32)
+        scores = 1.0 / (1.0 + np.exp(-logits))
+        id2label = getattr(self._config, "id2label", {})
+        return [
+            {
+                "label": str(id2label.get(i, f"LABEL_{i}")),
+                "score": float(score),
+            }
+            for i, score in enumerate(scores)
+        ]
 
     def _load_zero_shot(self) -> None:
         """Lazy-load zero-shot classifier for custom labels."""
         if self._zero_shot is not None:
             return
-        try:
-            from transformers import pipeline
-            self._zero_shot = pipeline(
-                "zero-shot-classification",
-                model=_COMPREHEND_MODEL,
-                device=self.device if self.device.type != "cpu" else -1,
-            )
-        except Exception as exc:
-            logger.warning("Zero-shot classifier unavailable: %s", exc)
+        from transformers import pipeline
+
+        self._zero_shot = pipeline(
+            "zero-shot-classification",
+            model=_COMPREHEND_MODEL,
+            device=self.device if self.device.type != "cpu" else -1,
+        )
 
     def detect(self, text: str, *, threshold: float | None = None) -> AffectState:
         """Detect emotional state from text.
@@ -202,80 +231,85 @@ class AffectOrgan(BaseOrgan):
             self._record_call((time.time() - start) * 1000)
             return state
 
-        try:
-            raw_scores = self._pipeline(text[:512])  # Truncate to model max
-            if isinstance(raw_scores, list) and raw_scores and isinstance(raw_scores[0], list):
-                raw_scores = raw_scores[0]
+        raw_scores = self._pipeline(text[:512])
+        if isinstance(raw_scores, list) and raw_scores and isinstance(raw_scores[0], list):
+            raw_scores = raw_scores[0]
 
-            # Build emotion scores
-            all_scores: dict[str, float] = {}
-            for item in raw_scores:
-                label = item["label"]
-                score = float(item["score"])
-                all_scores[label] = score
-                if score >= thresh:
-                    signal = EMOTION_TO_SIGNAL.get(label, "")
-                    state.emotions.append(EmotionScore(label=label, score=score, signal=signal))
+        all_scores: dict[str, float] = {}
+        for item in raw_scores:
+            label = item["label"]
+            score = float(item["score"])
+            all_scores[label] = score
+            if score >= thresh:
+                signal = EMOTION_TO_SIGNAL.get(label, "")
+                state.emotions.append(EmotionScore(label=label, score=score, signal=signal))
 
-            # Sort by score
-            state.emotions.sort(key=lambda e: e.score, reverse=True)
+        state.emotions.sort(key=lambda e: e.score, reverse=True)
 
-            # Dominant emotion
-            if state.emotions:
-                state.dominant_emotion = state.emotions[0].label
-                state.dominant_score = state.emotions[0].score
-            elif all_scores:
-                best = max(all_scores, key=all_scores.get)
-                state.dominant_emotion = best
-                state.dominant_score = all_scores[best]
+        if state.emotions:
+            state.dominant_emotion = state.emotions[0].label
+            state.dominant_score = state.emotions[0].score
+        elif all_scores:
+            best = max(all_scores, key=all_scores.get)
+            state.dominant_emotion = best
+            state.dominant_score = all_scores[best]
 
-            # Cognitive states (subset useful for substrate)
-            state.cognitive_states = {
-                label: score for label, score in all_scores.items()
-                if label in COGNITIVE_STATE_LABELS and score >= thresh
-            }
+        state.cognitive_states = {
+            label: score for label, score in all_scores.items()
+            if label in COGNITIVE_STATE_LABELS and score >= thresh
+        }
 
-            # Compute valence (-1 to +1)
-            positive = sum(
-                all_scores.get(e, 0.0) for e in
-                ["joy", "love", "gratitude", "approval", "admiration", "optimism", "excitement", "amusement", "pride", "relief", "caring"]
-            )
-            negative = sum(
-                all_scores.get(e, 0.0) for e in
-                ["anger", "annoyance", "disgust", "disappointment", "disapproval", "fear", "grief", "nervousness", "remorse", "sadness", "embarrassment"]
-            )
-            total = positive + negative
-            state.valence = (positive - negative) / max(total, 1e-6) if total > 0.01 else 0.0
+        positive = sum(
+            all_scores.get(e, 0.0) for e in
+            ["joy", "love", "gratitude", "approval", "admiration", "optimism", "excitement", "amusement", "pride", "relief", "caring"]
+        )
+        negative = sum(
+            all_scores.get(e, 0.0) for e in
+            ["anger", "annoyance", "disgust", "disappointment", "disapproval", "fear", "grief", "nervousness", "remorse", "sadness", "embarrassment"]
+        )
+        total = positive + negative
+        state.valence = (positive - negative) / max(total, 1e-6) if total > 0.01 else 0.0
 
-            # Compute arousal (0 to 1)
-            high_arousal = sum(
-                all_scores.get(e, 0.0) for e in
-                ["anger", "excitement", "fear", "surprise", "nervousness", "disgust"]
-            )
-            low_arousal = sum(
-                all_scores.get(e, 0.0) for e in
-                ["sadness", "relief", "neutral", "caring"]
-            )
-            state.arousal = min(1.0, high_arousal / max(high_arousal + low_arousal, 1e-6))
+        high_arousal = sum(
+            all_scores.get(e, 0.0) for e in
+            ["anger", "excitement", "fear", "surprise", "nervousness", "disgust"]
+        )
+        low_arousal = sum(
+            all_scores.get(e, 0.0) for e in
+            ["sadness", "relief", "neutral", "caring"]
+        )
+        state.arousal = min(1.0, high_arousal / max(high_arousal + low_arousal, 1e-6))
 
-            # Preference signal for DirichletPreference
-            pos_pref = sum(
-                s.score for s in state.emotions if s.signal == "positive_preference"
-            )
-            neg_pref = sum(
-                s.score for s in state.emotions if s.signal == "negative_preference"
-            )
-            if pos_pref > neg_pref and pos_pref > 0.3:
-                state.preference_signal = "positive_preference"
-                state.preference_strength = pos_pref
-            elif neg_pref > pos_pref and neg_pref > 0.3:
-                state.preference_signal = "negative_preference"
-                state.preference_strength = neg_pref
+        pos_pref = sum(
+            s.score for s in state.emotions if s.signal == "positive_preference"
+        )
+        neg_pref = sum(
+            s.score for s in state.emotions if s.signal == "negative_preference"
+        )
+        if pos_pref > neg_pref and pos_pref > 0.3:
+            state.preference_signal = "positive_preference"
+            state.preference_strength = pos_pref
+        elif neg_pref > pos_pref and neg_pref > 0.3:
+            state.preference_signal = "negative_preference"
+            state.preference_strength = neg_pref
 
-        except Exception as exc:
-            logger.warning("Emotion detection failed: %s", exc)
-
-        self._record_call((time.time() - start) * 1000)
+        latency = (time.time() - start) * 1000
+        self._record_call(latency, method="detect")
+        _publish(
+            "organ.affect",
+            {
+                "text": text[:120],
+                "dominant_emotion": state.dominant_emotion,
+                "dominant_score": state.dominant_score,
+                "valence": state.valence,
+                "arousal": state.arousal,
+                "preference_signal": state.preference_signal,
+                "preference_strength": state.preference_strength,
+                "cognitive_states": dict(state.cognitive_states),
+                "top_emotions": [(e.label, e.score) for e in state.emotions[:5]],
+                "latency_ms": latency,
+            },
+        )
         return state
 
     def classify_custom(
@@ -295,22 +329,14 @@ class AffectOrgan(BaseOrgan):
         self._load_zero_shot()
         start = time.time()
 
-        if self._zero_shot is None:
-            self._record_call((time.time() - start) * 1000)
-            return []
-
-        try:
-            raw = self._zero_shot(
-                text[:512],
-                candidate_labels=list(labels),
-                multi_label=multi_label,
-            )
-            results = list(zip(raw["labels"], raw["scores"]))
-            results = [(l, s) for l, s in results if s >= threshold]
-            results.sort(key=lambda x: x[1], reverse=True)
-        except Exception as exc:
-            logger.warning("Zero-shot classification failed: %s", exc)
-            results = []
+        raw = self._zero_shot(
+            text[:512],
+            candidate_labels=list(labels),
+            multi_label=multi_label,
+        )
+        results = list(zip(raw["labels"], raw["scores"]))
+        results = [(l, s) for l, s in results if s >= threshold]
+        results.sort(key=lambda x: x[1], reverse=True)
 
         self._record_call((time.time() - start) * 1000)
         return results

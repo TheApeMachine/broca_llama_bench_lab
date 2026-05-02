@@ -19,8 +19,16 @@ import torch
 import torch.nn.functional as F
 
 from ..host.tokenizer import speech_seed_ids
+from ..system.event_bus import get_default_bus
 
 logger = logging.getLogger(__name__)
+
+
+def _publish(topic: str, payload: dict) -> None:
+    try:
+        get_default_bus().publish(topic, payload)
+    except Exception:
+        pass
 
 
 def _batch_from_ids(rows: Sequence[Sequence[int]], pad_id: int, *, device: torch.device | str):
@@ -187,6 +195,18 @@ def lexical_surprise_gap(
             gap,
             (utterance[:100] + "…") if len(utterance) > 100 else utterance,
         )
+        _publish(
+            "cog.predictive_coding",
+            {
+                "path": "dual_ce",
+                "n_targets": len(target_ids),
+                "ce_graft": ce_g,
+                "ce_plain": ce_p,
+                "gap": gap,
+                "utterance": utterance[:120],
+                "n_plan_words": len(plan_ids),
+            },
+        )
         return ce_g, ce_p, gap
 
     ce_g = lexical_plan_cross_entropy_mean(
@@ -214,5 +234,17 @@ def lexical_surprise_gap(
         ce_p,
         gap_fb,
         (utterance[:100] + "…") if len(utterance) > 100 else utterance,
+    )
+    _publish(
+        "cog.predictive_coding",
+        {
+            "path": "fallback_two_pass",
+            "n_targets": len(target_ids),
+            "ce_graft": ce_g,
+            "ce_plain": ce_p,
+            "gap": gap_fb,
+            "utterance": utterance[:120],
+            "n_plan_words": len(plan_ids),
+        },
     )
     return ce_g, ce_p, gap_fb

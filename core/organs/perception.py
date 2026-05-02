@@ -26,9 +26,17 @@ from typing import Any
 import torch
 import torch.nn.functional as F
 
+from ..system.event_bus import get_default_bus
 from .base import BaseOrgan, OrganOutput
 
 logger = logging.getLogger(__name__)
+
+
+def _publish(topic: str, payload: dict) -> None:
+    try:
+        get_default_bus().publish(topic, payload)
+    except Exception:
+        pass
 
 # Model IDs
 _VJEPA_MODEL = "facebook/vjepa2-vith-fpc64-256"
@@ -91,11 +99,21 @@ class DINOv2Organ(BaseOrgan):
         features = F.normalize(cls_features[0].cpu().float(), dim=0)
 
         elapsed = (time.time() - start) * 1000
-        self._record_call(elapsed)
+        self._record_call(elapsed, method="encode")
+        n_patches = int(outputs.last_hidden_state.shape[1] - 1)
+        _publish(
+            "organ.perception.visual",
+            {
+                "stream": "visual_cortex",
+                "n_patches": n_patches,
+                "feature_dim": int(features.numel()),
+                "latency_ms": elapsed,
+            },
+        )
 
         return OrganOutput(
             features=features,
-            metadata={"model": self._model_id, "n_patches": outputs.last_hidden_state.shape[1] - 1},
+            metadata={"model": self._model_id, "n_patches": n_patches},
             confidence=1.0,
             latency_ms=elapsed,
             organ_name=self._name,
@@ -120,7 +138,16 @@ class DINOv2Organ(BaseOrgan):
         patch_features = all_features[1:]  # [n_patches, d_model]
 
         elapsed = (time.time() - start) * 1000
-        self._record_call(elapsed)
+        self._record_call(elapsed, method="encode_patches")
+        _publish(
+            "organ.perception.visual",
+            {
+                "stream": "visual_cortex",
+                "mode": "patches",
+                "n_patches": int(patch_features.shape[0]),
+                "latency_ms": elapsed,
+            },
+        )
 
         output = OrganOutput(
             features=cls_features,
@@ -183,7 +210,16 @@ class IJEPAOrgan(BaseOrgan):
             features = F.normalize(hidden[0].cpu().float(), dim=0)
 
         elapsed = (time.time() - start) * 1000
-        self._record_call(elapsed)
+        self._record_call(elapsed, method="encode")
+        _publish(
+            "organ.perception.ventral",
+            {
+                "stream": "ventral_stream",
+                "n_tokens": int(hidden.shape[0]),
+                "feature_dim": int(features.numel()),
+                "latency_ms": elapsed,
+            },
+        )
 
         return OrganOutput(
             features=features,
@@ -257,11 +293,22 @@ class VJEPAOrgan(BaseOrgan):
         features = F.normalize(hidden.mean(dim=0).cpu().float(), dim=0)
 
         elapsed = (time.time() - start) * 1000
-        self._record_call(elapsed)
+        self._record_call(elapsed, method="encode_frames")
+        n_frames = len(frames) if hasattr(frames, "__len__") else 0
+        _publish(
+            "organ.perception.dorsal",
+            {
+                "stream": "dorsal_stream",
+                "mode": "frames",
+                "n_frames": int(n_frames),
+                "n_tokens": int(hidden.shape[0]),
+                "latency_ms": elapsed,
+            },
+        )
 
         return OrganOutput(
             features=features,
-            metadata={"model": self._model_id, "n_frames": len(frames) if hasattr(frames, "__len__") else 0},
+            metadata={"model": self._model_id, "n_frames": n_frames},
             confidence=1.0,
             latency_ms=elapsed,
             organ_name=self._name,
@@ -282,7 +329,16 @@ class VJEPAOrgan(BaseOrgan):
         features = F.normalize(hidden.mean(dim=0).cpu().float(), dim=0)
 
         elapsed = (time.time() - start) * 1000
-        self._record_call(elapsed)
+        self._record_call(elapsed, method="encode_single_frame")
+        _publish(
+            "organ.perception.dorsal",
+            {
+                "stream": "dorsal_stream",
+                "mode": "single_frame",
+                "n_tokens": int(hidden.shape[0]),
+                "latency_ms": elapsed,
+            },
+        )
 
         return OrganOutput(
             features=features,
@@ -375,7 +431,16 @@ class DepthOrgan(BaseOrgan):
         padded[:features.shape[0]] = features
 
         elapsed = (time.time() - start) * 1000
-        self._record_call(elapsed)
+        self._record_call(elapsed, method="estimate_depth")
+        _publish(
+            "organ.perception.spatial",
+            {
+                "stream": "spatial_cortex",
+                "depth_stats": stats,
+                "depth_shape": list(depth_map.shape),
+                "latency_ms": elapsed,
+            },
+        )
 
         return OrganOutput(
             features=padded,

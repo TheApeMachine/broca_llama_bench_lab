@@ -10,7 +10,7 @@ import pytest
 
 import core.cognition.substrate as broca_mod
 from conftest import make_stub_llm_pair
-from core.cognition.substrate import SubstrateController
+from core.cli import build_substrate_controller
 from core.workers.docker_self_improve_worker import (
     SelfImproveConfig,
     SelfImproveDockerWorker,
@@ -81,7 +81,7 @@ def test_resolve_repo_url_explicit() -> None:
 
 def test_empty_diff_skips_docker(tmp_path: Path, fake_host_loader, monkeypatch: pytest.MonkeyPatch) -> None:
     fake_host_loader()
-    mind = SubstrateController(seed=0, db_path=tmp_path / "m.sqlite", namespace="ut", device="cpu", hf_token=False)
+    mind = build_substrate_controller(seed=0, db_path=tmp_path / "m.sqlite", namespace="ut", device="cpu", hf_token=False)
     cfg = SelfImproveConfig(enabled=True, interval_s=60.0)
     w = SelfImproveDockerWorker(mind, config=cfg)
     monkeypatch.setenv("GITHUB_TOKEN", "t0ken")
@@ -102,7 +102,7 @@ def test_empty_diff_skips_docker(tmp_path: Path, fake_host_loader, monkeypatch: 
 
 def test_docker_invoked_with_patch(tmp_path: Path, fake_host_loader, monkeypatch: pytest.MonkeyPatch) -> None:
     fake_host_loader()
-    mind = SubstrateController(seed=0, db_path=tmp_path / "m2.sqlite", namespace="ut2", device="cpu", hf_token=False)
+    mind = build_substrate_controller(seed=0, db_path=tmp_path / "m2.sqlite", namespace="ut2", device="cpu", hf_token=False)
     cfg = SelfImproveConfig(enabled=True, interval_s=60.0)
     w = SelfImproveDockerWorker(mind, config=cfg)
     monkeypatch.setenv("GITHUB_TOKEN", "t0ken")
@@ -132,7 +132,7 @@ def test_docker_invoked_with_patch(tmp_path: Path, fake_host_loader, monkeypatch
 
 def test_start_stop_thread(tmp_path: Path, fake_host_loader, monkeypatch: pytest.MonkeyPatch) -> None:
     fake_host_loader()
-    mind = SubstrateController(seed=0, db_path=tmp_path / "m3.sqlite", namespace="ut3", device="cpu", hf_token=False)
+    mind = build_substrate_controller(seed=0, db_path=tmp_path / "m3.sqlite", namespace="ut3", device="cpu", hf_token=False)
     cfg = SelfImproveConfig(enabled=True, interval_s=3600.0)
     w = SelfImproveDockerWorker(mind, config=cfg)
     monkeypatch.setattr(w, "_run_once_safe", MagicMock())
@@ -144,7 +144,7 @@ def test_start_stop_thread(tmp_path: Path, fake_host_loader, monkeypatch: pytest
 
 def test_mind_wiring_start_stop(tmp_path: Path, fake_host_loader, monkeypatch: pytest.MonkeyPatch) -> None:
     fake_host_loader()
-    mind = SubstrateController(seed=0, db_path=tmp_path / "m4.sqlite", namespace="ut4", device="cpu", hf_token=False)
+    mind = build_substrate_controller(seed=0, db_path=tmp_path / "m4.sqlite", namespace="ut4", device="cpu", hf_token=False)
     monkeypatch.setenv("GITHUB_TOKEN", "x")
     # Patch before the background thread's first loop iteration (it calls _run_once_safe immediately).
     monkeypatch.setattr(SelfImproveDockerWorker, "_run_once_safe", MagicMock())

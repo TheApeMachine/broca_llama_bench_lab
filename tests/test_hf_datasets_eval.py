@@ -1,7 +1,7 @@
 
 from __future__ import annotations
 
-from core.benchmarks.hf_datasets_eval import (
+from research_lab.benchmarks.hf_datasets_eval import (
     BenchmarkExample,
     build_arc,
     build_boolq,

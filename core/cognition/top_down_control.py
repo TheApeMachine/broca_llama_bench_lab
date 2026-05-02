@@ -49,9 +49,17 @@ from ..grafting.grafts import (
     state_confidence,
     state_inertia,
 )
+from ..system.event_bus import get_default_bus
 
 
 logger = logging.getLogger(__name__)
+
+
+def _publish(topic: str, payload: dict) -> None:
+    try:
+        get_default_bus().publish(topic, payload)
+    except Exception:
+        pass
 
 
 def _infer_host_device(host: Any) -> torch.device:
@@ -150,6 +158,15 @@ class HypothesisMaskingGraft(BaseGraft):
                 p,
                 reason,
                 len(self.banned),
+            )
+            _publish(
+                "cog.hypothesis.ban",
+                {
+                    "tokens": added,
+                    "penalty": p,
+                    "reason": str(reason),
+                    "total_banned": len(self.banned),
+                },
             )
 
     def unban(self, token_ids: Sequence[int]) -> None:
@@ -329,6 +346,16 @@ class IterativeHypothesisSearch:
         history: list[HypothesisAttempt] = []
         last_attempt: HypothesisAttempt | None = None
 
+        _publish(
+            "cog.hypothesis.start",
+            {
+                "max_iterations": self.max_iterations,
+                "hypothesis_max_tokens": self.hypothesis_max_tokens,
+                "prompt_len": len(prompt),
+                "clear_bans": bool(clear_bans),
+            },
+        )
+
         for it in range(1, self.max_iterations + 1):
             generated = self._generate_tokens(
                 prompt,
@@ -343,12 +370,33 @@ class IterativeHypothesisSearch:
             history.append(attempt)
             last_attempt = attempt
 
+            _publish(
+                "cog.hypothesis.attempt",
+                {
+                    "iteration": it,
+                    "tokens": list(generated),
+                    "text": text[:120],
+                    "valid": bool(verdict.valid),
+                    "reason": str(verdict.reason or ""),
+                    "ban_tokens": list(verdict.ban_tokens),
+                },
+            )
+
             if verdict.valid:
                 logger.info(
                     "IterativeHypothesisSearch: accepted iter=%d tokens=%s text=%r",
                     it,
                     generated,
                     text,
+                )
+                _publish(
+                    "cog.hypothesis.complete",
+                    {
+                        "accepted": True,
+                        "iterations": it,
+                        "final_text": text[:120],
+                        "n_attempts": len(history),
+                    },
                 )
                 return HypothesisSearchResult(
                     accepted=True,
@@ -377,6 +425,15 @@ class IterativeHypothesisSearch:
         accepted = False
         final_ids = list(last_attempt.token_ids) if last_attempt is not None else []
         final_text = last_attempt.text if last_attempt is not None else ""
+        _publish(
+            "cog.hypothesis.complete",
+            {
+                "accepted": False,
+                "iterations": self.max_iterations,
+                "final_text": final_text[:120],
+                "n_attempts": len(history),
+            },
+        )
         return HypothesisSearchResult(
             accepted=accepted,
             iterations=self.max_iterations,
@@ -533,6 +590,16 @@ class EpistemicInterruptionMonitor:
         active_correction: Optional[torch.Tensor] = None
         truncations = 0
 
+        _publish(
+            "cog.epistemic.start",
+            {
+                "prompt_len": len(prompt),
+                "max_new_tokens": int(max_new_tokens),
+                "check_every": self.check_every,
+                "max_truncations": self.max_truncations,
+            },
+        )
+
         step = 0
         while step < max_new_tokens:
             current = prompt + generated
@@ -608,8 +675,27 @@ class EpistemicInterruptionMonitor:
                 )
             )
             truncations += 1
+            _publish(
+                "cog.epistemic.intervention",
+                {
+                    "step": step,
+                    "truncated": truncate_n,
+                    "boost_steps": boost_remaining,
+                    "banned_tokens": list(int(t) for t in verdict.ban_tokens),
+                    "reason": str(verdict.reason),
+                    "intervention_index": len(interventions),
+                },
+            )
 
         text = _decode_token_ids(self.tokenizer, generated)
+        _publish(
+            "cog.epistemic.complete",
+            {
+                "final_step": step,
+                "n_interventions": len(interventions),
+                "text": text[:120],
+            },
+        )
         return EpistemicInterruptionResult(
             token_ids=list(generated),
             text=text,
@@ -702,6 +788,14 @@ class ModalityShiftGraft(BaseGraft):
         unit = F.normalize(d.reshape(1, -1), dim=-1).reshape(-1)
         self.modes[str(name)] = unit
         logger.debug("ModalityShiftGraft.register_mode: name=%s d_model=%d", name, self.d_model)
+        _publish(
+            "cog.modality_shift.register",
+            {
+                "name": str(name),
+                "d_model": self.d_model,
+                "n_modes": len(self.modes),
+            },
+        )
 
     def register_mode_from_capture(self, name: str, captured: Any) -> None:
         """Register from a :class:`CapturedActivationMode`-like object (any ``.value`` tensor)."""
@@ -743,10 +837,15 @@ class ModalityShiftGraft(BaseGraft):
     def set_active_mode(self, name: Optional[str]) -> None:
         if name is None:
             self.active_mode = None
+            _publish("cog.modality_shift.set_active", {"name": None})
             return
         if name not in self.modes:
             raise KeyError(f"mode {name!r} is not registered")
         self.active_mode = str(name)
+        _publish(
+            "cog.modality_shift.set_active",
+            {"name": str(name), "n_modes": len(self.modes)},
+        )
 
     def clear_modes(self) -> None:
         self.modes.clear()
@@ -912,6 +1011,17 @@ class CausalConstraintGraft(KVMemoryGraft):
                 metadata=meta,
             )
         self.constraints.append(constraint)
+        _publish(
+            "cog.causal.constraint",
+            {
+                "treatment": constraint.treatment,
+                "treatment_value": constraint.treatment_value,
+                "outcome": constraint.outcome,
+                "concept_token": constraint.concept_token,
+                "distribution": {str(k): float(v) for k, v in constraint.distribution.items()},
+                "n_constraints": len(self.constraints),
+            },
+        )
         return constraint
 
     # -- high-level: SCM intervention ---------------------------------------

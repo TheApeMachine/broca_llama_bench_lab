@@ -10,6 +10,8 @@ from __future__ import annotations
 import logging
 import os
 import warnings
+from pathlib import Path
+from typing import Any
 
 from .cognition.substrate import SubstrateController
 from .system.device import pick_torch_device
@@ -94,23 +96,49 @@ def stop_background_stack(controller: SubstrateController) -> None:
     controller.stop_self_improve_worker()
 
 
-def build_substrate_controller(*, bus: EventBus | None = None) -> SubstrateController:
-    """Construct ``SubstrateController`` with canonical chat paths and tokens."""
+_DEFAULT_HF_TOKEN = object()
+
+
+def build_substrate_controller(
+    *,
+    bus: EventBus | None = None,
+    seed: int = 0,
+    db_path: str | Path | None = None,
+    namespace: str | None = None,
+    llama_model_id: str | None = None,
+    device: Any = None,
+    hf_token: str | bool | None | object = _DEFAULT_HF_TOKEN,
+    preload_host_tokenizer: tuple[Any, Any] | None = None,
+) -> SubstrateController:
+    """Construct ``SubstrateController`` through the sole supported wiring surface.
+
+    Chat REPL/TUI, benchmarks, Docker workers, and tests should instantiate the
+    live stack only here (optionally overriding paths and model handles) so
+    device handling, SQLite location, namespaces, tokenizer env setup, and token
+    resolution stay aligned with AGENTS \"one system fully wired\".
+    """
 
     prepare_model_runtime()
 
-    resolved_device = pick_torch_device(parse_device_env())
-    token_kw: str | bool | None = resolve_hf_hub_token(None)
-    db_path = default_substrate_sqlite_path()
-    ensure_parent_dir(db_path)
+    rp = Path(db_path) if db_path is not None else default_substrate_sqlite_path()
+    ensure_parent_dir(rp)
+    ns = namespace if namespace is not None else CHAT_NAMESPACE
+    mid = llama_model_id if llama_model_id is not None else default_model_id()
+    resolved_device = pick_torch_device(parse_device_env()) if device is None else device
+
+    if hf_token is _DEFAULT_HF_TOKEN:
+        token_kw: str | bool | None = resolve_hf_hub_token(None)
+    else:
+        token_kw = hf_token
 
     controller = SubstrateController(
-        seed=0,
-        db_path=db_path,
-        namespace=CHAT_NAMESPACE,
-        llama_model_id=default_model_id(),
+        seed=int(seed),
+        db_path=rp,
+        namespace=ns,
+        llama_model_id=mid,
         device=resolved_device,
         hf_token=token_kw,
+        preload_host_tokenizer=preload_host_tokenizer,
     )
 
     if bus is not None:

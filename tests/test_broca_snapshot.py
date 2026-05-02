@@ -6,7 +6,8 @@ from pathlib import Path
 import pytest
 
 import core.cognition.substrate as substrate_mod
-from core.cognition.substrate import SubstrateController, CognitiveFrame
+from core.cli import build_substrate_controller
+from core.cognition.substrate import CognitiveFrame, SubstrateController
 from core.system.event_bus import EventBus
 
 from conftest import make_stub_llm_pair
@@ -41,7 +42,7 @@ def fake_host_loader(monkeypatch: pytest.MonkeyPatch):
         host = _FakeHost()
         tok = _FakeTok(host._stub_tokenizer)
         monkeypatch.setattr(substrate_mod, "load_llama_broca_host", lambda *a, **k: (host, tok))
-        mind = SubstrateController(seed=0, db_path=tmp_path / "snap.sqlite", namespace="snap")
+        mind = build_substrate_controller(seed=0, db_path=tmp_path / "snap.sqlite", namespace="snap", device="cpu", hf_token=False)
         return host, mind
 
     return _setup

@@ -23,9 +23,17 @@ from typing import Any
 import torch
 import torch.nn.functional as F
 
+from ..system.event_bus import get_default_bus
 from .base import BaseOrgan, OrganOutput
 
 logger = logging.getLogger(__name__)
+
+
+def _publish(topic: str, payload: dict) -> None:
+    try:
+        get_default_bus().publish(topic, payload)
+    except Exception:
+        pass
 
 _WHISPER_MODEL = "openai/whisper-large-v3-turbo"
 _WHISPER_DIM = 1280  # Whisper-large encoder hidden size
@@ -123,8 +131,19 @@ class AuditoryOrgan(BaseOrgan):
         )
 
         text = result.get("text", "") if isinstance(result, dict) else str(result)
-        self._record_call((time.time() - start) * 1000)
-        return text.strip()
+        latency = (time.time() - start) * 1000
+        self._record_call(latency, method="transcribe")
+        stripped = text.strip()
+        _publish(
+            "organ.auditory.transcribe",
+            {
+                "transcription": stripped[:160],
+                "language": language or "auto",
+                "sampling_rate": int(sampling_rate),
+                "latency_ms": latency,
+            },
+        )
+        return stripped
 
     @torch.no_grad()
     def encode(
@@ -163,7 +182,16 @@ class AuditoryOrgan(BaseOrgan):
         features = F.normalize(hidden.mean(dim=0).cpu().float(), dim=0)
 
         elapsed = (time.time() - start) * 1000
-        self._record_call(elapsed)
+        self._record_call(elapsed, method="encode")
+        _publish(
+            "organ.auditory.encode",
+            {
+                "n_frames": int(hidden.shape[0]),
+                "feature_dim": int(features.numel()),
+                "sampling_rate": int(sampling_rate),
+                "latency_ms": elapsed,
+            },
+        )
 
         return OrganOutput(
             features=features,

@@ -66,7 +66,14 @@ from ..frame.continuous_frame import (
     stable_sketch,
 )
 from ..system.device import pick_torch_device
-from ..grafting.grafts import BaseGraft, DEFAULT_GRAFT_TARGET_SNR, snr_magnitude, state_confidence, state_inertia
+from ..grafting.grafts import (
+    BaseGraft,
+    DEFAULT_GRAFT_TARGET_SNR,
+    snr_magnitude,
+    state_confidence,
+    state_inertia,
+    state_target_snr_scale,
+)
 from ..host.hf_tokenizer_compat import HuggingFaceBrocaTokenizer
 from ..substrate.runtime import default_substrate_sqlite_path, ensure_parent_dir
 from ..host.llama_broca_host import LlamaBrocaHost, load_llama_broca_host
@@ -89,6 +96,8 @@ from ..natives.native_tools import NativeTool, NativeToolRegistry, ToolSandbox, 
 from ..grafting.dynamic_grafts import DynamicGraftSynthesizer, CapturedActivationMode, ACTIVATION_MODE_KIND
 from ..system.event_bus import EventBus, get_default_bus
 from ..memory import SQLiteActivationMemory
+from ..organs.extraction import ExtractionOrgan
+from ..organs.affect import AffectOrgan, AffectState
 
 from .constants import (
     DEFAULT_CHAT_MODEL_ID,
@@ -96,6 +105,11 @@ from .constants import (
     BELIEF_REVISION_LOG_ODDS_THRESHOLD,
     BELIEF_REVISION_MIN_CLAIMS,
 )
+from .intent_gate import IntentGate, UtteranceIntent
+from .organ_relation_extractor import OrganRelationExtractor
+from .derived_strength import DerivedStrength, StrengthInputs
+from .multimodal_perception import MultimodalPerceptionPipeline
+from .observation import CognitiveObservation
 
 logger = logging.getLogger(__name__)
 
@@ -200,9 +214,19 @@ class RelationExtractor:
     Implementations return ``None`` for non-declarative input (questions,
     fragments, or anything the LLM cannot resolve into a triple) and a
     ``ParsedClaim`` otherwise. Extractors are called per routing decision.
+
+    When ``utterance_intent`` is supplied (same value as ``comprehend`` already
+    computed), implementations must **not** re-run intent classification —
+    avoids duplicate organ cost and contradictory labels.
     """
 
-    def extract_claim(self, utterance: str, toks: Sequence[str]) -> "ParsedClaim | None":  # pragma: no cover - protocol
+    def extract_claim(  # pragma: no cover - protocol
+        self,
+        utterance: str,
+        toks: Sequence[str],
+        *,
+        utterance_intent: UtteranceIntent | None = None,
+    ) -> ParsedClaim | None:
         logger.debug(f"extract_claim: {utterance} {toks}")
         raise NotImplementedError
 
@@ -270,7 +294,19 @@ class LLMRelationExtractor(RelationExtractor):
         self._cache: dict[tuple[str, str], tuple[str, str, str] | None] = {}
         self._cache_size = max(0, int(cache_size))
 
-    def extract_claim(self, utterance: str, toks: Sequence[str]) -> "ParsedClaim | None":
+    def extract_claim(
+        self,
+        utterance: str,
+        toks: Sequence[str],
+        *,
+        utterance_intent: UtteranceIntent | None = None,
+    ) -> ParsedClaim | None:
+        if utterance_intent is not None and not utterance_intent.allows_storage:
+            logger.debug(
+                "LLMRelationExtractor: skip extract; intent does not allow storage label=%s",
+                utterance_intent.label,
+            )
+            return None
         if _is_question(toks):
             logger.debug(f"extract_claim: {utterance} {toks} is question")
             return None
@@ -2339,7 +2375,14 @@ class LexicalPlanGraft(BaseGraft):
         host_at_last = x[rows, last]
         confidence = state_confidence(state)
         inertia = state_inertia(state)
-        magnitude = snr_magnitude(host_at_last, target_snr=self.target_snr, confidence=confidence, inertia=inertia)
+        substrate_scale = state_target_snr_scale(state)
+        magnitude = snr_magnitude(
+            host_at_last,
+            target_snr=self.target_snr,
+            confidence=confidence,
+            inertia=inertia,
+            substrate_scale=substrate_scale,
+        )
         out = x.clone()
         out[rows, last] += directions * magnitude
         self.last_token_id = int(target_ids[0].item())
@@ -2399,7 +2442,14 @@ class TrainableFeatureGraft(BaseGraft):
         direction = F.normalize(self.net(z).to(device=x.device, dtype=x.dtype), dim=-1)
         confidence = state_confidence(state)
         inertia = state_inertia(state)
-        magnitude = snr_magnitude(host_at_last, target_snr=self.target_snr, confidence=confidence, inertia=inertia)
+        substrate_scale = state_target_snr_scale(state)
+        magnitude = snr_magnitude(
+            host_at_last,
+            target_snr=self.target_snr,
+            confidence=confidence,
+            inertia=inertia,
+            substrate_scale=substrate_scale,
+        )
         out = x.clone()
         out[rows, last] += direction * magnitude
         return out
@@ -2446,6 +2496,9 @@ class SubstrateLogitBiasGraft(BaseGraft):
         bias = state.get("broca_logit_bias")
         if not bias:
             return x
+        substrate_scale = state_target_snr_scale(state)
+        if substrate_scale <= 0.0:
+            return x
         decay_raw = state.get("broca_logit_bias_decay", 1.0)
         try:
             decay = float(decay_raw)
@@ -2483,7 +2536,7 @@ class SubstrateLogitBiasGraft(BaseGraft):
             cur = last_logits[:, tid:tid + 1]                            # [B, 1]
             target_boost = (max_logit - cur).clamp_min(0.0) * confidence
             stubborn_push = stubbornness * float(bonus)
-            delta = ((target_boost + stubborn_push) * decay * inertia).to(out.dtype)
+            delta = ((target_boost + stubborn_push) * decay * inertia * substrate_scale).to(out.dtype)
             out[rows, last, tid] = out[rows, last, tid] + delta.squeeze(-1)
         return out
 
@@ -2503,6 +2556,39 @@ def _batch_from_ids(rows: Sequence[Sequence[int]], pad_id: int, *, device: torch
         mask = mask.to(device)
         lengths = lengths.to(device)
     return ids, mask, lengths
+
+
+def _affect_evidence(affect: AffectState) -> dict[str, Any]:
+    """Compact, JSON-friendly summary of an :class:`AffectState`.
+
+    Stored on every frame so derived graft strength, preference learning,
+    and intrinsic cues all consume the same numbers — there is no second
+    affect call that could disagree with this one.
+    """
+
+    return {
+        "dominant_emotion": str(affect.dominant_emotion),
+        "dominant_score": float(affect.dominant_score),
+        "valence": float(affect.valence),
+        "arousal": float(affect.arousal),
+        "preference_signal": str(affect.preference_signal),
+        "preference_strength": float(affect.preference_strength),
+        "cognitive_states": dict(affect.cognitive_states),
+    }
+
+
+def affect_certainty(affect: AffectState | None) -> float:
+    """Affect-driven certainty in ``[0, 1]`` for derived graft strength.
+
+    Uses the dominant emotion's score directly: a peaked affective response
+    (``dominant_score`` near 1) means the user's emotional signal is
+    unambiguous; a flat distribution (no emotion above threshold) means the
+    user is hard to read and the substrate should *nudge*, not hammer.
+    """
+
+    if affect is None:
+        return 1.0
+    return max(0.0, min(1.0, float(affect.dominant_score)))
 
 
 def default_lexical_target_snr(model: nn.Module) -> float:
@@ -2625,9 +2711,16 @@ class CognitiveRouter:
         self.relevance_floor = float(relevance_floor)
         self.extractor: RelationExtractor = extractor
 
-    def route(self, mind: "SubstrateController", utterance: str, toks: Sequence[str]) -> CognitiveFrame:
+    def route(
+        self,
+        mind: "SubstrateController",
+        utterance: str,
+        toks: Sequence[str],
+        *,
+        utterance_intent: UtteranceIntent,
+    ) -> CognitiveFrame:
         candidates: list[FacultyCandidate] = []
-        claim = self.extractor.extract_claim(utterance, toks)
+        claim = self.extractor.extract_claim(utterance, toks, utterance_intent=utterance_intent)
         if claim is not None:
             claim = mind.refine_extracted_claim(utterance, toks, claim)
         query = _query_from_tokens(
@@ -2886,16 +2979,35 @@ class SubstrateController:
             int(getattr(self.host.cfg, "d_model", 96)),
             target_snr=snr,
         )
+        host_param = None
         params = getattr(self.host, "parameters", None)
         if callable(params):
-            host_param = next(params(), None)
+            host_param = next(iter(params()), None)
             if host_param is not None:
                 self.feature_graft.to(host_param.device)
         self.host.add_graft("final_hidden", self.feature_graft)
         self.logit_bias_graft = SubstrateLogitBiasGraft()
         self.host.add_graft("logits", self.logit_bias_graft)
+        organ_device = (
+            host_param.device
+            if host_param is not None
+            else device
+            if isinstance(device, torch.device)
+            else pick_torch_device(device)
+        )
+        self.multimodal_perception = MultimodalPerceptionPipeline(device=organ_device)
         self.workspace = GlobalWorkspace()
-        self.router = CognitiveRouter(extractor=LLMRelationExtractor(self.host, self.tokenizer))
+        self.extraction_organ = ExtractionOrgan()
+        self.affect_organ = AffectOrgan()
+        self.intent_gate = IntentGate(self.extraction_organ)
+        self._last_intent: UtteranceIntent | None = None
+        self._last_affect: AffectState | None = None
+        self.router = CognitiveRouter(
+            extractor=OrganRelationExtractor(
+                intent_gate=self.intent_gate,
+                organ=self.extraction_organ,
+            )
+        )
         self.pomdp = build_tiger_pomdp()
         self.active_agent = ActiveInferenceAgent(self.pomdp, horizon=1, learn=False)
         self.scm = build_simpson_scm()
@@ -3147,6 +3259,12 @@ class SubstrateController:
             snap["substrate"] = {"error": True}
 
         try:
+            snap["organs"] = self.multimodal_perception.stats()
+        except Exception:
+            logger.exception("snapshot.organs failed")
+            snap["organs"] = {"error": True}
+
+        try:
             snap["preferences"] = {
                 "spatial_C": [float(x) for x in self.spatial_preference.expected_C()],
                 "causal_C": [float(x) for x in self.causal_preference.expected_C()],
@@ -3257,6 +3375,157 @@ class SubstrateController:
             self._padded_hopfield_sketch(b_sketch),
             metadata=dict(metadata or {}),
         )
+
+    def _after_frame_commit(
+        self,
+        out: CognitiveFrame,
+        utterance: str,
+        *,
+        event_topic: str,
+    ) -> None:
+        """Run shared post-commit substrate side effects for a published frame."""
+
+        try:
+            self.hawkes.observe(str(out.intent or "unknown"))
+        except Exception:
+            logger.exception("_after_frame_commit: hawkes observe failed")
+
+        if self._background_worker is not None:
+            self._background_worker.mark_user_active()
+
+        for concept in (out.subject, out.answer):
+            if isinstance(concept, str) and concept and concept != "unknown":
+                self.ontology.observe(concept)
+                base = stable_sketch(concept, dim=SKETCH_DIM)
+                self.ontology.maybe_promote(concept, base)
+
+        if out.subject and out.answer and out.intent in {"memory_write", "memory_lookup"}:
+            try:
+                pr_bind = str((out.evidence or {}).get("predicate", out.intent))
+                self.vsa.encode_triple(out.subject, pr_bind, out.answer)
+                ut_sk = stable_sketch(utterance[:512])
+                trip_sk = stable_sketch(f"{out.subject}|{pr_bind}|{out.answer}")
+                self.remember_hopfield(
+                    ut_sk,
+                    trip_sk,
+                    metadata={"kind": "declarative_binding", "intent": out.intent},
+                )
+            except Exception:
+                logger.exception("_after_frame_commit: vsa/hopfield binding failed")
+
+        logger.debug(
+            "_after_frame_commit: intent=%s confidence=%s journal_id=%s",
+            out.intent,
+            out.confidence,
+            (out.evidence or {}).get("journal_id"),
+        )
+
+        try:
+            payload = {
+                "intent": out.intent,
+                "subject": out.subject,
+                "answer": out.answer,
+                "confidence": float(out.confidence),
+                "journal_id": (out.evidence or {}).get("journal_id"),
+                "utterance": utterance[:200],
+            }
+            if event_topic == "frame.perception":
+                payload.update(
+                    {
+                        "modality": (out.evidence or {}).get("modality"),
+                        "source": (out.evidence or {}).get("source"),
+                        "feature_dim": (out.evidence or {}).get("feature_dim"),
+                    }
+                )
+            self.event_bus.publish(event_topic, payload)
+        except Exception:
+            logger.exception("_after_frame_commit: event publish failed")
+
+    def _frame_from_observation(self, observation: CognitiveObservation) -> CognitiveFrame:
+        """Convert a strict multimodal observation to a workspace frame."""
+
+        return CognitiveFrame(
+            f"perception_{observation.modality}",
+            subject=observation.subject,
+            answer=observation.answer,
+            confidence=float(observation.confidence),
+            evidence={
+                **observation.frame_evidence(),
+                "is_actionable": True,
+                "allows_storage": False,
+                "intent_label": f"perception_{observation.modality}",
+                "intent_confidence": float(observation.confidence),
+            },
+        )
+
+    def _commit_observation(self, observation: CognitiveObservation) -> CognitiveFrame:
+        """Publish a multimodal observation into journal, workspace, VSA, and Hopfield memory."""
+
+        source_text = f"[{observation.modality}:{observation.source}] {observation.answer}"
+        frame = self._frame_from_observation(observation)
+        with self._cognitive_state_lock:
+            out = self._commit_frame(source_text, utterance_words(source_text), frame)
+            self.vsa.encode_triple(observation.modality, "observed_as", observation.answer)
+            self.remember_hopfield(
+                stable_sketch(source_text[:512]),
+                observation.features,
+                metadata={
+                    "kind": "multimodal_observation",
+                    "modality": observation.modality,
+                    "source": observation.source,
+                    "intent": out.intent,
+                    "journal_id": (out.evidence or {}).get("journal_id"),
+                },
+            )
+        self._after_frame_commit(out, source_text, event_topic="frame.perception")
+        return out
+
+    def perceive_image(self, image: Any, *, source: str = "image") -> CognitiveFrame:
+        """Run the visual organs and commit their fused observation."""
+
+        return self._commit_observation(
+            self.multimodal_perception.perceive_image(image, source=source)
+        )
+
+    def perceive_video(self, frames: Any, *, source: str = "video") -> CognitiveFrame:
+        """Run temporal + visual organs and commit their fused observation."""
+
+        return self._commit_observation(
+            self.multimodal_perception.perceive_video(frames, source=source)
+        )
+
+    def perceive_audio(
+        self,
+        audio: Any,
+        *,
+        sampling_rate: int = 16000,
+        source: str = "audio",
+        language: str | None = None,
+    ) -> CognitiveFrame:
+        """Run Whisper/ImageBind audio organs, then route transcripts through language memory."""
+
+        observation = self.multimodal_perception.perceive_audio(
+            audio,
+            sampling_rate=int(sampling_rate),
+            source=source,
+            language=language,
+        )
+        out = self._commit_observation(observation)
+        transcription = str((observation.evidence or {}).get("transcription") or "").strip()
+        if transcription:
+            transcription_frame = self.comprehend(transcription)
+            try:
+                self.event_bus.publish(
+                    "frame.perception.transcription",
+                    {
+                        "audio_journal_id": (out.evidence or {}).get("journal_id"),
+                        "transcription_journal_id": (transcription_frame.evidence or {}).get("journal_id"),
+                        "transcription": transcription[:200],
+                    },
+                )
+            except Exception:
+                logger.exception("perceive_audio: transcription event publish failed")
+        return out
 
     def broca_features_from_frame(self, frame: CognitiveFrame) -> torch.Tensor:
         """Sketch frame + numeric tail + sparse VSA injection for :class:`TrainableFeatureGraft`."""
@@ -3622,61 +3891,63 @@ class SubstrateController:
         except Exception:
             logger.exception("_intrinsic_scan: event publish failed")
 
+    def _non_actionable_frame(self, intent: UtteranceIntent, affect: AffectState) -> "CognitiveFrame":
+        """Frame for utterances the substrate has nothing legitimate to say about.
+
+        Greetings, requests, commands, and feedback do not yield a triple to
+        store or a question to answer; producing a non-trivial frame for them
+        only invites the grafts to bias the LLM toward content the substrate
+        did not actually retrieve. Returning an explicit ``unknown`` frame
+        with confidence 0 is what the rest of the pipeline keys off of to
+        skip graft activation entirely.
+        """
+
+        evidence = {
+            "route": "intent_gate",
+            "intent_label": intent.label,
+            "intent_confidence": float(intent.confidence),
+            "intent_scores": dict(intent.scores),
+            "is_actionable": False,
+            "allows_storage": intent.allows_storage,
+            "affect": _affect_evidence(affect),
+        }
+        return CognitiveFrame(
+            "unknown",
+            answer="unknown",
+            confidence=0.0,
+            evidence=evidence,
+        )
+
+    def _attach_perception(
+        self, frame: "CognitiveFrame", intent: UtteranceIntent, affect: AffectState
+    ) -> None:
+        """Attach intent + affect signals to the frame's evidence in-place."""
+
+        frame.evidence = {
+            **dict(frame.evidence or {}),
+            "intent_label": intent.label,
+            "intent_confidence": float(intent.confidence),
+            "intent_scores": dict(intent.scores),
+            "is_actionable": True,
+            "allows_storage": intent.allows_storage,
+            "affect": _affect_evidence(affect),
+        }
+
     def comprehend(self, utterance: str) -> CognitiveFrame:
         toks = utterance_words(utterance)
         with self._cognitive_state_lock:
             self._intrinsic_scan(toks)
-            frame = self.router.route(self, utterance, toks)
+            intent = self.intent_gate.classify(utterance)
+            affect = self.affect_organ.detect(utterance)
+            self._last_intent = intent
+            self._last_affect = affect
+            if not intent.is_actionable:
+                frame = self._non_actionable_frame(intent, affect)
+            else:
+                frame = self.router.route(self, utterance, toks, utterance_intent=intent)
+                self._attach_perception(frame, intent, affect)
             out = self._commit_frame(utterance, toks, frame)
-        # Tell the Hawkes layer that this intent fired so its working memory
-        # heats up the relevant channels for the next few seconds.
-        try:
-            self.hawkes.observe(str(out.intent or "unknown"))
-        except Exception:
-            logger.exception("comprehend: hawkes observe failed")
-        # Tell the DMN the user is active so REM doesn't fire mid-conversation.
-        if self._background_worker is not None:
-            self._background_worker.mark_user_active()
-        # Promote frequent concepts to dedicated orthogonal axes.
-        for concept in (out.subject, out.answer):
-            if isinstance(concept, str) and concept and concept != "unknown":
-                self.ontology.observe(concept)
-                base = stable_sketch(concept, dim=SKETCH_DIM)
-                self.ontology.maybe_promote(concept, base)
-        # Bind the triple into the VSA codebook for algebraic recall.
-        if out.subject and out.answer and out.intent in {"memory_write", "memory_lookup"}:
-            try:
-                pr_bind = str((out.evidence or {}).get("predicate", out.intent))
-                self.vsa.encode_triple(out.subject, pr_bind, out.answer)
-                ut_sk = stable_sketch(utterance[:512])
-                trip_sk = stable_sketch(f"{out.subject}|{pr_bind}|{out.answer}")
-                self.remember_hopfield(
-                    ut_sk,
-                    trip_sk,
-                    metadata={"kind": "declarative_binding", "intent": out.intent},
-                )
-            except Exception:
-                logger.exception("comprehend: vsa/hopfield binding failed")
-        logger.debug(
-            "comprehend: intent=%s confidence=%s journal_id=%s",
-            out.intent,
-            out.confidence,
-            (out.evidence or {}).get("journal_id"),
-        )
-        try:
-            self.event_bus.publish(
-                "frame.comprehend",
-                {
-                    "intent": out.intent,
-                    "subject": out.subject,
-                    "answer": out.answer,
-                    "confidence": float(out.confidence),
-                    "journal_id": (out.evidence or {}).get("journal_id"),
-                    "utterance": utterance[:200],
-                },
-            )
-        except Exception:
-            logger.exception("comprehend: event publish failed")
+        self._after_frame_commit(out, utterance, event_topic="frame.comprehend")
         return out
 
     def _commit_frame(self, utterance: str, toks: Sequence[str], frame: CognitiveFrame) -> CognitiveFrame:
@@ -3686,21 +3957,6 @@ class SubstrateController:
             self.episode_graph.bump(self._last_journal_id, jid)
         self._last_journal_id = jid
         logger.debug("_commit_frame: journal_id=%s intent=%s pred_error=%s", jid, frame.intent, frame.intent == "prediction_error")
-        if frame.intent == "prediction_error":
-            pred = str(frame.evidence.get("predicate", ""))
-            if not pred and frame.subject:
-                records = self.memory.records_for_subject(frame.subject)
-                pred = records[0][0] if records else ""
-            known_objects = self.memory.distinct_objects_for_predicate(pred)
-            observed_objects = [t for t in toks if t in known_objects]
-            if observed_objects and frame.subject and pred:
-                self.memory.upsert(
-                    frame.subject,
-                    pred,
-                    observed_objects[-1],
-                    confidence=1.0,
-                    evidence={"journal_id": jid, "resolver": "prediction_error"},
-                )
         out = self.workspace.publish(frame)
         for tail in self.workspace.frames:
             pred = str((tail.evidence or {}).get("predicate", ""))
@@ -3778,20 +4034,26 @@ class SubstrateController:
         user_text = str(msgs[-1].get("content", "")).strip()
         frame = self.comprehend(user_text)
 
-        broca_features = self.broca_features_from_frame(frame) if frame.intent != "unknown" else None
-        logit_bias = self._content_logit_bias(frame)
         confidence = max(0.0, min(1.0, float(frame.confidence)))
+        derived_scale = self._derived_target_snr_scale(frame)
+        if derived_scale <= 0.0:
+            broca_features = None
+            logit_bias: dict[int, float] = {}
+        else:
+            broca_features = self.broca_features_from_frame(frame) if frame.intent != "unknown" else None
+            logit_bias = self._content_logit_bias(frame)
         eff_temperature = max(
             1e-3,
             float(temperature) * self._substrate_temperature_scale(frame, confidence),
         )
         logger.debug(
-            "chat_reply: intent=%s bias_tokens=%d has_broca_features=%s confidence=%.3f eff_temperature=%.3f",
+            "chat_reply: intent=%s bias_tokens=%d has_broca_features=%s confidence=%.3f eff_temperature=%.3f derived_scale=%.3f",
             frame.intent,
             len(logit_bias),
             broca_features is not None,
             confidence,
             eff_temperature,
+            derived_scale,
         )
         bias_top: list[dict[str, Any]] = []
         try:
@@ -3816,6 +4078,7 @@ class SubstrateController:
             "bias_token_count": len(logit_bias),
             "bias_top": bias_top,
             "has_broca_features": broca_features is not None,
+            "derived_target_snr_scale": float(derived_scale),
             "ts": time.time(),
         }
         try:
@@ -3833,6 +4096,7 @@ class SubstrateController:
             top_p=float(top_p),
             on_token=on_token,
             substrate_confidence=confidence,
+            substrate_target_snr_scale=float(derived_scale),
         )
         try:
             self.event_bus.publish(
@@ -3923,6 +4187,40 @@ class SubstrateController:
                 bias[tid] = max(bias.get(tid, 0.0), 1.0)
         return bias
 
+    def _derived_target_snr_scale(self, frame: CognitiveFrame) -> float:
+        """Compose intent / memory / conformal / affect into a graft-strength scale.
+
+        Returns a value in ``[0, 1]`` that the host grafts multiply against
+        their static SNR cap. ``0`` means *do not bias the LLM at all*;
+        ``1`` means *push as hard as the cap allows*. The scale is derived
+        from substrate state, never tuned.
+        """
+
+        evidence = frame.evidence or {}
+        is_actionable = bool(evidence.get("is_actionable", frame.intent != "unknown"))
+        actionability = 1.0 if is_actionable else 0.0
+        memory_confidence = max(0.0, min(1.0, float(frame.confidence)))
+        conformal_set_size = int(evidence.get("conformal_set_size", 0) or 0)
+        certainty = affect_certainty(self._last_affect)
+        strength = DerivedStrength.compute(
+            StrengthInputs(
+                intent_actionability=actionability,
+                memory_confidence=memory_confidence,
+                conformal_set_size=conformal_set_size,
+                affect_certainty=certainty,
+            )
+        )
+        logger.debug(
+            "_derived_target_snr_scale: intent=%s actionability=%.1f mem=%.3f |C|=%d affect=%.3f -> scale=%.3f",
+            frame.intent,
+            actionability,
+            memory_confidence,
+            conformal_set_size,
+            certainty,
+            strength,
+        )
+        return float(strength)
+
     def _stream_substrate_chat(
         self,
         messages: Sequence[dict[str, str]],
@@ -3935,6 +4233,7 @@ class SubstrateController:
         top_p: float,
         on_token: Callable[[str], None] | None,
         substrate_confidence: float = 1.0,
+        substrate_target_snr_scale: float = 1.0,
     ) -> str:
         hf_tok = getattr(self.tokenizer, "inner", None)
         if hf_tok is None or not callable(getattr(hf_tok, "apply_chat_template", None)):
@@ -3974,6 +4273,7 @@ class SubstrateController:
                     "tokenizer": self.tokenizer,
                     "substrate_confidence": float(substrate_confidence),
                     "substrate_inertia": float(inertia),
+                    "substrate_target_snr_scale": float(substrate_target_snr_scale),
                     "return_past_key_values": True,
                 }
                 if feature_tensor is not None:

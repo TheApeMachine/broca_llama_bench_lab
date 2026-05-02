@@ -18,8 +18,16 @@ from pathlib import Path
 
 import pytest
 
+from core.cognition.intent_gate import INTENT_LABELS
 from core.organs.extraction import ExtractionOrgan, ExtractedEntity, ExtractedRelation
 from core.organs.affect import AffectOrgan, AffectState
+
+
+def _intent_schema(*wanted: str) -> list[str]:
+    """Intersect with :data:`INTENT_LABELS` so label order follows the live gate."""
+
+    w = frozenset(wanted)
+    return [lab for lab in INTENT_LABELS if lab in w]
 
 
 class TestExtractionOrganIntentClassification:
@@ -33,35 +41,55 @@ class TestExtractionOrganIntentClassification:
 
     def test_request_classified_as_request(self, organ):
         """'Tell me a joke' is a request, not a factual statement."""
-        results = organ.classify("Tell me a joke", labels=["request", "statement", "question"])
+        results = organ.classify(
+            "Tell me a joke",
+            labels=_intent_schema("request", "statement", "question"),
+            multi_label=False,
+        )
         assert results, "classify returned no results"
         top_label = results[0][0]
         assert top_label == "request", f"Expected 'request', got '{top_label}'"
 
     def test_question_classified_as_question(self, organ):
         """'Where is Ada?' is a question."""
-        results = organ.classify("Where is Ada?", labels=["request", "statement", "question"])
+        results = organ.classify(
+            "Where is Ada?",
+            labels=_intent_schema("request", "statement", "question"),
+            multi_label=False,
+        )
         assert results, "classify returned no results"
         top_label = results[0][0]
         assert top_label == "question", f"Expected 'question', got '{top_label}'"
 
     def test_statement_classified_as_statement(self, organ):
         """'Ada lives in Rome' is a factual statement."""
-        results = organ.classify("Ada lives in Rome", labels=["request", "statement", "question"])
+        results = organ.classify(
+            "Ada lives in Rome",
+            labels=_intent_schema("request", "statement", "question"),
+            multi_label=False,
+        )
         assert results, "classify returned no results"
         top_label = results[0][0]
         assert top_label == "statement", f"Expected 'statement', got '{top_label}'"
 
     def test_greeting_not_classified_as_statement(self, organ):
         """'Hi' should not be classified as a statement with entities."""
-        results = organ.classify("Hi", labels=["request", "statement", "question", "greeting"])
+        results = organ.classify(
+            "Hi",
+            labels=_intent_schema("request", "statement", "question", "greeting"),
+            multi_label=False,
+        )
         assert results, "classify returned no results"
         top_label = results[0][0]
         assert top_label != "statement", f"'Hi' should not be a statement, got '{top_label}'"
 
     def test_command_not_classified_as_statement(self, organ):
         """'Stop talking about dogs' is a command, not a fact."""
-        results = organ.classify("Stop talking about dogs", labels=["request", "statement", "question", "command"])
+        results = organ.classify(
+            "Stop talking about dogs",
+            labels=_intent_schema("request", "statement", "question", "command"),
+            multi_label=False,
+        )
         assert results, "classify returned no results"
         top_label = results[0][0]
         assert top_label in ("request", "command"), f"Expected request/command, got '{top_label}'"

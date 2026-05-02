@@ -36,6 +36,36 @@ def _mosaic_test_sqlite(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None
     monkeypatch.setenv("MOSAIC_TEST_DB", str(tmp_path / "mosaic_test.sqlite"))
 
 
+@pytest.fixture(autouse=True)
+def _autostub_substrate_organs(request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Replace organs with canned stubs whenever a test builds a ``SubstrateController``.
+
+    ``SubstrateController.__init__`` instantiates :class:`ExtractionOrgan`
+    and :class:`AffectOrgan`, which lazy-load HuggingFace weights on first
+    use. The first ``comprehend`` call therefore tries to download
+    ``fastino/gliner2-base-v1`` and SamLowe's GoEmotions model, neither of
+    which the unit suite should depend on. We wrap ``__init__`` with a
+    post-step that swaps the freshly-built organs out for canned stubs so
+    every test gets a substrate that *functions* without network access.
+
+    Tests that genuinely want the real organs (e.g. ``test_organ_integration``)
+    can opt out by adding the ``real_organs`` marker.
+    """
+
+    if request.node.get_closest_marker("real_organs"):
+        return
+
+    import core.cognition.substrate as substrate_mod
+
+    real_init = substrate_mod.SubstrateController.__init__
+
+    def patched_init(self, *args, **kwargs):
+        real_init(self, *args, **kwargs)
+        stub_substrate_organs(self)
+
+    monkeypatch.setattr(substrate_mod.SubstrateController, "__init__", patched_init)
+
+
 def _hf_token_available() -> bool:
     if os.environ.get("HF_TOKEN", "").strip():
         return True
@@ -141,3 +171,150 @@ def make_stub_llm_pair(extractor: Callable[[str], tuple[str, str, str] | None] |
     llm = StubGenerationLLM()
     tok = StubGenerationTokenizer(llm, extractor or _default_stub_extract)
     return llm, tok
+
+
+# ---------------------------------------------------------------------------
+# Substrate organ stubbing.
+#
+# Every ``SubstrateController.comprehend`` call now runs through the intent
+# gate (``ExtractionOrgan.classify``) and the affect organ
+# (``AffectOrgan.detect``), which lazy-load model weights from HuggingFace on
+# first use. Tests that exercise memory, journals, or grafts do not care
+# about the gate's accuracy — they only need a substrate that *functions*.
+# ``stub_substrate_organs`` swaps in tiny canned implementations so those
+# tests stay fast and deterministic.
+#
+# Tests that DO want to exercise the real organs (``test_organ_integration``,
+# ``test_substrate_intent_gating`` opting into stubs explicitly) should not
+# call this helper.
+# ---------------------------------------------------------------------------
+
+
+class _CannedExtractionOrgan:
+    """Minimal stand-in for :class:`core.organs.extraction.ExtractionOrgan`.
+
+    Defaults ``classify`` to "statement" so the substrate's intent gate
+    routes everything as actionable, which matches the pre-organ behavior
+    that legacy tests expect. Tests can pass per-fragment overrides for
+    either ``classify`` or ``extract_relations`` results.
+    """
+
+    def __init__(
+        self,
+        *,
+        intent_responses: "dict[str, list[tuple[str, float]]] | None" = None,
+        relation_responses: "dict[str, list] | None" = None,
+        default_intent_label: str = "statement",
+        default_intent_score: float = 0.95,
+    ):
+        self._intent = intent_responses or {}
+        self._relations = relation_responses or {}
+        self._default_intent_label = default_intent_label
+        self._default_intent_score = float(default_intent_score)
+        self.classify_calls: list[str] = []
+        self.relation_calls: list[str] = []
+
+    def classify(self, text: str, *, labels, multi_label: bool = True, threshold: float = 0.0):
+        self.classify_calls.append(text)
+        for fragment, scores in self._intent.items():
+            if fragment in text.lower():
+                return list(scores)
+        # Match the smallest set of pragmatic features the legacy substrate
+        # relied on: a trailing ``?`` is a question; otherwise the canned
+        # default applies. Tests that need finer behavior pass explicit
+        # ``intent_responses``.
+        if "?" in text:
+            return [("question", 0.95)]
+        return [(self._default_intent_label, self._default_intent_score)]
+
+    def extract_relations(self, text: str, *, entity_labels=None, relation_labels=None):
+        _ = entity_labels, relation_labels
+        self.relation_calls.append(text)
+        for fragment, rels in self._relations.items():
+            if fragment in text.lower():
+                return list(rels)
+        if "?" in text:
+            return []
+        return _heuristic_extract_relations(text)
+
+
+class _CannedAffectOrgan:
+    """Returns a fixed neutral :class:`core.organs.affect.AffectState`."""
+
+    def __init__(self, state=None):
+        from core.organs.affect import AffectState
+
+        self._state = state if state is not None else AffectState(
+            dominant_emotion="neutral",
+            dominant_score=0.5,
+            valence=0.0,
+            arousal=0.0,
+        )
+        self.calls: list[str] = []
+
+    def detect(self, text: str, *, threshold=None):
+        _ = threshold
+        self.calls.append(text)
+        return self._state
+
+
+def _heuristic_extract_relations(text: str):
+    """Tiny SVO heuristic — ``"X is in Y"`` → triple, otherwise empty.
+
+    This mirrors the ``_default_stub_extract`` behavior used by the legacy
+    LLM extractor stubs in this conftest, so memory-layer tests that send
+    sentences like ``"ada is in rome ."`` continue to produce a triple
+    after we route extraction through the organ.
+    """
+
+    from core.organs.extraction import ExtractedRelation
+
+    import re
+
+    words = re.findall(r"[A-Za-z0-9_]+", text.lower())
+    while words and words[0] in ("the", "a", "an"):
+        words.pop(0)
+    if len(words) < 3:
+        return []
+    return [
+        ExtractedRelation(
+            subject=words[0],
+            predicate="is_in",
+            object=words[-1],
+            confidence=0.9,
+        )
+    ]
+
+
+def stub_substrate_organs(
+    mind,
+    *,
+    intent_responses: "dict[str, list[tuple[str, float]]] | None" = None,
+    relation_responses: "dict[str, list] | None" = None,
+    affect_state=None,
+    default_intent_label: str = "statement",
+    default_intent_score: float = 0.95,
+) -> _CannedExtractionOrgan:
+    """Replace a substrate's organs with deterministic canned stubs.
+
+    Returns the canned extraction organ so tests can inspect ``classify_calls``
+    or ``relation_calls`` after the fact.
+    """
+
+    from core.cognition.intent_gate import IntentGate
+    from core.cognition.organ_relation_extractor import OrganRelationExtractor
+
+    extraction = _CannedExtractionOrgan(
+        intent_responses=intent_responses,
+        relation_responses=relation_responses,
+        default_intent_label=default_intent_label,
+        default_intent_score=default_intent_score,
+    )
+    mind.extraction_organ = extraction
+    mind.affect_organ = _CannedAffectOrgan(affect_state)
+    mind.intent_gate = IntentGate(extraction)
+    mind.router.extractor = OrganRelationExtractor(
+        intent_gate=mind.intent_gate,
+        organ=extraction,
+    )
+    return extraction

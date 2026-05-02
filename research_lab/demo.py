@@ -27,7 +27,7 @@ def main(argv: list[str] | None = None) -> None:
         print(f"Unsupported --mode {args.mode!r}; use broca.", file=sys.stderr)
         raise SystemExit(2)
 
-    from core.benchmarks.architecture_eval import run_broca_architecture_eval
+    from research_lab.benchmarks.architecture_eval import run_broca_architecture_eval
     from core.host.llama_broca_host import resolve_hf_hub_token
     from core.system.device import pick_torch_device
     from core.substrate.runtime import default_model_id, default_substrate_sqlite_path, ensure_parent_dir

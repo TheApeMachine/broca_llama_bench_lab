@@ -20,7 +20,7 @@ Environment (optional)::
     BROCA_SELF_IMPROVE_DOCKER_CPUS — default ``2``
     BROCA_SELF_IMPROVE_TIMEOUT_S — default ``1800``
     BROCA_SELF_IMPROVE_RUN_DEMO — if ``1``, run ``python -m core.demo --mode broca`` after pytest
-    BROCA_SELF_IMPROVE_RUN_PAPER — if ``1``, run ``python -m core.paper`` (``refresh_paper_experiments``)
+    BROCA_SELF_IMPROVE_RUN_PAPER — if ``1``, run ``python -m research_lab.paper`` (``refresh_paper_experiments``)
         after a **successful** Docker validation cycle (local benchmark/TeX deps as for ``make paper-bench``)
 """
 
@@ -628,8 +628,10 @@ class SelfImproveDockerWorker:
         )
         if ok and self.config.run_paper_refresh:
             try:
-                from ..paper.harness import refresh_paper_experiments
+                from research_lab.paper.harness import refresh_paper_experiments
 
                 refresh_paper_experiments()
+            except ImportError:
+                logger.debug("self-improve: research_lab not installed; skipping paper refresh")
             except Exception:
                 logger.exception("self-improve: refresh_paper_experiments failed after successful Docker cycle")

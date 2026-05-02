@@ -10,7 +10,7 @@ deterministic generation with normalized exact matching where applicable.
 
 Real runs use the unified entry point::
 
-  HF_TOKEN=... python -m core.benchmarks
+  HF_TOKEN=... python -m research_lab.benchmarks
 """
 
 from __future__ import annotations
@@ -34,6 +34,7 @@ from typing import Any, Callable, Iterable, Iterator, Mapping, Protocol, Sequenc
 import torch
 import torch.nn.functional as F
 
+from core.cli import build_substrate_controller
 from core.cognition.substrate import SubstrateController
 from core.system.device import inference_dtype, pick_torch_device
 from core.host.hf_tokenizer_compat import HuggingFaceBrocaTokenizer
@@ -43,7 +44,7 @@ from core.host.llama_broca_host import (
     quiet_transformers_benchmark_log_warnings,
     resolve_hf_hub_token,
 )
-from core.substrate.runtime import CHAT_NAMESPACE, default_substrate_sqlite_path
+from core.substrate.runtime import CHAT_NAMESPACE, ensure_parent_dir
 
 
 DEFAULT_LLAMA_MODEL = "meta-llama/Llama-3.2-1B-Instruct"
@@ -1297,15 +1298,17 @@ def run_hf_datasets_benchmark(
                 "artifacts_subdir": "broca_shell",
             }
         }
+        mind_sqlite = (out / "broca_mind_hf.sqlite").resolve()
+        ensure_parent_dir(mind_sqlite)
         mind_preload = (shell_back.host, HuggingFaceBrocaTokenizer(shell_back.tokenizer))
-        bm = SubstrateController(
+        bm = build_substrate_controller(
             seed=int(seed),
-            db_path=default_substrate_sqlite_path(),
+            db_path=mind_sqlite,
             namespace=CHAT_NAMESPACE,
-            preload_host_tokenizer=mind_preload,
             llama_model_id=model_id,
             device=str(shell_back.device),
             hf_token=hf_token,
+            preload_host_tokenizer=mind_preload,
         )
         mind_backend = HFLocalSubstrateBench(bm, backend)
         mind_dir = out / "broca_mind"
@@ -1389,7 +1392,7 @@ def run_hf_datasets_benchmark(
 
 
 def print_hf_datasets_benchmark_help() -> None:
-    print("Standalone module for library imports. Run the unified harness via:\n  python -m core.benchmarks\n")
+    print("Standalone module for library imports. Run the unified harness via:\n  python -m research_lab.benchmarks\n")
 
 
 def main(argv: Sequence[str] | None = None) -> None:
@@ -1400,7 +1403,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         print_hf_datasets_benchmark_help()
         return
     if trailing:
-        print("hf_datasets_eval has no tuning flags; use `python -m core.benchmarks`.", file=sys.stderr)
+        print("hf_datasets_eval has no tuning flags; use `python -m research_lab.benchmarks`.", file=sys.stderr)
         raise SystemExit(2)
     print_hf_datasets_benchmark_help()
 

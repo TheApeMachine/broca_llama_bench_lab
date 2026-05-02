@@ -8,6 +8,7 @@ sleep-cycle plumbing from the heavy substrate stack.
 from __future__ import annotations
 
 import random
+import sqlite3
 import threading
 import types
 from pathlib import Path
@@ -103,6 +104,14 @@ def test_rem_phase_runs_when_idle_threshold_exceeded(tmp_path: Path):
     assert cd.get("ran"), cd
     assert mind.discovered_scm is not None
 
+    db_file = tmp_path / "rem.sqlite"
+    con = sqlite3.connect(str(db_file))
+    try:
+        hawkes_rows = int(con.execute("SELECT COUNT(*) FROM hawkes_state").fetchone()[0])
+        assert hawkes_rows >= 1
+    finally:
+        con.close()
+
 
 def test_rem_phase_skipped_when_user_active(tmp_path: Path):
     mind = _build_synthetic_mind(tmp_path)
@@ -123,3 +132,24 @@ def test_rem_phase_persists_preferences(tmp_path: Path):
     assert loaded is not None
     # Saved alpha matches in-memory alpha after REM.
     assert all(abs(a - b) < 1e-6 for a, b in zip(loaded.alpha, mind.spatial_preference.alpha))
+
+
+def test_rem_persists_conformal_scores_after_calibration(tmp_path: Path) -> None:
+    mind = _build_synthetic_mind(tmp_path)
+    warm = ConformalPredictor(alpha=0.1, method="lac", min_calibration=1)
+    mind.relation_conformal = warm
+    mind.conformal_calibration.hydrate(warm, "relation_extraction")
+    warm.calibrate(p_label=0.92)
+    cfg = DMNConfig(
+        sleep_idle_seconds=0.0,
+        sleep_min_observations_for_pc=999,
+        sleep_hawkes_min_events=999,
+    )
+    worker = CognitiveBackgroundWorker(mind, interval_s=999.0, config=cfg, rng=random.Random(11))
+    worker.run_once()
+    con = sqlite3.connect(str(tmp_path / "rem.sqlite"))
+    try:
+        scores_n = int(con.execute("SELECT COUNT(*) FROM conformal_scores").fetchone()[0])
+        assert scores_n >= 1
+    finally:
+        con.close()

@@ -7,7 +7,14 @@ name = "mosaic"
 version = "0.5.0"
 description = "LLM-as-Broca neurosymbolic architecture with Llama 3.2 and HuggingFace datasets benchmarks"
 requires-python = ">=3.11"
-dependencies = ["torch>=2.11.0", "numpy>=2.4.4"]
+dependencies = [
+    "torch>=2.11.0",
+    "numpy>=2.4.4",
+    "gliner2",
+    "msgpack",
+    "urllib3>=2.2.0",
+    "onnxruntime>=1.23.2",
+]
 
 [project.scripts]
 mosaic = "core.main:main"
@@ -31,8 +38,11 @@ tui = [
 
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["core"]
+include = ["core", "core.*", "research_lab", "research_lab.*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["."]
+markers = [
+    "real_organs: opt out of automatic organ stubbing; the test must load the real ExtractionOrgan / AffectOrgan model weights",
+]

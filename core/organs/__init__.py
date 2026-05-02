@@ -20,7 +20,7 @@ All organs are:
     - Frozen (weights never updated)
     - Lazy-loaded (only instantiated when first used)
     - Device-aware (share device with the substrate)
-    - Fallback-safe (graceful degradation when deps missing)
+    - Strict (missing dependencies or incomplete outputs raise immediately)
 """
 
 from __future__ import annotations
@@ -35,12 +35,23 @@ __all__ = [
     "OrganOutput",
     "ExtractionOrgan",
     "AffectOrgan",
+    "DINOv2Organ",
+    "IJEPAOrgan",
+    "VJEPAOrgan",
+    "DepthOrgan",
+    "create_perception_organs",
+    "AuditoryOrgan",
+    "BindingOrgan",
 ]
 
 # Lazy imports for heavy organs (avoid importing torch-heavy vision/audio at module level)
 def __getattr__(name: str):
     _lazy = {
-        "PerceptionOrgan": (".perception", "PerceptionOrgan"),
+        "DINOv2Organ": (".perception", "DINOv2Organ"),
+        "IJEPAOrgan": (".perception", "IJEPAOrgan"),
+        "VJEPAOrgan": (".perception", "VJEPAOrgan"),
+        "DepthOrgan": (".perception", "DepthOrgan"),
+        "create_perception_organs": (".perception", "create_perception_organs"),
         "AuditoryOrgan": (".auditory", "AuditoryOrgan"),
         "BindingOrgan": (".binding", "BindingOrgan"),
     }

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import math
 
-from core.benchmarks.substrate_eval import bench_memory_fidelity
+from research_lab.benchmarks.substrate_eval import bench_memory_fidelity
 
 
 def test_bench_memory_fidelity_reports_finite_avg_confidence_error() -> None:

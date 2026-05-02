@@ -8,13 +8,14 @@ PYTHON ?= python3
 RUN_PYTHON := $(if $(wildcard .venv/bin/python),.venv/bin/python,$(PYTHON))
 UV ?= uv
 
-.PHONY: help install install-benchmark chat tui bench bench-cli bench-tui paper paper-bench paper-pdf
+.PHONY: help install install-benchmark test chat tui bench bench-cli bench-tui paper paper-bench paper-pdf
 
 help:
 	@echo "Targets:"
 	@echo "  Unified entry: \`$(RUN_PYTHON) -m core --help\` (subcommands: chat, chat-tui, bench, bench-tui, demo, paper)"
 	@echo "  make install             python3 -m venv .venv; uv sync (--extra tui --extra test; tui pulls benchmark)"
 	@echo "  make install-benchmark   add/refresh benchmark extra: uv pip install -e \".[benchmark]\""
+	@echo "  make test                pytest (isolated DBs via MOSAIC_TEST_DB; see help text below)"
 	@echo "  make chat                streaming terminal chat (full Broca substrate; fixed runtime)"
 	@echo "  make bench               live benchmark TUI (native HF + lm-eval + Broca probes)"
 	@echo "  make bench-cli           same harness without the TUI (plain stdout)"
@@ -40,6 +41,9 @@ install:
 install-benchmark: install
 	. .venv/bin/activate && $(UV) pip install -e ".[benchmark]"
 
+test:
+	$(RUN_PYTHON) -m pytest
+
 chat:
 	$(RUN_PYTHON) -m core chat
 
@@ -51,14 +55,14 @@ tui:
 bench: bench-tui
 
 bench-tui:
-	$(RUN_PYTHON) -m core bench-tui
+	$(RUN_PYTHON) -m research_lab.tui.bench
 
 bench-cli:
-	$(RUN_PYTHON) -m core bench
+	$(RUN_PYTHON) -m research_lab.benchmarks
 
 # Smaller default preset/limit via env: PAPER_NATIVE_PRESET=quick PAPER_BENCH_LIMIT=50
 paper-bench:
-	$(RUN_PYTHON) -m core paper
+	$(RUN_PYTHON) -m research_lab.paper
 
 paper-pdf:
 	@if command -v latexmk >/dev/null 2>&1; then \

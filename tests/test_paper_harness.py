@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pytest
 
-from core.paper.harness import (
+from research_lab.paper.harness import (
     refresh_paper_experiments,
     write_broca_architecture_experiment_tex,
     write_comparison_table_tex,

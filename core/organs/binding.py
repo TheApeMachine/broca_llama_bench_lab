@@ -27,9 +27,17 @@ from typing import Any, Literal
 import torch
 import torch.nn.functional as F
 
+from ..system.event_bus import get_default_bus
 from .base import BaseOrgan, OrganOutput
 
 logger = logging.getLogger(__name__)
+
+
+def _publish(topic: str, payload: dict) -> None:
+    try:
+        get_default_bus().publish(topic, payload)
+    except Exception:
+        pass
 
 _IMAGEBIND_MODEL = "nielsr/imagebind-huge"
 _IMAGEBIND_DIM = 1024  # ImageBind's shared embedding dimension
@@ -73,25 +81,18 @@ class BindingOrgan(BaseOrgan):
     def _load_model(self) -> None:
         """Load ImageBind model."""
         try:
-            # Try the imagebind package first
             from imagebind.models import imagebind_model
             from imagebind.models.imagebind_model import ModalityType
-            self._model = imagebind_model.imagebind_huge(pretrained=True).to(self.device).eval()
-            self._modality_type = ModalityType
-            self._backend = "imagebind_native"
-        except ImportError:
-            # Fall back to transformers-based loading
-            try:
-                from transformers import AutoModel, AutoProcessor
-                self._model = AutoModel.from_pretrained(self._model_id).to(self.device).eval()
-                self._processor = AutoProcessor.from_pretrained(self._model_id)
-                self._backend = "transformers"
-            except Exception as exc:
-                raise ImportError(
-                    "BindingOrgan requires either the `imagebind` package "
-                    "(pip install git+https://github.com/facebookresearch/ImageBind) "
-                    "or a transformers-compatible ImageBind port."
-                ) from exc
+        except ImportError as exc:
+            raise ImportError(
+                "BindingOrgan requires the native `imagebind` package "
+                "(pip install git+https://github.com/facebookresearch/ImageBind). "
+                "The transformers backend is not used because it cannot encode all wired modalities."
+            ) from exc
+
+        self._model = imagebind_model.imagebind_huge(pretrained=True).to(self.device).eval()
+        self._modality_type = ModalityType
+        self._backend = "imagebind_native"
 
         # Freeze
         for param in self._model.parameters():
@@ -104,23 +105,23 @@ class BindingOrgan(BaseOrgan):
         self._ensure_loaded()
         start = time.time()
 
-        if self._backend == "imagebind_native":
-            from imagebind import data as ib_data
-            if isinstance(image, str):
-                inputs = {self._modality_type.VISION: ib_data.load_and_transform_vision_data([image], self.device)}
-            else:
-                # Assume tensor or PIL
-                inputs = {self._modality_type.VISION: ib_data.load_and_transform_vision_data_from_pil([image], self.device)}
-            embeddings = self._model(inputs)
-            features = F.normalize(embeddings[self._modality_type.VISION][0].cpu().float(), dim=0)
+        if self._backend != "imagebind_native":
+            raise RuntimeError("BindingOrgan must be loaded with the native ImageBind backend")
+
+        from imagebind import data as ib_data
+        if isinstance(image, str):
+            inputs = {self._modality_type.VISION: ib_data.load_and_transform_vision_data([image], self.device)}
         else:
-            inputs = self._processor(images=image, return_tensors="pt")
-            inputs = {k: v.to(self.device) for k, v in inputs.items()}
-            outputs = self._model.get_image_features(**inputs)
-            features = F.normalize(outputs[0].cpu().float(), dim=0)
+            inputs = {self._modality_type.VISION: ib_data.load_and_transform_vision_data_from_pil([image], self.device)}
+        embeddings = self._model(inputs)
+        features = F.normalize(embeddings[self._modality_type.VISION][0].cpu().float(), dim=0)
 
         elapsed = (time.time() - start) * 1000
-        self._record_call(elapsed)
+        self._record_call(elapsed, method="encode_image")
+        _publish(
+            "organ.binding.encode",
+            {"modality": "image", "latency_ms": elapsed, "feature_dim": int(features.numel())},
+        )
         return OrganOutput(features=features, metadata={"modality": "image"}, latency_ms=elapsed, organ_name=self._name)
 
     @torch.no_grad()
@@ -129,19 +130,25 @@ class BindingOrgan(BaseOrgan):
         self._ensure_loaded()
         start = time.time()
 
-        if self._backend == "imagebind_native":
-            from imagebind import data as ib_data
-            inputs = {self._modality_type.TEXT: ib_data.load_and_transform_text([text], self.device)}
-            embeddings = self._model(inputs)
-            features = F.normalize(embeddings[self._modality_type.TEXT][0].cpu().float(), dim=0)
-        else:
-            inputs = self._processor(text=text, return_tensors="pt", padding=True)
-            inputs = {k: v.to(self.device) for k, v in inputs.items()}
-            outputs = self._model.get_text_features(**inputs)
-            features = F.normalize(outputs[0].cpu().float(), dim=0)
+        if self._backend != "imagebind_native":
+            raise RuntimeError("BindingOrgan must be loaded with the native ImageBind backend")
+
+        from imagebind import data as ib_data
+        inputs = {self._modality_type.TEXT: ib_data.load_and_transform_text([text], self.device)}
+        embeddings = self._model(inputs)
+        features = F.normalize(embeddings[self._modality_type.TEXT][0].cpu().float(), dim=0)
 
         elapsed = (time.time() - start) * 1000
-        self._record_call(elapsed)
+        self._record_call(elapsed, method="encode_text")
+        _publish(
+            "organ.binding.encode",
+            {
+                "modality": "text",
+                "text": text[:120],
+                "latency_ms": elapsed,
+                "feature_dim": int(features.numel()),
+            },
+        )
         return OrganOutput(features=features, metadata={"modality": "text", "text": text[:100]}, latency_ms=elapsed, organ_name=self._name)
 
     @torch.no_grad()
@@ -150,28 +157,30 @@ class BindingOrgan(BaseOrgan):
         self._ensure_loaded()
         start = time.time()
 
-        if self._backend == "imagebind_native":
-            from imagebind import data as ib_data
-            if isinstance(audio, str):
-                inputs = {self._modality_type.AUDIO: ib_data.load_and_transform_audio_data([audio], self.device)}
-            else:
-                inputs = {self._modality_type.AUDIO: audio.unsqueeze(0).to(self.device) if isinstance(audio, torch.Tensor) else audio}
-            embeddings = self._model(inputs)
-            features = F.normalize(embeddings[self._modality_type.AUDIO][0].cpu().float(), dim=0)
+        if self._backend != "imagebind_native":
+            raise RuntimeError("BindingOrgan must be loaded with the native ImageBind backend")
+
+        from imagebind import data as ib_data
+        if isinstance(audio, str):
+            inputs = {self._modality_type.AUDIO: ib_data.load_and_transform_audio_data([audio], self.device)}
         else:
-            # Transformers path - may need audio preprocessing
-            features = torch.zeros(self._output_dim, dtype=torch.float32)
-            logger.warning("Audio encoding via transformers backend not fully implemented for ImageBind")
+            inputs = {self._modality_type.AUDIO: audio.unsqueeze(0).to(self.device) if isinstance(audio, torch.Tensor) else audio}
+        embeddings = self._model(inputs)
+        features = F.normalize(embeddings[self._modality_type.AUDIO][0].cpu().float(), dim=0)
 
         elapsed = (time.time() - start) * 1000
-        self._record_call(elapsed)
+        self._record_call(elapsed, method="encode_audio")
+        _publish(
+            "organ.binding.encode",
+            {"modality": "audio", "latency_ms": elapsed, "feature_dim": int(features.numel())},
+        )
         return OrganOutput(features=features, metadata={"modality": "audio"}, latency_ms=elapsed, organ_name=self._name)
 
     @torch.no_grad()
     def cross_modal_similarity(self, output_a: OrganOutput, output_b: OrganOutput) -> float:
         """Compute cosine similarity between two organ outputs from any modalities."""
         if output_a.features is None or output_b.features is None:
-            return 0.0
+            raise ValueError("cross_modal_similarity requires features from both outputs")
         return float(F.cosine_similarity(
             output_a.features.unsqueeze(0),
             output_b.features.unsqueeze(0),

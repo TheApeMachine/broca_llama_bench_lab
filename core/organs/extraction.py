@@ -1,16 +1,18 @@
 """Extraction organ: zero-shot NER, relation extraction, and classification.
 
-Replaces the LLM-based LLMRelationExtractor and regex-based intent detection
-with a dedicated 205M parameter encoder model (GLiNER2) that handles:
-- Named Entity Recognition with arbitrary dynamic labels
-- Relation extraction between entity pairs
-- Zero-shot text classification (intent, topic, etc.)
-- Template-based structured extraction
+Replaces the LLM-based ``LLMRelationExtractor`` and regex intent detection with
+a single GLiNER2 encoder that handles entities, relations, and classification
+in one model call. There is no fallback chain — if the model cannot be loaded
+or a method is missing, the organ raises so the flaw is exposed rather than
+papered over.
 
 Brain analogy: Wernicke's area — language comprehension and semantic parsing.
 
-Model: fastino/gliner2-base-v1 (205M params, ~400MB, CPU-first design)
-Fallback: urchade/gliner_medium-v2.1 (209M) if GLiNER2 unavailable
+Model: ``fastino/gliner2-base-v1`` (205M params, ~400MB, CPU-first design),
+loaded via the ``gliner2`` package — *not* ``gliner``. The two libraries
+share a name family but expose different APIs; gliner2's surface is
+``extract_entities(text, [labels])``, ``classify_text(text, schema)``, and
+``extract_json(text, schema)``.
 """
 
 from __future__ import annotations
@@ -20,24 +22,46 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Sequence
 
+from ..system.event_bus import get_default_bus
 from .base import BaseOrgan, OrganOutput
 
 logger = logging.getLogger(__name__)
 
-# Default model hierarchy (try in order)
-_GLINER2_MODEL = "fastino/gliner2-base-v1"
-_GLINER_FALLBACK = "urchade/gliner_medium-v2.1"
 
-# Default entity labels for general-purpose extraction
-DEFAULT_ENTITY_LABELS = [
+def _publish(topic: str, payload: dict) -> None:
+    try:
+        get_default_bus().publish(topic, payload)
+    except Exception:
+        pass
+
+EXTRACTION_MODEL_ID = "fastino/gliner2-base-v1"
+
+DEFAULT_ENTITY_LABELS: tuple[str, ...] = (
     "person", "organization", "location", "concept",
-    "event", "quantity", "time", "relationship",
-]
+    "event", "quantity", "time", "thing",
+)
+
+DEFAULT_RELATION_LABELS: tuple[str, ...] = (
+    "is_in", "is_a", "has", "works_at", "created",
+    "related_to", "part_of", "causes", "located_in",
+)
+
+STRUCTURED_FACT_KEY = "fact"
+STRUCTURED_FACT_FIELDS: tuple[str, ...] = (
+    "subject::str::entity in subject role",
+    "predicate::str::verb phrase linking subject and object",
+    "object::str::entity in object role",
+)
+
+_REQUIRED_GLINER2_METHODS: tuple[str, ...] = (
+    "extract_entities",
+    "classify_text",
+    "extract_json",
+)
 
 
 @dataclass
 class ExtractedEntity:
-    """A named entity extracted from text."""
     text: str
     label: str
     score: float
@@ -47,7 +71,6 @@ class ExtractedEntity:
 
 @dataclass
 class ExtractedRelation:
-    """A relation between two entities."""
     subject: str
     predicate: str
     object: str
@@ -58,7 +81,6 @@ class ExtractedRelation:
 
 @dataclass
 class ExtractionResult:
-    """Complete extraction output from the organ."""
     entities: list[ExtractedEntity] = field(default_factory=list)
     relations: list[ExtractedRelation] = field(default_factory=list)
     classifications: dict[str, list[tuple[str, float]]] = field(default_factory=dict)
@@ -66,24 +88,7 @@ class ExtractionResult:
 
 
 class ExtractionOrgan(BaseOrgan):
-    """Frozen GLiNER2/GLiNER model for structured information extraction.
-
-    Replaces LLM few-shot prompting for relation extraction with a dedicated
-    encoder that runs in <10ms per utterance on CPU.
-
-    Usage:
-        organ = ExtractionOrgan()
-        organ.load()
-
-        # NER
-        result = organ.extract_entities("Ada lives in Rome", labels=["person", "location"])
-
-        # Relations (subject, predicate, object triples)
-        result = organ.extract_relations("Ada lives in Rome")
-
-        # Classification
-        result = organ.classify("where is Ada?", labels=["question", "statement", "request"])
-    """
+    """Frozen GLiNER2 model for structured information extraction."""
 
     def __init__(
         self,
@@ -93,54 +98,28 @@ class ExtractionOrgan(BaseOrgan):
         entity_threshold: float = 0.3,
         relation_threshold: float = 0.3,
     ):
-        # GLiNER output dim is contextual (span-based), not a fixed embedding
-        # We report 0 since the organ returns structured data, not vectors
         super().__init__(
             name="extraction",
-            model_id=model_id or _GLINER2_MODEL,
+            model_id=model_id or EXTRACTION_MODEL_ID,
             output_dim=0,
             device=device,
         )
-        self._entity_threshold = entity_threshold
-        self._relation_threshold = relation_threshold
-        self._is_gliner2 = False
-        self._is_gliner1 = False
+        self._entity_threshold = float(entity_threshold)
+        self._relation_threshold = float(relation_threshold)
 
     def _load_model(self) -> None:
-        """Try GLiNER2 first, fall back to GLiNER v2.1."""
-        # Try GLiNER2
-        try:
-            from gliner import GLiNER
-            self._model = GLiNER.from_pretrained(self._model_id)
-            if hasattr(self._model, "to"):
-                self._model = self._model.to(self.device)
-            self._is_gliner2 = "gliner2" in self._model_id.lower()
-            self._is_gliner1 = not self._is_gliner2
-            logger.info("ExtractionOrgan: loaded %s", self._model_id)
-            return
-        except ImportError:
-            logger.debug("gliner package not available")
-        except Exception as exc:
-            logger.warning("Failed to load %s: %s", self._model_id, exc)
+        from gliner2 import GLiNER2
 
-        # Fallback to GLiNER v2.1
-        if self._model_id != _GLINER_FALLBACK:
-            try:
-                from gliner import GLiNER
-                self._model = GLiNER.from_pretrained(_GLINER_FALLBACK)
-                if hasattr(self._model, "to"):
-                    self._model = self._model.to(self.device)
-                self._model_id = _GLINER_FALLBACK
-                self._is_gliner1 = True
-                logger.info("ExtractionOrgan: loaded fallback %s", _GLINER_FALLBACK)
-                return
-            except Exception as exc:
-                logger.warning("Fallback GLiNER also failed: %s", exc)
-
-        raise ImportError(
-            "ExtractionOrgan requires the `gliner` package. "
-            "Install with: pip install gliner"
-        )
+        self._model = GLiNER2.from_pretrained(self._model_id)
+        if hasattr(self._model, "to"):
+            self._model = self._model.to(self.device)
+        for required in _REQUIRED_GLINER2_METHODS:
+            if not callable(getattr(self._model, required, None)):
+                raise RuntimeError(
+                    f"ExtractionOrgan requires GLiNER2 with `{required}`; "
+                    f"loaded model {self._model_id!r} does not expose it."
+                )
+        logger.info("ExtractionOrgan: loaded %s", self._model_id)
 
     def extract_entities(
         self,
@@ -149,41 +128,94 @@ class ExtractionOrgan(BaseOrgan):
         labels: Sequence[str] | None = None,
         threshold: float | None = None,
     ) -> list[ExtractedEntity]:
-        """Extract named entities with dynamic labels.
+        """Run zero-shot NER and return ``ExtractedEntity`` mentions.
 
-        Args:
-            text: Input text to extract from.
-            labels: Entity type labels (e.g. ["person", "location", "concept"]).
-                Must be lowercase for GLiNER.
-            threshold: Minimum confidence score (default: self._entity_threshold).
-
-        Returns:
-            List of ExtractedEntity with text spans, labels, and scores.
+        gliner2's ``extract_entities`` returns ``{"entities": {label: [text, ...]}}``
+        — a label → mentions map without per-mention scores or offsets. We
+        translate that into the legacy list-of-mentions shape; callers that
+        depended on per-mention ``score`` see ``1.0`` for every survivor of
+        gliner2's internal threshold (``threshold`` here is informational —
+        gliner2 applies its own).
         """
+
         self._ensure_loaded()
         start = time.time()
-
-        labels = [l.lower() for l in (labels or DEFAULT_ENTITY_LABELS)]
-        thresh = threshold if threshold is not None else self._entity_threshold
-
-        try:
-            raw = self._model.predict_entities(text, labels, threshold=thresh)
-            entities = [
-                ExtractedEntity(
-                    text=ent.get("text", ent.get("span", "")),
-                    label=ent.get("label", ""),
-                    score=float(ent.get("score", 0.0)),
-                    start=int(ent.get("start", 0)),
-                    end=int(ent.get("end", 0)),
-                )
-                for ent in raw
-            ]
-        except Exception as exc:
-            logger.warning("Entity extraction failed: %s", exc)
-            entities = []
-
-        self._record_call((time.time() - start) * 1000)
+        _ = threshold
+        ent_labels = [str(l).lower() for l in (labels or DEFAULT_ENTITY_LABELS)]
+        raw = self._model.extract_entities(text, ent_labels)
+        payload = raw.get("entities", raw) if isinstance(raw, dict) else {}
+        entities: list[ExtractedEntity] = []
+        if isinstance(payload, dict):
+            for label, mentions in payload.items():
+                if not isinstance(mentions, (list, tuple)):
+                    continue
+                for mention in mentions:
+                    surface = str(mention)
+                    span = self._locate_span(text, surface)
+                    entities.append(
+                        ExtractedEntity(
+                            text=surface,
+                            label=str(label),
+                            score=1.0,
+                            start=span[0],
+                            end=span[1],
+                        )
+                    )
+        latency = (time.time() - start) * 1000
+        self._record_call(latency, method="extract_entities")
+        _publish(
+            "organ.extraction.entities",
+            {
+                "text": text[:120],
+                "n_entities": len(entities),
+                "labels": list(ent_labels),
+                "entities": [(e.label, e.text) for e in entities[:8]],
+                "latency_ms": latency,
+            },
+        )
         return entities
+
+    @staticmethod
+    def _unwrap_gliner_scalar(value: Any) -> str | None:
+        if value is None:
+            return None
+        if isinstance(value, dict) and "text" in value:
+            tx = value.get("text")
+            return None if tx is None else str(tx)
+        return str(value)
+
+    @staticmethod
+    def _predicate_gap_from_source(text_full: str, subj_clean: str, obj_clean: str) -> str:
+        """Substring strictly between grounded subject/object spans in ``text_full``.
+
+        Raises if the grounding is unusable — no silent Invented predicates.
+        """
+
+        tl = text_full.lower()
+        sl = subj_clean.strip().lower()
+        ol = obj_clean.strip().lower()
+        if not sl or not ol:
+            raise ValueError(
+                "ExtractionOrgan._predicate_gap_from_source: empty subject or object span"
+            )
+        i = tl.find(sl)
+        j = tl.find(ol)
+        if i < 0 or j < 0:
+            raise ValueError(
+                f"ExtractionOrgan._predicate_gap_from_source: substring not located "
+                f"subject={subj_clean!r} object={obj_clean!r}"
+            )
+        if j <= i + len(sl):
+            raise ValueError(
+                "ExtractionOrgan._predicate_gap_from_source: object does not follow subject span"
+            )
+        gap_raw = text_full[i + len(sl) : j].strip().strip(",").strip()
+        gap_norm = gap_raw.strip().lower()
+        if not gap_norm:
+            raise ValueError(
+                "ExtractionOrgan._predicate_gap_from_source: empty gap between grounded entities"
+            )
+        return gap_norm
 
     def extract_relations(
         self,
@@ -192,61 +224,75 @@ class ExtractionOrgan(BaseOrgan):
         entity_labels: Sequence[str] | None = None,
         relation_labels: Sequence[str] | None = None,
     ) -> list[ExtractedRelation]:
-        """Extract (subject, predicate, object) triples from text.
+        """Extract subject-predicate-object triples via gliner2's ``extract_json`` structured ``fact``.
 
-        First extracts entities, then classifies relations between pairs.
-        This replaces the LLM-based LLMRelationExtractor.
+        ``fastino/gliner2-base-v1`` emits list-valued structures (see GLiNER2
+        README); naming the bundle ``relations`` yielded empty payloads in
+        practice, while ``fact`` returns grounded subject/object rows. Predicate
+        may be absent in JSON-null form; then it is reconstructed only from the
+        source text spans between grounded entities (still fully text-derived).
 
-        Args:
-            text: Input text.
-            entity_labels: Labels for NER pass.
-            relation_labels: Candidate relation types. If None, uses generic set.
-
-        Returns:
-            List of ExtractedRelation triples.
+        ``relation_labels`` remains informational — downstream normalizes predicates.
         """
+
         self._ensure_loaded()
         start = time.time()
+        _ = entity_labels, relation_labels
+        schema = {STRUCTURED_FACT_KEY: list(STRUCTURED_FACT_FIELDS)}
+        raw = self._model.extract_json(text, schema)
+        records: list[dict] = []
+        if isinstance(raw, dict):
+            primary = raw.get(STRUCTURED_FACT_KEY)
+            if isinstance(primary, list):
+                records.extend(r for r in primary if isinstance(r, dict))
+            elif isinstance(primary, dict) and primary:
+                records.append(primary)
+            legacy = raw.get("relations")
+            if isinstance(legacy, list):
+                records.extend(r for r in legacy if isinstance(r, dict))
 
-        # Step 1: Extract entities
-        entities = self.extract_entities(
-            text,
-            labels=entity_labels or ["person", "organization", "location", "concept", "thing"],
-        )
-
-        if len(entities) < 2:
-            self._record_call((time.time() - start) * 1000)
-            return []
-
-        # Step 2: For each entity pair, infer relation
-        # GLiNER2 can do this via schema; GLiNER1 needs the glirel package
         relations: list[ExtractedRelation] = []
+        for item in records:
+            lower = {str(k).lower().replace("-", "").replace("_", ""): v for k, v in item.items()}
+            rs = lower.get("subject")
+            rp = lower.get("predicate")
+            ro = lower.get("object")
+            subj_clean = self._unwrap_gliner_scalar(rs)
+            obj_clean = self._unwrap_gliner_scalar(ro)
+            pred_raw = self._unwrap_gliner_scalar(rp)
+            if subj_clean is None or obj_clean is None:
+                continue
+            subj = str(subj_clean).strip().lower()
+            obj = str(obj_clean).strip().lower()
+            if not subj or not obj:
+                continue
+            pred_part = None if pred_raw is None else str(pred_raw).strip().lower()
+            if not pred_part or pred_part in {"none", "null"}:
+                pred_part = self._predicate_gap_from_source(text, subj, obj)
+            if not pred_part:
+                continue
+            relations.append(
+                ExtractedRelation(
+                    subject=subj,
+                    predicate=pred_part,
+                    object=obj,
+                    confidence=1.0,
+                )
+            )
 
-        if self._is_gliner2 and hasattr(self._model, "predict_relations"):
-            # GLiNER2 native relation extraction
-            try:
-                rel_labels = list(relation_labels or [
-                    "is_in", "is_a", "has", "works_at", "created",
-                    "related_to", "part_of", "causes", "located_in",
-                ])
-                raw_rels = self._model.predict_relations(text, rel_labels)
-                for rel in raw_rels:
-                    relations.append(ExtractedRelation(
-                        subject=rel.get("head", {}).get("text", ""),
-                        predicate=rel.get("label", ""),
-                        object=rel.get("tail", {}).get("text", ""),
-                        confidence=float(rel.get("score", 0.0)),
-                        subject_label=rel.get("head", {}).get("label", ""),
-                        object_label=rel.get("tail", {}).get("label", ""),
-                    ))
-            except Exception as exc:
-                logger.debug("GLiNER2 relation extraction failed: %s", exc)
-        
-        # Fallback: synthesize relations from entity co-occurrence + proximity
-        if not relations and len(entities) >= 2:
-            relations = self._heuristic_relations(text, entities)
-
-        self._record_call((time.time() - start) * 1000)
+        latency = (time.time() - start) * 1000
+        self._record_call(latency, method="extract_relations")
+        _publish(
+            "organ.extraction.relations",
+            {
+                "text": text[:120],
+                "n_relations": len(relations),
+                "relations": [
+                    (r.subject, r.predicate, r.object) for r in relations[:5]
+                ],
+                "latency_ms": latency,
+            },
+        )
         return relations
 
     def classify(
@@ -255,73 +301,83 @@ class ExtractionOrgan(BaseOrgan):
         *,
         labels: Sequence[str],
         multi_label: bool = True,
-        threshold: float = 0.3,
+        threshold: float = 0.0,
     ) -> list[tuple[str, float]]:
-        """Zero-shot text classification with dynamic labels.
+        """Zero-shot classification via gliner2's ``classify_text``.
 
-        Replaces regex-based intent/sentiment detection.
-
-        Args:
-            text: Input text.
-            labels: Candidate classification labels.
-            multi_label: Allow multiple labels above threshold.
-            threshold: Minimum confidence.
-
-        Returns:
-            List of (label, score) tuples sorted by score descending.
+        gliner2 returns the *selected* label(s) without per-label scores
+        (single-label: a string; multi-label: a list of strings). We translate
+        that into the substrate's expected ``[(label, score)]`` shape with
+        ``score=1.0`` for selected labels.
         """
+
         self._ensure_loaded()
         start = time.time()
-
+        label_list = list(labels)
+        if not label_list:
+            self._record_call((time.time() - start) * 1000)
+            return []
+        if multi_label:
+            schema = {
+                "_intent": {
+                    "labels": label_list,
+                    "multi_label": True,
+                    "cls_threshold": float(threshold),
+                }
+            }
+        else:
+            schema = {"_intent": label_list}
+        raw = self._model.classify_text(text, schema)
+        selected = raw.get("_intent") if isinstance(raw, dict) else None
         results: list[tuple[str, float]] = []
-
-        # GLiNER2 has built-in classification
-        if self._is_gliner2 and hasattr(self._model, "classify"):
-            try:
-                raw = self._model.classify(text, list(labels))
-                results = [(r["label"], float(r["score"])) for r in raw if float(r.get("score", 0)) >= threshold]
-            except Exception as exc:
-                logger.debug("GLiNER2 classify failed: %s", exc)
-
-        # Fallback: use entity prediction as a proxy for classification
-        # (predict the label as if it were an entity in the text)
-        if not results:
-            try:
-                raw = self._model.predict_entities(text, [l.lower() for l in labels], threshold=threshold)
-                seen = set()
-                for ent in raw:
-                    label = ent.get("label", "")
-                    if label not in seen:
-                        results.append((label, float(ent.get("score", 0.0))))
-                        seen.add(label)
-            except Exception as exc:
-                logger.debug("Classification fallback also failed: %s", exc)
-
-        results.sort(key=lambda x: x[1], reverse=True)
-        if not multi_label and results:
-            results = results[:1]
-
-        self._record_call((time.time() - start) * 1000)
+        if isinstance(selected, list):
+            for label in selected:
+                if str(label).strip():
+                    results.append((str(label), 1.0))
+        elif isinstance(selected, str) and selected.strip():
+            results.append((str(selected).strip(), 1.0))
+        allowed = frozenset(str(lab) for lab in label_list)
+        results = [(lab, scr) for lab, scr in results if lab in allowed]
+        # Keep GLiNER2's emitted order — it encodes relevance. Sorting selected
+        # labels into the caller's label-list order falsely makes whichever
+        # label appears first *in `labels=`* win whenever every score was 1.0.
+        latency = (time.time() - start) * 1000
+        self._record_call(latency, method="classify")
+        _publish(
+            "organ.extraction.classify",
+            {
+                "text": text[:120],
+                "labels": list(label_list),
+                "selected": [label for label, _ in results],
+                "multi_label": bool(multi_label),
+                "latency_ms": latency,
+            },
+        )
         return results
 
     def process(self, text: str, **kwargs: Any) -> OrganOutput:
-        """Unified organ interface: extract entities + relations + classify intent."""
+        _ = kwargs
         self._ensure_loaded()
         start = time.time()
-
         result = ExtractionResult(raw_text=text)
         result.entities = self.extract_entities(text)
         result.relations = self.extract_relations(text)
         result.classifications["intent"] = self.classify(
-            text, labels=["question", "statement", "request", "complaint", "praise"]
+            text,
+            labels=("question", "statement", "request", "complaint", "praise"),
         )
-
         elapsed = (time.time() - start) * 1000
         return OrganOutput(
-            features=None,  # Extraction organ outputs structured data, not vectors
+            features=None,
             metadata={
-                "entities": [{"text": e.text, "label": e.label, "score": e.score} for e in result.entities],
-                "relations": [{"subject": r.subject, "predicate": r.predicate, "object": r.object, "confidence": r.confidence} for r in result.relations],
+                "entities": [
+                    {"text": e.text, "label": e.label, "score": e.score}
+                    for e in result.entities
+                ],
+                "relations": [
+                    {"subject": r.subject, "predicate": r.predicate, "object": r.object, "confidence": r.confidence}
+                    for r in result.relations
+                ],
                 "classifications": result.classifications,
             },
             confidence=max((e.score for e in result.entities), default=0.5),
@@ -329,44 +385,11 @@ class ExtractionOrgan(BaseOrgan):
             organ_name=self._name,
         )
 
-    def _heuristic_relations(self, text: str, entities: list[ExtractedEntity]) -> list[ExtractedRelation]:
-        """Infer relations from entity proximity and basic sentence structure."""
-        relations: list[ExtractedRelation] = []
-        # Simple: take consecutive entity pairs and assign generic "related_to"
-        for i in range(len(entities) - 1):
-            e1, e2 = entities[i], entities[i + 1]
-            # Extract text between the two entities
-            between = text[e1.end:e2.start].strip().lower()
-            # Try to find a verb phrase
-            predicate = self._extract_predicate(between)
-            if predicate:
-                relations.append(ExtractedRelation(
-                    subject=e1.text.lower(),
-                    predicate=predicate,
-                    object=e2.text.lower(),
-                    confidence=0.5,
-                    subject_label=e1.label,
-                    object_label=e2.label,
-                ))
-        return relations
-
     @staticmethod
-    def _extract_predicate(between: str) -> str:
-        """Extract a predicate from text between two entities."""
-        import re
-        between = between.strip(" ,;:")
-        # Common verb patterns
-        patterns = [
-            r"^(is|are|was|were)\s+(located\s+in|based\s+in|a|an|the\s+\w+\s+of)",
-            r"^(is|are|was|were)\s+(\w+)",
-            r"^(has|have|had)\s+(\w+)",
-            r"^(\w+(?:ed|s|es|ing))\b",
-        ]
-        for pattern in patterns:
-            m = re.match(pattern, between)
-            if m:
-                return m.group(0).strip()[:50]
-        # If short enough, use the whole between-text as predicate
-        if 1 < len(between.split()) <= 4:
-            return between[:50]
-        return ""
+    def _locate_span(text: str, mention: str) -> tuple[int, int]:
+        if not mention:
+            return (0, 0)
+        idx = text.lower().find(mention.lower())
+        if idx < 0:
+            return (0, 0)
+        return (idx, idx + len(mention))

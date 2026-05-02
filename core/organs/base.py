@@ -21,7 +21,16 @@ from typing import Any, Protocol, runtime_checkable
 import torch
 import torch.nn.functional as F
 
+from ..system.event_bus import get_default_bus
+
 logger = logging.getLogger(__name__)
+
+
+def _publish(topic: str, payload: dict) -> None:
+    try:
+        get_default_bus().publish(topic, payload)
+    except Exception:
+        pass
 
 
 @dataclass
@@ -156,6 +165,15 @@ class BaseOrgan(ABC):
                 "Organ loaded: %s (%s) on %s in %.0fms",
                 self._name, self._model_id, self.device, elapsed,
             )
+            _publish(
+                "organ.load",
+                {
+                    "name": self._name,
+                    "model_id": self._model_id,
+                    "device": str(self.device),
+                    "load_ms": elapsed,
+                },
+            )
 
     def unload(self) -> None:
         """Release model weights."""
@@ -166,15 +184,26 @@ class BaseOrgan(ABC):
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
             logger.info("Organ unloaded: %s", self._name)
+            _publish("organ.unload", {"name": self._name})
 
     def _ensure_loaded(self) -> None:
         """Load on first use if not already loaded."""
         if not self._loaded:
             self.load()
 
-    def _record_call(self, latency_ms: float) -> None:
+    def _record_call(self, latency_ms: float, *, method: str | None = None) -> None:
         self._total_calls += 1
         self._total_latency_ms += latency_ms
+        _publish(
+            "organ.call",
+            {
+                "name": self._name,
+                "method": method or "process",
+                "latency_ms": float(latency_ms),
+                "total_calls": self._total_calls,
+                "avg_latency_ms": self._total_latency_ms / max(1, self._total_calls),
+            },
+        )
 
     @abstractmethod
     def _load_model(self) -> None:

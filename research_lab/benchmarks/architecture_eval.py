@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Any, Sequence
 
 from core.cognition.substrate import SubstrateController, generate_without_substrate
+from core.cli import build_substrate_controller
 from core.substrate.runtime import CHAT_NAMESPACE
 
 logger = logging.getLogger(__name__)
@@ -156,10 +157,10 @@ def run_broca_architecture_eval(
     rows: list[dict[str, Any]] = []
     graft_reports_by_case: dict[str, str] = {}
     total_cases = len(cases)
-    mind = SubstrateController(
+    mind = build_substrate_controller(
+        bus=bus,
         seed=seed,
-        db_path=db_path,
-        namespace=CHAT_NAMESPACE,
+        db_path=Path(db_path),
         llama_model_id=mid,
         device=device,
         hf_token=hf_token,

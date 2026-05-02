@@ -1,4 +1,4 @@
-"""CLI: ``python -m core.paper`` — refresh ``paper/include/experiment/``."""
+"""CLI: ``python -m research_lab.paper`` — refresh ``paper/include/experiment/``."""
 
 from __future__ import annotations
 

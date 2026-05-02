@@ -6,8 +6,8 @@ import torch
 
 import pytest
 
+from core.cli import build_substrate_controller
 from core.cognition.substrate import (
-    SubstrateController,
     CognitiveFrame,
     GlobalWorkspace,
     TrainableFeatureGraft,
@@ -18,7 +18,7 @@ import core.cognition.substrate as substrate_mod
 from core.memory import SQLiteActivationMemory
 from core.substrate.graph import EpisodeAssociationGraph, merge_epistemic_evidence_dict
 
-from conftest import make_stub_llm_pair
+from conftest import make_stub_llm_pair, stub_substrate_organs
 
 
 class FakeHost:
@@ -66,7 +66,8 @@ def test_episode_association_graph_persistent(tmp_path: Path):
 def test_workspace_journal_fetch_roundtrip(tmp_path: Path, llama_broca_loaded: None):
     subject = _symbol("subject")
     obj = _symbol("object")
-    mind = SubstrateController(seed=0, db_path=tmp_path / "b.sqlite", namespace="x")
+    mind = build_substrate_controller(seed=0, db_path=tmp_path / "b.sqlite", namespace="x", device="cpu", hf_token=False)
+    stub_substrate_organs(mind)
     mind.answer(f"{subject} is in {obj} .")
     mind.answer(f"where is {subject} ?")
     row = mind.journal.fetch(2)
@@ -96,7 +97,7 @@ def test_runtime_mind_creates_sqlite_before_model_load_failure(tmp_path: Path, m
     monkeypatch.setattr(substrate_mod, "load_llama_broca_host", fail_load)
 
     with pytest.raises(RuntimeError, match="model unavailable"):
-        SubstrateController(seed=0, db_path=db, namespace="early")
+        build_substrate_controller(seed=0, db_path=db, namespace="early", device="cpu", hf_token=False)
 
     assert db.exists()
     assert WorkspaceJournal(db).count() == 0
@@ -108,7 +109,8 @@ def test_runtime_mind_starts_empty_and_learns_observed_location(tmp_path: Path, 
     subject = _symbol("subject")
     obj = _symbol("object")
 
-    mind = SubstrateController(seed=0, db_path=db, namespace="runtime")
+    mind = build_substrate_controller(seed=0, db_path=db, namespace="runtime", device="cpu", hf_token=False)
+    stub_substrate_organs(mind)
     assert mind.memory.count() == 0
     assert mind.comprehend(f"where is {subject} ?").intent == "unknown"
 
@@ -118,7 +120,8 @@ def test_runtime_mind_starts_empty_and_learns_observed_location(tmp_path: Path, 
     assert mind.memory.count() == 1
     assert mind.comprehend(f"where is {subject} ?").answer == obj
 
-    restarted = SubstrateController(seed=0, db_path=db, namespace="runtime")
+    restarted = build_substrate_controller(seed=0, db_path=db, namespace="runtime", device="cpu", hf_token=False)
+    stub_substrate_organs(restarted)
     assert restarted.memory.count() == 1
     assert restarted.comprehend(f"where is {subject} ?").answer == obj
     assert pred == learned.evidence["predicate"]
@@ -126,7 +129,8 @@ def test_runtime_mind_starts_empty_and_learns_observed_location(tmp_path: Path, 
 
 def test_runtime_mind_routes_faculties_and_installs_feature_graft(tmp_path: Path, fake_host_loader):
     host = fake_host_loader(track_grafts=True)
-    mind = SubstrateController(seed=0, db_path=tmp_path / "router.sqlite", namespace="runtime")
+    mind = build_substrate_controller(seed=0, db_path=tmp_path / "router.sqlite", namespace="runtime", device="cpu", hf_token=False)
+    stub_substrate_organs(mind)
 
     assert any(isinstance(graft, TrainableFeatureGraft) for _, graft in host.grafts)
     assert mind.comprehend("what action should i take ?").intent == "active_action"
@@ -135,7 +139,8 @@ def test_runtime_mind_routes_faculties_and_installs_feature_graft(tmp_path: Path
 
 def test_observed_contradiction_records_counterfactual_without_overwrite(tmp_path: Path, fake_host_loader):
     fake_host_loader(track_grafts=False)
-    mind = SubstrateController(seed=0, db_path=tmp_path / "conflict.sqlite", namespace="runtime")
+    mind = build_substrate_controller(seed=0, db_path=tmp_path / "conflict.sqlite", namespace="runtime", device="cpu", hf_token=False)
+    stub_substrate_organs(mind)
     subject = _symbol("subject")
     current = _symbol("object")
     challenger = _symbol("object")
@@ -154,7 +159,8 @@ def test_observed_contradiction_records_counterfactual_without_overwrite(tmp_pat
 
 def test_background_consolidation_revises_after_repeated_counterevidence(tmp_path: Path, fake_host_loader):
     fake_host_loader(track_grafts=False)
-    mind = SubstrateController(seed=0, db_path=tmp_path / "consolidate.sqlite", namespace="runtime")
+    mind = build_substrate_controller(seed=0, db_path=tmp_path / "consolidate.sqlite", namespace="runtime", device="cpu", hf_token=False)
+    stub_substrate_organs(mind)
     subject = _symbol("subject")
     current = _symbol("object")
     challenger = _symbol("object")
@@ -175,7 +181,7 @@ def test_background_consolidation_revises_after_repeated_counterevidence(tmp_pat
 
 def test_background_worker_start_stop(tmp_path: Path, fake_host_loader):
     fake_host_loader(track_grafts=False)
-    mind = SubstrateController(seed=0, db_path=tmp_path / "worker.sqlite", namespace="runtime")
+    mind = build_substrate_controller(seed=0, db_path=tmp_path / "worker.sqlite", namespace="runtime", device="cpu", hf_token=False)
 
     worker = mind.start_background(interval_s=60.0)
 

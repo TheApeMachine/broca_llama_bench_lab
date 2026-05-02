@@ -39,18 +39,36 @@ def host_rms(x: torch.Tensor) -> torch.Tensor:
 
 
 def snr_magnitude(
-    x: torch.Tensor, *, target_snr: float, confidence: float = 1.0, inertia: float = 1.0
+    x: torch.Tensor,
+    *,
+    target_snr: float,
+    confidence: float = 1.0,
+    inertia: float = 1.0,
+    substrate_scale: float = 1.0,
 ) -> torch.Tensor:
     """Magnitude that injects a unit direction at ``target_snr`` × host RMS.
 
-    Confidence and context-inertia are multiplicative on top: high-confidence
-    substrate frames push proportionally harder, and the bias scales with the
-    autoregressive prefix length so grafts can shout over an LLM that has built
-    up momentum on a competing surface form.
+    ``target_snr`` is the SNR *cap* — the most a graft may push, fixed at
+    construction time. The remaining factors are derived per call:
+
+    * ``confidence`` — the substrate frame's belief in the answer.
+    * ``inertia`` — log-grown sequence-length factor so grafts can shout
+      over an LLM that has built up autoregressive momentum.
+    * ``substrate_scale`` — derived strength in ``[0, 1]`` composed from
+      intent, memory, conformal, and affect signals (see
+      :class:`core.cognition.derived_strength.DerivedStrength`). When the
+      substrate has nothing legitimate to say this collapses to ``0`` and
+      the graft injects no bias regardless of the cap.
     """
 
     ts = max(0.0, float(target_snr))
-    return host_rms(x) * ts * float(max(0.0, confidence)) * float(max(0.0, inertia))
+    return (
+        host_rms(x)
+        * ts
+        * float(max(0.0, confidence))
+        * float(max(0.0, inertia))
+        * float(max(0.0, substrate_scale))
+    )
 
 
 def state_confidence(state: dict) -> float:
@@ -63,6 +81,22 @@ def state_confidence(state: dict) -> float:
 
 def state_inertia(state: dict) -> float:
     val = state.get("substrate_inertia")
+    try:
+        return float(val) if val is not None else 1.0
+    except (TypeError, ValueError):
+        return 1.0
+
+
+def state_target_snr_scale(state: dict) -> float:
+    """Read the derived ``[0, 1]`` graft strength scale from the host state.
+
+    Defaults to ``1.0`` so callers that don't compute a derived scale
+    (benchmarks, plan-forced ``speak()``) still see the static cap as the
+    effective SNR. Conversational paths must set this so grafts only fire
+    when the substrate has earned the right to bias.
+    """
+
+    val = state.get("substrate_target_snr_scale")
     try:
         return float(val) if val is not None else 1.0
     except (TypeError, ValueError):
@@ -206,6 +240,7 @@ class KVMemoryGraft(BaseGraft):
         host_at_query: torch.Tensor,
         confidence: float = 1.0,
         inertia: float = 1.0,
+        substrate_scale: float = 1.0,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, dict]:
         q = F.normalize(queries, dim=-1)
         k = F.normalize(self.keys.to(x.device), dim=-1)
@@ -271,6 +306,7 @@ class KVMemoryGraft(BaseGraft):
             target_snr=self.target_snr,
             confidence=confidence,
             inertia=inertia,
+            substrate_scale=substrate_scale,
         )
         delta = direction * magnitude * gate
         return delta, weights, gate.squeeze(-1), manifold_dbg
@@ -285,6 +321,7 @@ class KVMemoryGraft(BaseGraft):
             mask = torch.ones(bsz, seq_len, device=x.device, dtype=torch.bool)
         confidence = state_confidence(state)
         inertia = state_inertia(state)
+        substrate_scale = state_target_snr_scale(state)
         if self.query_mode == "token":
             host_at_query = x.reshape(-1, d_model)
             delta, weights, gate, manifold_dbg = self._retrieve(
@@ -293,6 +330,7 @@ class KVMemoryGraft(BaseGraft):
                 host_at_query=host_at_query,
                 confidence=confidence,
                 inertia=inertia,
+                substrate_scale=substrate_scale,
             )
             self.last_debug = {
                 "weights": weights.detach().cpu(),
@@ -327,6 +365,7 @@ class KVMemoryGraft(BaseGraft):
             host_at_query=host_at_last,
             confidence=confidence,
             inertia=inertia,
+            substrate_scale=substrate_scale,
         )
         out = x.clone()
         out[torch.arange(bsz, device=x.device), last] += delta
@@ -468,6 +507,7 @@ class FeatureVectorGraft(BaseGraft):
             return x
         confidence = state_confidence(state)
         inertia = state_inertia(state)
+        substrate_scale = state_target_snr_scale(state)
         last = _last_indices(state, x)
         rows = torch.arange(x.shape[0], device=x.device)[applies]
         last_apply = last[applies]
@@ -478,6 +518,7 @@ class FeatureVectorGraft(BaseGraft):
             target_snr=self.target_snr,
             confidence=confidence,
             inertia=inertia,
+            substrate_scale=substrate_scale,
         )
         out = x.clone()
         out[rows, last_apply] += direction * magnitude
@@ -523,6 +564,7 @@ class TriggeredTokenDirectionGraft(BaseGraft):
             return x
         confidence = state_confidence(state)
         inertia = state_inertia(state)
+        substrate_scale = state_target_snr_scale(state)
         out = x.clone()
         model = state["model"]
         tok_id = self.token_by_name[name]
@@ -538,6 +580,7 @@ class TriggeredTokenDirectionGraft(BaseGraft):
             target_snr=self.target_snr,
             confidence=confidence,
             inertia=inertia,
+            substrate_scale=substrate_scale,
         )
         out[rows, last_apply] += direction.unsqueeze(0) * magnitude
         self.last_name = name

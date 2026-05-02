@@ -2,11 +2,11 @@
 
 Run:
 
-  python -m core bench-tui
-  # or: python -m core.tui.bench
+  python -m research_lab.tui.bench
+  # or: python -m research_lab.tui.bench
 
 The benchmark suite executes in a Textual ``@work(thread=True)`` worker so the
-UI stays responsive. The benchmark code (``core.benchmarks``) publishes
+UI stays responsive. The benchmark code (``research_lab.benchmarks``) publishes
 progress on the shared :mod:`core.system.event_bus` (``bench.suite.*``,
 ``bench.phase.*``, ``bench.task.*``, ``bench.example``,
 ``bench.arch_case.*``) and the TUI subscribes from the same in-process bus.
@@ -20,7 +20,7 @@ Layout, mirroring the brand identity of :mod:`core.tui.chat`:
 * Right column: aggregate vs broca comparison panel, architecture case
   scoreboard, suite summary card.
 
-Threading: the worker calls :func:`core.benchmarks.__main__.main` directly
+Threading: the worker calls :func:`research_lab.benchmarks.__main__.main` directly
 (no subprocess), since both the bench code and the TUI live in the same
 process and share ``get_default_bus()``.
 """
@@ -170,13 +170,22 @@ def _fmt_delta(v: float | None, prec: int = 3) -> str:
     return f"{sign}{f:.{prec}f}"
 
 
+def _fmt_float(v: Any, prec: int = 3) -> str:
+    if v is None:
+        return "—"
+    try:
+        return f"{float(v):.{prec}f}"
+    except (TypeError, ValueError):
+        return str(v)
+
+
 # ---------------------------------------------------------------------------
 # The app
 # ---------------------------------------------------------------------------
 
 
 class BenchApp(App):
-    """Real-time dashboard for ``python -m core.benchmarks``."""
+    """Real-time dashboard for ``python -m research_lab.benchmarks``."""
 
     CSS = f"""
     Screen {{
@@ -199,14 +208,16 @@ class BenchApp(App):
     #main {{
         height: 1fr;
     }}
-    #left, #right {{
+    #left {{
         width: 36;
         min-width: 32;
         padding: 1;
         border-right: solid {BRAND} 40%;
     }}
     #right {{
-        border-right: none;
+        width: 46;
+        min-width: 40;
+        padding: 1;
         border-left: solid {BRAND} 40%;
     }}
     #center {{
@@ -287,6 +298,55 @@ class BenchApp(App):
         self._lm_eval_summary: dict[str, Any] | None = None
         self._arch_summary: dict[str, Any] | None = None
         self._acc_trend: deque[float] = deque(maxlen=80)
+        # --- live cognition / organ state for the new panels --------------
+        self._last_intent: dict[str, Any] | None = None
+        self._intent_label_counts: dict[str, int] = {}
+        self._last_derived_strength: dict[str, Any] | None = None
+        self._last_relation_extract: dict[str, Any] | None = None
+        self._relation_outcome_counts: dict[str, int] = {}
+        self._last_predictive_coding: dict[str, Any] | None = None
+        self._hypothesis_state: dict[str, Any] = {
+            "running": False,
+            "iteration": 0,
+            "max_iterations": 0,
+            "n_bans": 0,
+            "n_completed": 0,
+            "n_accepted": 0,
+            "last_text": "",
+            "last_reason": "",
+        }
+        self._epistemic_state: dict[str, Any] = {
+            "running": False,
+            "step": 0,
+            "max_new_tokens": 0,
+            "n_interventions": 0,
+            "last_reason": "",
+            "n_completed": 0,
+        }
+        self._modality_state: dict[str, Any] = {
+            "active": None,
+            "modes": [],
+            "n_registered": 0,
+        }
+        self._causal_state: dict[str, Any] = {
+            "n_constraints": 0,
+            "last": None,
+        }
+        # organ name -> {"calls": int, "avg_ms": float, "last_ms": float, "method": str}
+        self._organ_stats: dict[str, dict[str, Any]] = {}
+        self._loaded_organs: dict[str, dict[str, Any]] = {}
+        self._last_affect: dict[str, Any] | None = None
+        self._last_extraction: dict[str, Any] | None = None
+        self._last_perception: dict[str, dict[str, Any]] = {}
+        self._last_binding: dict[str, Any] | None = None
+        self._last_auditory: dict[str, Any] | None = None
+        # substrate (already-published) topics
+        self._last_frame: dict[str, Any] | None = None
+        self._last_intrinsic_cue: dict[str, Any] | None = None
+        self._last_dmn_tick: dict[str, Any] | None = None
+        self._dmn_ticks_seen: int = 0
+        self._consolidations_seen: int = 0
+        self._last_chat_complete: dict[str, Any] | None = None
 
     # ------------------------------------------------------------------ layout
     def compose(self) -> ComposeResult:
@@ -309,6 +369,10 @@ class BenchApp(App):
                 yield StatePanel("Vanilla vs Broca shell", id="panel-compare")
                 yield StatePanel("Architecture eval", id="panel-arch")
                 yield StatePanel("LM-eval parity", id="panel-lmeval")
+                yield StatePanel("Substrate (DMN / frames)", id="panel-substrate")
+                yield StatePanel("Cognition (intent / strength / relation)", id="panel-cognition")
+                yield StatePanel("Top-down control", id="panel-topdown")
+                yield StatePanel("Organs", id="panel-organs")
                 yield StatePanel("Suite summary", id="panel-summary")
         yield Static("", id="status")
         yield Footer()
@@ -345,8 +409,8 @@ class BenchApp(App):
 
     @work(thread=True, exclusive=True)
     def _kick_off(self) -> None:
-        # Run the unified ``core.benchmarks`` entrypoint in-process (same bus).
-        from core.benchmarks.__main__ import main as bench_main
+        # Run the unified ``research_lab.benchmarks`` entrypoint in-process (same bus).
+        from research_lab.benchmarks.__main__ import main as bench_main
 
         self.app.call_from_thread(self._on_suite_starting)
         out_stream = _LinePublisher(self.bus, "bench.stdout")
@@ -487,6 +551,246 @@ class BenchApp(App):
             line = str(payload.get("line", ""))
             if line.strip():
                 activity.write(f"[{WARNING}]{ts_s}[/{WARNING}]  {line}")
+        # ------------------ substrate-emitted topics ----------------------
+        elif topic == "frame.comprehend":
+            self._last_frame = dict(payload)
+            activity.write(
+                f"[cyan]{ts_s}[/cyan] frame [b]{payload.get('intent') or '—'}[/b]"
+                f"  conf={_fmt_float(payload.get('confidence'))}"
+                f"  subject={payload.get('subject') or '—'}"
+            )
+        elif topic == "intrinsic_cue":
+            self._last_intrinsic_cue = dict(payload)
+            activity.write(
+                f"[yellow]{ts_s}[/yellow] cue [b]{payload.get('faculty')}[/b]"
+                f"  urgency={_fmt_float(payload.get('urgency'))}"
+            )
+        elif topic == "dmn.tick":
+            self._last_dmn_tick = dict(payload)
+            self._dmn_ticks_seen += 1
+            duration_ms = float(payload.get("duration_ms") or 0.0)
+            activity.write(
+                f"[magenta]{ts_s}[/magenta] dmn tick {payload.get('iteration')}"
+                f"  {duration_ms:.0f}ms  reflections={payload.get('reflections', 0)}"
+            )
+        elif topic == "consolidation":
+            self._consolidations_seen += 1
+            activity.write(
+                f"[green]{ts_s}[/green] consolidation reflections={payload.get('reflections', 0)}"
+            )
+        elif topic == "chat.start":
+            activity.write(
+                f"[{BRAND_SOFT}]{ts_s}[/{BRAND_SOFT}] chat start  intent={payload.get('intent') or '—'}"
+            )
+        elif topic == "chat.complete":
+            self._last_chat_complete = dict(payload)
+            activity.write(
+                f"[{ONLINE}]{ts_s}[/{ONLINE}] chat done   intent={payload.get('intent') or '—'}"
+                f"  conf={_fmt_float(payload.get('confidence'))}"
+            )
+        # ------------------ cognition: gating / strength / extraction ------
+        elif topic == "cog.intent":
+            self._last_intent = dict(payload)
+            label = str(payload.get("label") or "—")
+            self._intent_label_counts[label] = self._intent_label_counts.get(label, 0) + 1
+            actionable = "✓" if payload.get("is_actionable") else "·"
+            activity.write(
+                f"[cyan]{ts_s}[/cyan] intent [b]{label}[/b]"
+                f"  conf={_fmt_float(payload.get('confidence'))}  actionable={actionable}"
+            )
+        elif topic == "cog.derived_strength":
+            self._last_derived_strength = dict(payload)
+            activity.write(
+                f"[cyan]{ts_s}[/cyan] strength={_fmt_float(payload.get('strength'))}"
+                f"  intent={_fmt_float(payload.get('intent_actionability'))}"
+                f"  mem={_fmt_float(payload.get('memory_confidence'))}"
+                f"  sharp={_fmt_float(payload.get('conformal_sharpness'))}"
+                f"  affect={_fmt_float(payload.get('affect_certainty'))}"
+                f"  weakest={payload.get('gated_by') or '—'}"
+            )
+        elif topic == "cog.relation_extract":
+            self._last_relation_extract = dict(payload)
+            outcome = str(payload.get("outcome") or "")
+            self._relation_outcome_counts[outcome] = self._relation_outcome_counts.get(outcome, 0) + 1
+            color = {"extracted": ONLINE, "gated_out": WARNING, "no_relations": "dim"}.get(outcome, "white")
+            if outcome == "extracted":
+                activity.write(
+                    f"[{color}]{ts_s}[/{color}] relation [{payload.get('subject')!s} -{payload.get('predicate')!s}-> {payload.get('object')!s}]"
+                    f"  conf={_fmt_float(payload.get('claim_confidence'))}"
+                )
+            else:
+                activity.write(
+                    f"[{color}]{ts_s}[/{color}] relation {outcome}  intent={payload.get('intent_label') or '—'}"
+                )
+        elif topic == "cog.predictive_coding":
+            self._last_predictive_coding = dict(payload)
+            activity.write(
+                f"[cyan]{ts_s}[/cyan] pred-coding gap={_fmt_float(payload.get('gap'))}"
+                f"  ce_g={_fmt_float(payload.get('ce_graft'))}  ce_p={_fmt_float(payload.get('ce_plain'))}"
+                f"  n={payload.get('n_targets')}  path={payload.get('path')}"
+            )
+        # ------------------ cognition: top-down control --------------------
+        elif topic == "cog.hypothesis.start":
+            self._hypothesis_state.update(
+                running=True,
+                iteration=0,
+                max_iterations=int(payload.get("max_iterations") or 0),
+                last_text="",
+                last_reason="",
+            )
+            activity.write(
+                f"[{BRAND}]{ts_s}[/{BRAND}] hypothesis search start"
+                f"  max_iter={payload.get('max_iterations')}  prompt_len={payload.get('prompt_len')}"
+            )
+        elif topic == "cog.hypothesis.attempt":
+            self._hypothesis_state["iteration"] = int(payload.get("iteration") or 0)
+            self._hypothesis_state["last_text"] = str(payload.get("text") or "")
+            self._hypothesis_state["last_reason"] = str(payload.get("reason") or "")
+            mark = "✓" if payload.get("valid") else "·"
+            activity.write(
+                f"[{BRAND}]{ts_s}[/{BRAND}] hyp attempt {payload.get('iteration')}"
+                f"  {mark} text={payload.get('text')!r}  bans={len(payload.get('ban_tokens') or [])}"
+            )
+        elif topic == "cog.hypothesis.ban":
+            self._hypothesis_state["n_bans"] = int(payload.get("total_banned") or 0)
+            activity.write(
+                f"[{WARNING}]{ts_s}[/{WARNING}] hyp ban tokens={payload.get('tokens')}"
+                f"  total={payload.get('total_banned')}  reason={payload.get('reason')!r}"
+            )
+        elif topic == "cog.hypothesis.complete":
+            accepted = bool(payload.get("accepted"))
+            self._hypothesis_state.update(
+                running=False,
+                iteration=int(payload.get("iterations") or 0),
+            )
+            self._hypothesis_state["n_completed"] += 1
+            if accepted:
+                self._hypothesis_state["n_accepted"] += 1
+            color = ONLINE if accepted else "red"
+            tag = "accepted" if accepted else "exhausted"
+            activity.write(
+                f"[{color}]{ts_s}[/{color}] hyp {tag}  iters={payload.get('iterations')}"
+                f"  text={payload.get('final_text')!r}"
+            )
+        elif topic == "cog.epistemic.start":
+            self._epistemic_state.update(
+                running=True,
+                step=0,
+                max_new_tokens=int(payload.get("max_new_tokens") or 0),
+                n_interventions=0,
+                last_reason="",
+            )
+            activity.write(
+                f"[{BRAND}]{ts_s}[/{BRAND}] epistemic monitor start"
+                f"  max_new={payload.get('max_new_tokens')}  check_every={payload.get('check_every')}"
+            )
+        elif topic == "cog.epistemic.intervention":
+            self._epistemic_state["step"] = int(payload.get("step") or 0)
+            self._epistemic_state["n_interventions"] = int(payload.get("intervention_index") or 0)
+            self._epistemic_state["last_reason"] = str(payload.get("reason") or "")
+            activity.write(
+                f"[{WARNING}]{ts_s}[/{WARNING}] epistemic halt step={payload.get('step')}"
+                f"  trunc={payload.get('truncated')}  bans={len(payload.get('banned_tokens') or [])}"
+                f"  reason={payload.get('reason')!r}"
+            )
+        elif topic == "cog.epistemic.complete":
+            self._epistemic_state.update(
+                running=False,
+                step=int(payload.get("final_step") or 0),
+                n_interventions=int(payload.get("n_interventions") or 0),
+            )
+            self._epistemic_state["n_completed"] = self._epistemic_state.get("n_completed", 0) + 1
+            activity.write(
+                f"[{ONLINE}]{ts_s}[/{ONLINE}] epistemic done  steps={payload.get('final_step')}"
+                f"  interventions={payload.get('n_interventions')}"
+            )
+        elif topic == "cog.modality_shift.register":
+            self._modality_state["n_registered"] = int(payload.get("n_modes") or 0)
+            modes = list(self._modality_state.get("modes") or [])
+            name = payload.get("name")
+            if name and name not in modes:
+                modes.append(name)
+            self._modality_state["modes"] = modes
+            activity.write(
+                f"[cyan]{ts_s}[/cyan] modality register name={name}  total={payload.get('n_modes')}"
+            )
+        elif topic == "cog.modality_shift.set_active":
+            self._modality_state["active"] = payload.get("name")
+            activity.write(
+                f"[cyan]{ts_s}[/cyan] modality active={payload.get('name')}"
+            )
+        elif topic == "cog.causal.constraint":
+            self._causal_state["n_constraints"] = int(payload.get("n_constraints") or 0)
+            self._causal_state["last"] = dict(payload)
+            activity.write(
+                f"[cyan]{ts_s}[/cyan] causal constraint  do({payload.get('treatment')}={payload.get('treatment_value')!r})"
+                f" → {payload.get('outcome')}  total={payload.get('n_constraints')}"
+            )
+        # ------------------ organs ----------------------------------------
+        elif topic == "organ.load":
+            self._loaded_organs[str(payload.get("name"))] = {
+                "model_id": payload.get("model_id"),
+                "device": payload.get("device"),
+                "load_ms": float(payload.get("load_ms") or 0.0),
+            }
+            activity.write(
+                f"[cyan]{ts_s}[/cyan] organ load  {payload.get('name')}  "
+                f"({payload.get('model_id')})  {float(payload.get('load_ms') or 0.0):.0f}ms"
+            )
+        elif topic == "organ.unload":
+            self._loaded_organs.pop(str(payload.get("name")), None)
+            activity.write(f"[dim]{ts_s}[/dim] organ unload {payload.get('name')}")
+        elif topic == "organ.call":
+            name = str(payload.get("name") or "—")
+            stats = self._organ_stats.setdefault(name, {"calls": 0, "avg_ms": 0.0, "last_ms": 0.0, "method": ""})
+            stats["calls"] = int(payload.get("total_calls") or stats["calls"] + 1)
+            stats["avg_ms"] = float(payload.get("avg_latency_ms") or stats["avg_ms"])
+            stats["last_ms"] = float(payload.get("latency_ms") or 0.0)
+            stats["method"] = str(payload.get("method") or "process")
+        elif topic == "organ.affect":
+            self._last_affect = dict(payload)
+            activity.write(
+                f"[cyan]{ts_s}[/cyan] affect [b]{payload.get('dominant_emotion')}[/b]"
+                f"  score={_fmt_float(payload.get('dominant_score'))}"
+                f"  val={_fmt_float(payload.get('valence'))}"
+                f"  ar={_fmt_float(payload.get('arousal'))}"
+                f"  pref={payload.get('preference_signal') or '—'}"
+            )
+        elif topic.startswith("organ.extraction."):
+            self._last_extraction = {"topic": topic, **dict(payload)}
+            kind = topic.split(".")[-1]
+            n_key = {"entities": "n_entities", "relations": "n_relations", "classify": "selected"}.get(kind)
+            count = payload.get(n_key) if n_key else None
+            if isinstance(count, list):
+                count_str = str(len(count))
+            else:
+                count_str = str(count) if count is not None else "—"
+            activity.write(
+                f"[cyan]{ts_s}[/cyan] extraction.{kind}  n={count_str}"
+                f"  ms={_fmt_float(payload.get('latency_ms'), prec=0)}"
+            )
+        elif topic.startswith("organ.perception."):
+            stream = topic.split(".")[-1]
+            self._last_perception[stream] = dict(payload)
+            activity.write(
+                f"[cyan]{ts_s}[/cyan] perception.{stream}  ms={_fmt_float(payload.get('latency_ms'), prec=0)}"
+            )
+        elif topic == "organ.binding.encode":
+            self._last_binding = dict(payload)
+            activity.write(
+                f"[cyan]{ts_s}[/cyan] binding {payload.get('modality')}"
+                f"  ms={_fmt_float(payload.get('latency_ms'), prec=0)}"
+            )
+        elif topic.startswith("organ.auditory."):
+            kind = topic.split(".")[-1]
+            self._last_auditory = {"topic": topic, **dict(payload)}
+            extra = (
+                f" text={payload.get('transcription')!r}" if kind == "transcribe" else f" frames={payload.get('n_frames')}"
+            )
+            activity.write(
+                f"[cyan]{ts_s}[/cyan] auditory.{kind}{extra}"
+                f"  ms={_fmt_float(payload.get('latency_ms'), prec=0)}"
+            )
         # else: ignore unknown topics
 
     # ------------------------------------------------------------------ helpers
@@ -608,7 +912,19 @@ class BenchApp(App):
             "[dim]bench runs in this process; events stream from the shared bus[/dim]",
         ]
         self.query_one("#panel-suite", StatePanel).set_lines(suite_lines)
-        for pid in ("panel-phase", "panel-tally", "panel-native", "panel-compare", "panel-arch", "panel-lmeval", "panel-summary"):
+        for pid in (
+            "panel-phase",
+            "panel-tally",
+            "panel-native",
+            "panel-compare",
+            "panel-arch",
+            "panel-lmeval",
+            "panel-substrate",
+            "panel-cognition",
+            "panel-topdown",
+            "panel-organs",
+            "panel-summary",
+        ):
             self.query_one(f"#{pid}", StatePanel).set_lines([])
 
     def _refresh_phase_panel(self) -> None:
@@ -711,6 +1027,191 @@ class BenchApp(App):
         else:
             lm_lines.append("[dim]not run[/dim]")
         self.query_one("#panel-lmeval", StatePanel).set_lines(lm_lines)
+        # Substrate (DMN, frames, cues, consolidation, chat)
+        sub_lines: list[str] = []
+        if self._last_frame:
+            sub_lines.append(
+                f"frame:    [b]{self._last_frame.get('intent') or '—'}[/b]"
+                f"  conf={_fmt_float(self._last_frame.get('confidence'))}"
+            )
+            subj = self._last_frame.get("subject")
+            if subj:
+                sub_lines.append(f"  subject={subj}")
+            ans = self._last_frame.get("answer")
+            if ans:
+                sub_lines.append(f"  answer={str(ans)[:48]}")
+        if self._last_dmn_tick:
+            sub_lines.append(
+                f"dmn:      iter={self._last_dmn_tick.get('iteration')}"
+                f"  reflections={self._last_dmn_tick.get('reflections', 0)}"
+                f"  total_ticks={self._dmn_ticks_seen}"
+            )
+        if self._last_intrinsic_cue:
+            sub_lines.append(
+                f"cue:      [b]{self._last_intrinsic_cue.get('faculty') or '—'}[/b]"
+                f"  urgency={_fmt_float(self._last_intrinsic_cue.get('urgency'))}"
+            )
+        if self._consolidations_seen:
+            sub_lines.append(f"consolidations: {self._consolidations_seen}")
+        if self._last_chat_complete:
+            sub_lines.append(
+                f"chat:     intent={self._last_chat_complete.get('intent') or '—'}"
+                f"  conf={_fmt_float(self._last_chat_complete.get('confidence'))}"
+            )
+        if not sub_lines:
+            sub_lines.append("[dim]no substrate events yet[/dim]")
+        self.query_one("#panel-substrate", StatePanel).set_lines(sub_lines)
+
+        # Cognition (intent gate, derived strength, relation extractor, predictive coding)
+        cog_lines: list[str] = []
+        if self._last_intent:
+            actionable = "[green]act[/green]" if self._last_intent.get("is_actionable") else "[dim]non-act[/dim]"
+            storable = "[green]store[/green]" if self._last_intent.get("allows_storage") else "[dim]no-store[/dim]"
+            cog_lines.append(
+                f"intent:   [b]{self._last_intent.get('label') or '—'}[/b]"
+                f"  conf={_fmt_float(self._last_intent.get('confidence'))}  {actionable}/{storable}"
+            )
+            if self._intent_label_counts:
+                top = sorted(self._intent_label_counts.items(), key=lambda kv: -kv[1])[:4]
+                cog_lines.append(
+                    "  hist: " + " ".join(f"{l}={n}" for l, n in top)
+                )
+        if self._last_derived_strength:
+            ds = self._last_derived_strength
+            cog_lines.append(
+                f"strength: {_fmt_float(ds.get('strength'))}"
+                f"  weakest={ds.get('gated_by') or '—'}"
+            )
+            cog_lines.append(
+                f"  intent={_fmt_float(ds.get('intent_actionability'))}"
+                f"  mem={_fmt_float(ds.get('memory_confidence'))}"
+                f"  sharp={_fmt_float(ds.get('conformal_sharpness'))}"
+                f"  affect={_fmt_float(ds.get('affect_certainty'))}"
+            )
+        if self._last_relation_extract:
+            re = self._last_relation_extract
+            outcome = re.get("outcome") or "—"
+            color = {"extracted": ONLINE, "gated_out": WARNING, "no_relations": "dim"}.get(outcome, "white")
+            cog_lines.append(f"relation: [{color}]{outcome}[/{color}]")
+            if outcome == "extracted":
+                cog_lines.append(
+                    f"  ({re.get('subject')}, {re.get('predicate')}, {re.get('object')})"
+                    f"  conf={_fmt_float(re.get('claim_confidence'))}"
+                )
+            if self._relation_outcome_counts:
+                cog_lines.append(
+                    "  hist: " + " ".join(
+                        f"{k}={v}" for k, v in sorted(self._relation_outcome_counts.items())
+                    )
+                )
+        if self._last_predictive_coding:
+            pc = self._last_predictive_coding
+            cog_lines.append(
+                f"pred-coding: gap={_fmt_float(pc.get('gap'))}"
+                f"  ce_g={_fmt_float(pc.get('ce_graft'))}  ce_p={_fmt_float(pc.get('ce_plain'))}"
+            )
+            cog_lines.append(
+                f"  n_targets={pc.get('n_targets')}  path={pc.get('path')}"
+            )
+        if not cog_lines:
+            cog_lines.append("[dim]no cognition events yet[/dim]")
+        self.query_one("#panel-cognition", StatePanel).set_lines(cog_lines)
+
+        # Top-down control (hypothesis search, epistemic monitor, modality, causal)
+        td_lines: list[str] = []
+        hs = self._hypothesis_state
+        if hs["running"] or hs["n_completed"]:
+            state_str = "[yellow]running[/yellow]" if hs["running"] else "idle"
+            td_lines.append(
+                f"hypothesis: {state_str}  iter={hs['iteration']}/{hs['max_iterations']}"
+            )
+            td_lines.append(
+                f"  bans={hs['n_bans']}  done={hs['n_completed']}  accepted={hs['n_accepted']}"
+            )
+            if hs.get("last_text"):
+                td_lines.append(f"  last={str(hs['last_text'])[:40]!r}")
+        es = self._epistemic_state
+        if es["running"] or es.get("n_completed"):
+            state_str = "[yellow]running[/yellow]" if es["running"] else "idle"
+            td_lines.append(
+                f"epistemic:  {state_str}  step={es['step']}/{es['max_new_tokens']}"
+            )
+            td_lines.append(
+                f"  interventions={es['n_interventions']}  runs={es.get('n_completed', 0)}"
+            )
+            if es.get("last_reason"):
+                td_lines.append(f"  reason={str(es['last_reason'])[:40]!r}")
+        if self._modality_state["n_registered"]:
+            ms = self._modality_state
+            active = ms.get("active") or "—"
+            td_lines.append(
+                f"modality:   active=[b]{active}[/b]  n_registered={ms['n_registered']}"
+            )
+            if ms.get("modes"):
+                td_lines.append(f"  modes: {', '.join(ms['modes'][:6])}")
+        if self._causal_state["n_constraints"]:
+            cs = self._causal_state
+            td_lines.append(f"causal:     constraints={cs['n_constraints']}")
+            last = cs.get("last") or {}
+            if last:
+                td_lines.append(
+                    f"  last: do({last.get('treatment')}={last.get('treatment_value')!r})"
+                    f" → {last.get('outcome')}"
+                )
+        if not td_lines:
+            td_lines.append("[dim]no top-down control events yet[/dim]")
+        self.query_one("#panel-topdown", StatePanel).set_lines(td_lines)
+
+        # Organs panel — per-organ call counters and last-emotion / last-perception
+        org_lines: list[str] = []
+        if self._loaded_organs:
+            org_lines.append(f"loaded: {len(self._loaded_organs)}")
+            for name, info in sorted(self._loaded_organs.items()):
+                org_lines.append(
+                    f"  [b]{name}[/b]  {str(info.get('model_id') or '')[:24]}"
+                    f"  load={float(info.get('load_ms') or 0.0):.0f}ms"
+                )
+        if self._organ_stats:
+            org_lines.append("activity:")
+            for name, st in sorted(self._organ_stats.items(), key=lambda kv: -int(kv[1].get("calls", 0))):
+                org_lines.append(
+                    f"  {name:<18} n={st['calls']:4d}"
+                    f"  avg={st['avg_ms']:5.0f}ms  last={st['last_ms']:5.0f}ms"
+                    f"  [{st['method']}]"
+                )
+        if self._last_affect:
+            af = self._last_affect
+            org_lines.append(
+                f"affect: [b]{af.get('dominant_emotion')}[/b]"
+                f"  val={_fmt_float(af.get('valence'))}  ar={_fmt_float(af.get('arousal'))}"
+            )
+            pref = af.get("preference_signal")
+            if pref:
+                org_lines.append(
+                    f"  pref={pref}  strength={_fmt_float(af.get('preference_strength'))}"
+                )
+        if self._last_extraction:
+            org_lines.append(
+                f"extraction: {self._last_extraction.get('topic', '').split('.')[-1]}"
+            )
+        if self._last_perception:
+            for stream, info in sorted(self._last_perception.items()):
+                org_lines.append(
+                    f"perception.{stream}: ms={_fmt_float(info.get('latency_ms'), prec=0)}"
+                )
+        if self._last_binding:
+            org_lines.append(
+                f"binding: {self._last_binding.get('modality')}"
+                f"  ms={_fmt_float(self._last_binding.get('latency_ms'), prec=0)}"
+            )
+        if self._last_auditory:
+            org_lines.append(
+                f"auditory: {str(self._last_auditory.get('topic', '')).split('.')[-1]}"
+            )
+        if not org_lines:
+            org_lines.append("[dim]no organ activity yet[/dim]")
+        self.query_one("#panel-organs", StatePanel).set_lines(org_lines)
+
         # Suite summary
         sum_lines: list[str] = []
         if self._suite_started_at:
@@ -794,7 +1295,7 @@ class BenchApp(App):
 
 def _build_parser() -> argparse.ArgumentParser:
     return argparse.ArgumentParser(
-    description="Textual dashboard for `python -m core bench` / `python -m core.benchmarks` (see -h below).",
+    description="Textual dashboard for `python -m core bench` / `python -m research_lab.benchmarks` (see -h below).",
     )
 
 
@@ -810,7 +1311,7 @@ def run_bench_tui(argv: list[str] | None = None) -> None:
         parser = _build_parser()
         parser.print_help()
         print()
-        from core.benchmarks.__main__ import print_benchmark_cli_help
+        from research_lab.benchmarks.__main__ import print_benchmark_cli_help
 
         print_benchmark_cli_help()
 
@@ -835,7 +1336,7 @@ def run_bench_tui(argv: list[str] | None = None) -> None:
 
 
 def main() -> None:
-    """Entry point for ``python -m core.tui.bench``."""
+    """Entry point for ``python -m research_lab.tui.bench``."""
 
     run_bench_tui()
 

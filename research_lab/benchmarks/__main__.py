@@ -6,7 +6,7 @@ baseline-vs-enhanced probes. Model id follows ``MODEL_ID`` / ``BENCHMARK_MODEL``
 Substrate probes persist to ``runs/broca_substrate.sqlite`` (pytest uses
 ``MOSAIC_TEST_DB``).
 
-  HF_TOKEN=... python -m core.benchmarks
+  HF_TOKEN=... python -m research_lab.benchmarks
 """
 
 from __future__ import annotations
@@ -35,14 +35,14 @@ from core.substrate.runtime import (
     ensure_parent_dir,
 )
 
-from core.benchmarks.architecture_eval import run_broca_architecture_eval
-from core.benchmarks.hf_datasets_eval import (
+from research_lab.benchmarks.architecture_eval import run_broca_architecture_eval
+from research_lab.benchmarks.hf_datasets_eval import (
     DEFAULT_LLAMA_MODEL,
     DEFAULT_NATIVE_PRESETS,
     run_hf_datasets_benchmark,
     resolve_task_names,
 )
-from core.benchmarks.lm_eval_pair import run_paired_lm_eval
+from research_lab.benchmarks.lm_eval_pair import run_paired_lm_eval
 from core.system.device import normalize_device_arg, pick_torch_device
 from core.system.event_bus import get_default_bus
 
