@@ -1,46 +1,17 @@
-"""UDP multicast swarm communication for Mosaic substrate instances.
+"""UDP multicast swarm — every node sees everything, no filters.
 
-Enables multiple Mosaic nodes on a LAN to discover each other and exchange
-events without any central orchestrator. Each node announces its presence
-via periodic heartbeats and selectively bridges local EventBus events to
-the network.
+Every Mosaic instance on the LAN is part of the swarm. The swarm is not
+optional. All EventBus events flow to the network. All network events
+flow to the local EventBus. There is no selective bridging, no filtering,
+no "forward patterns." Nodes communicate freely and the substrate decides
+what to do with what it hears.
 
-Design principles:
-- No orchestration: nodes are peers, not leader/follower
-- Gossip-style: eventual consistency, not strong consistency
-- Fire-and-forget: UDP is unreliable by design; messages are idempotent
-- LAN-only: TTL=1 means packets never leave the local subnet
-- Zero infrastructure: no broker, no registry, no DNS
-
-Architecture:
-    Local EventBus ←→ [Selective Bridge] ←→ MulticastBus ←→ LAN (239.255.77.1:50077)
-                                                             ↕
-                                                    Other Mosaic Nodes
-
-Usage:
-    from core.swarm import SwarmNode
-
-    node = SwarmNode(
-        node_id="mosaic-alpha",
-        capabilities=["llm", "visual_cortex", "auditory_cortex"],
-        on_receive=lambda msg: event_bus.publish(msg["topic"], msg["payload"]),
-    )
-    node.start()
-
-    # Publish to all peers
-    node.broadcast("organ.memory.state_update", {"key": "ada.location", "value": "rome"})
-
-    # Check who's online
-    peers = node.peers()
-    # [PeerInfo(node_id="mosaic-beta", capabilities=["llm", "affect"], ...)]
-
-    node.stop()
+The only deduplication is: don't process your own messages, and don't
+process the same sequence number twice from the same sender.
 """
 
 from __future__ import annotations
 
-import hashlib
-import hmac
 import logging
 import socket
 import struct
@@ -49,468 +20,242 @@ import time
 import uuid
 from collections import defaultdict
 from dataclasses import dataclass, field
-from typing import Any, Callable, Sequence
+from typing import Any
+
+import msgpack
 
 logger = logging.getLogger(__name__)
 
-try:
-    import msgpack
-    HAS_MSGPACK = True
-except ImportError:
-    HAS_MSGPACK = False
-
-# --- Protocol constants ---
-
-MCAST_GROUP = "239.255.77.1"   # Administratively scoped, site-local
-MCAST_PORT = 50077             # Mosaic-specific port
-MCAST_TTL = 1                  # LAN-only: never crosses a router
+MCAST_GROUP = "239.255.77.1"
+MCAST_PORT = 50077
+MCAST_TTL = 1
 PROTOCOL_VERSION = 1
+HEARTBEAT_INTERVAL_S = 2.0
+PEER_TIMEOUT_S = 8.0
 
-HEARTBEAT_INTERVAL_S = 2.0     # Announce every 2 seconds
-PEER_TIMEOUT_S = 8.0           # 4× heartbeat = dead
-MAX_PACKET_SIZE = 65507        # UDP maximum payload
-
-# Message types
-MSG_ANNOUNCE = "announce"
-MSG_EVENT = "event"
-MSG_BYE = "bye"
-MSG_STATE = "state"            # Full state snapshot (periodic)
-
-
-# --- Peer tracking ---
 
 @dataclass
 class PeerInfo:
-    """Information about a discovered peer node."""
     node_id: str
-    address: tuple[str, int]       # (ip, port) from recvfrom
+    address: tuple[str, int]
     capabilities: list[str] = field(default_factory=list)
     last_seen: float = field(default_factory=time.monotonic)
     last_seq: int = 0
-    join_time: float = field(default_factory=time.time)
 
     @property
     def age_seconds(self) -> float:
         return time.monotonic() - self.last_seen
 
-    @property
-    def is_stale(self) -> bool:
-        return self.age_seconds > PEER_TIMEOUT_S
 
+class Swarm:
+    """UDP multicast swarm node wired directly into the EventBus.
 
-class PeerTable:
-    """Thread-safe table of discovered peers with automatic expiry."""
+    On construction, the swarm joins the multicast group and starts
+    listening. Every event published to the local EventBus is broadcast
+    to the LAN. Every event received from the LAN is published to the
+    local EventBus. Peers are discovered automatically via heartbeat.
 
-    def __init__(self):
-        self._peers: dict[str, PeerInfo] = {}
-        self._lock = threading.Lock()
-
-    def update(self, node_id: str, address: tuple, capabilities: list[str], seq: int) -> bool:
-        """Update peer info. Returns True if this is a newly discovered peer."""
-        with self._lock:
-            is_new = node_id not in self._peers
-            if is_new:
-                self._peers[node_id] = PeerInfo(
-                    node_id=node_id,
-                    address=address,
-                    capabilities=capabilities,
-                    last_seq=seq,
-                )
-            else:
-                peer = self._peers[node_id]
-                peer.last_seen = time.monotonic()
-                peer.last_seq = seq
-                peer.capabilities = capabilities
-                peer.address = address
-            return is_new
-
-    def remove(self, node_id: str) -> PeerInfo | None:
-        """Explicitly remove a peer (e.g., on BYE message)."""
-        with self._lock:
-            return self._peers.pop(node_id, None)
-
-    def expire(self) -> list[PeerInfo]:
-        """Remove stale peers. Returns list of removed peers."""
-        now = time.monotonic()
-        with self._lock:
-            dead = [p for p in self._peers.values() if now - p.last_seen > PEER_TIMEOUT_S]
-            for p in dead:
-                del self._peers[p.node_id]
-            return dead
-
-    def live(self) -> list[PeerInfo]:
-        """Return all currently live peers."""
-        with self._lock:
-            return [p for p in self._peers.values() if not p.is_stale]
-
-    def __len__(self) -> int:
-        with self._lock:
-            return len(self._peers)
-
-    def __contains__(self, node_id: str) -> bool:
-        with self._lock:
-            return node_id in self._peers
-
-
-class SequenceTracker:
-    """Per-sender deduplication via monotonic sequence numbers."""
-
-    def __init__(self):
-        self._seen: dict[str, int] = defaultdict(lambda: -1)
-
-    def is_duplicate(self, sender_id: str, seq: int) -> bool:
-        """Returns True if we've already processed this or a later seq from sender."""
-        last = self._seen[sender_id]
-        if seq <= last:
-            return True
-        self._seen[sender_id] = seq
-        return False
-
-
-# --- Multicast socket helpers ---
-
-def _make_sender_socket() -> socket.socket:
-    """Create a UDP socket for sending to the multicast group."""
-    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
-    sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, MCAST_TTL)
-    # Enable loopback so we can test multiple nodes on one machine
-    sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_LOOP, 1)
-    return sock
-
-
-def _make_receiver_socket() -> socket.socket:
-    """Create a UDP socket for receiving from the multicast group."""
-    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
-    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    try:
-        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
-    except (AttributeError, OSError):
-        pass  # Windows / some Linux kernels
-    sock.bind(("", MCAST_PORT))
-    # Join the multicast group
-    group = socket.inet_aton(MCAST_GROUP)
-    mreq = struct.pack("4sL", group, socket.INADDR_ANY)
-    sock.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, mreq)
-    sock.settimeout(1.0)  # 1s timeout for clean shutdown polling
-    return sock
-
-
-# --- Serialization ---
-
-def _pack(msg: dict) -> bytes:
-    """Serialize message to bytes via msgpack."""
-    if not HAS_MSGPACK:
-        import json
-        return json.dumps(msg, separators=(",", ":"), default=str).encode("utf-8")
-    return msgpack.packb(msg, use_bin_type=True)
-
-
-def _unpack(data: bytes) -> dict | None:
-    """Deserialize bytes to message dict. Returns None on failure."""
-    try:
-        if HAS_MSGPACK:
-            return msgpack.unpackb(data, raw=False)
-        else:
-            import json
-            return json.loads(data.decode("utf-8"))
-    except Exception:
-        return None
-
-
-# --- The SwarmNode ---
-
-class SwarmNode:
-    """A single Mosaic node participating in the LAN swarm.
-
-    Manages:
-    - Periodic heartbeat announcements
-    - Peer discovery and timeout
-    - Event broadcasting to all peers
-    - Event reception and deduplication
-    - Optional HMAC signing for untrusted LANs
-
-    The node runs two daemon threads (receiver + heartbeat) and exposes
-    a simple publish/subscribe interface that bridges to the local EventBus.
+    There are no configuration options. There is one swarm per process.
     """
 
-    def __init__(
-        self,
-        *,
-        node_id: str | None = None,
-        capabilities: Sequence[str] | None = None,
-        on_receive: Callable[[dict], None] | None = None,
-        on_peer_joined: Callable[[PeerInfo], None] | None = None,
-        on_peer_left: Callable[[PeerInfo], None] | None = None,
-        shared_secret: bytes | None = None,
-        multicast_group: str = MCAST_GROUP,
-        multicast_port: int = MCAST_PORT,
-    ):
-        if not HAS_MSGPACK:
-            logger.warning("SwarmNode: msgpack not installed, falling back to JSON (slower)")
+    def __init__(self, event_bus: Any, *, capabilities: list[str]):
+        """Wire up and start immediately.
 
-        self.node_id = node_id or f"mosaic-{uuid.uuid4().hex[:8]}"
-        self.capabilities = list(capabilities or [])
-        self._on_receive = on_receive
-        self._on_peer_joined = on_peer_joined
-        self._on_peer_left = on_peer_left
-        self._shared_secret = shared_secret
-        self._mcast_group = multicast_group
-        self._mcast_port = multicast_port
-
-        self._peer_table = PeerTable()
-        self._seq_tracker = SequenceTracker()
+        Args:
+            event_bus: The local EventBus instance. Must have publish(topic, payload)
+                and subscribe(pattern, callback) methods.
+            capabilities: List of organ/subsystem names this node is running.
+        """
+        self._bus = event_bus
+        self.node_id = f"mosaic-{uuid.uuid4().hex[:8]}"
+        self.capabilities = capabilities
+        self._peers: dict[str, PeerInfo] = {}
+        self._peers_lock = threading.Lock()
+        self._seen_seqs: dict[str, int] = defaultdict(lambda: -1)
         self._seq = 0
         self._seq_lock = threading.Lock()
         self._running = threading.Event()
-
-        self._tx_sock: socket.socket | None = None
-        self._rx_sock: socket.socket | None = None
-        self._rx_thread: threading.Thread | None = None
-        self._hb_thread: threading.Thread | None = None
-
         self._total_sent = 0
         self._total_received = 0
-        self._total_dropped = 0
 
-    @property
-    def peers(self) -> list[PeerInfo]:
-        """Currently live peers."""
-        return self._peer_table.live()
+        # Sockets
+        self._tx = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
+        self._tx.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, MCAST_TTL)
+        self._tx.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_LOOP, 1)
 
-    @property
-    def n_peers(self) -> int:
-        return len(self._peer_table)
+        self._rx = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
+        self._rx.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            self._rx.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
+        except (AttributeError, OSError):
+            pass
+        self._rx.bind(("", MCAST_PORT))
+        mreq = struct.pack("4sL", socket.inet_aton(MCAST_GROUP), socket.INADDR_ANY)
+        self._rx.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, mreq)
+        self._rx.settimeout(1.0)
 
-    @property
-    def is_running(self) -> bool:
-        return self._running.is_set()
+        # Subscribe to ALL local events and forward them to the network
+        self._bus.subscribe("*", self._on_local_event)
 
-    @property
-    def stats(self) -> dict[str, Any]:
-        return {
-            "node_id": self.node_id,
-            "running": self.is_running,
-            "n_peers": self.n_peers,
-            "total_sent": self._total_sent,
-            "total_received": self._total_received,
-            "total_dropped": self._total_dropped,
-            "capabilities": self.capabilities,
-            "peers": [{"node_id": p.node_id, "caps": p.capabilities, "age_s": round(p.age_seconds, 1)} for p in self.peers],
-        }
-
-    def start(self) -> None:
-        """Start the swarm node (heartbeat + receiver threads)."""
-        if self._running.is_set():
-            return
-
-        self._tx_sock = _make_sender_socket()
-        self._rx_sock = _make_receiver_socket()
+        # Start threads
         self._running.set()
-
-        self._rx_thread = threading.Thread(
-            target=self._receiver_loop, daemon=True, name=f"swarm-rx-{self.node_id[:8]}"
-        )
-        self._hb_thread = threading.Thread(
-            target=self._heartbeat_loop, daemon=True, name=f"swarm-hb-{self.node_id[:8]}"
-        )
+        self._rx_thread = threading.Thread(target=self._receive_loop, daemon=True, name="swarm-rx")
+        self._hb_thread = threading.Thread(target=self._heartbeat_loop, daemon=True, name="swarm-hb")
         self._rx_thread.start()
         self._hb_thread.start()
 
-        logger.info("SwarmNode started: %s (caps=%s, group=%s:%d)",
-                    self.node_id, self.capabilities, self._mcast_group, self._mcast_port)
+        logger.info("Swarm online: %s caps=%s", self.node_id, self.capabilities)
+
+    @property
+    def peers(self) -> list[PeerInfo]:
+        with self._peers_lock:
+            return [p for p in self._peers.values() if p.age_seconds <= PEER_TIMEOUT_S]
+
+    @property
+    def n_peers(self) -> int:
+        return len(self.peers)
 
     def stop(self) -> None:
-        """Graceful shutdown: send BYE, close sockets, join threads."""
+        """Send BYE and shut down."""
         if not self._running.is_set():
             return
-
         self._running.clear()
-
-        # Best-effort BYE
-        self._send_raw({"v": PROTOCOL_VERSION, "type": MSG_BYE,
-                        "src": self.node_id, "seq": self._next_seq()})
-
-        # Close sockets
-        if self._tx_sock:
-            try:
-                self._tx_sock.close()
-            except OSError:
-                pass
-        if self._rx_sock:
-            try:
-                group = socket.inet_aton(self._mcast_group)
-                mreq = struct.pack("4sL", group, socket.INADDR_ANY)
-                self._rx_sock.setsockopt(socket.IPPROTO_IP, socket.IP_DROP_MEMBERSHIP, mreq)
-                self._rx_sock.close()
-            except OSError:
-                pass
-
-        # Join threads
-        if self._rx_thread:
-            self._rx_thread.join(timeout=3.0)
-        if self._hb_thread:
-            self._hb_thread.join(timeout=3.0)
-
-        logger.info("SwarmNode stopped: %s", self.node_id)
-
-    def broadcast(self, topic: str, payload: dict) -> None:
-        """Broadcast an event to all peers on the LAN.
-
-        Args:
-            topic: Event topic string (e.g., "organ.memory.update")
-            payload: Arbitrary dict payload (must be msgpack-serializable)
-        """
-        if not self._running.is_set():
-            return
-
-        msg = {
-            "v": PROTOCOL_VERSION,
-            "type": MSG_EVENT,
-            "src": self.node_id,
-            "seq": self._next_seq(),
-            "ts": time.time(),
-            "topic": topic,
-            "payload": payload,
-        }
-        self._send_raw(msg)
-        self._total_sent += 1
-
-    def broadcast_state(self, state: dict) -> None:
-        """Broadcast a full state snapshot (periodic, for catch-up)."""
-        msg = {
-            "v": PROTOCOL_VERSION,
-            "type": MSG_STATE,
-            "src": self.node_id,
-            "seq": self._next_seq(),
-            "ts": time.time(),
-            "state": state,
-        }
-        self._send_raw(msg)
-        self._total_sent += 1
-
-    # --- Internal ---
+        self._send({"type": "bye", "src": self.node_id, "seq": self._next_seq(), "v": PROTOCOL_VERSION})
+        try:
+            self._tx.close()
+        except OSError:
+            pass
+        try:
+            mreq = struct.pack("4sL", socket.inet_aton(MCAST_GROUP), socket.INADDR_ANY)
+            self._rx.setsockopt(socket.IPPROTO_IP, socket.IP_DROP_MEMBERSHIP, mreq)
+            self._rx.close()
+        except OSError:
+            pass
+        self._rx_thread.join(timeout=3.0)
+        self._hb_thread.join(timeout=3.0)
+        logger.info("Swarm offline: %s", self.node_id)
 
     def _next_seq(self) -> int:
         with self._seq_lock:
             self._seq += 1
             return self._seq
 
-    def _send_raw(self, msg: dict) -> None:
-        """Serialize and send a message to the multicast group."""
-        data = _pack(msg)
-        if self._shared_secret:
-            mac = hmac.new(self._shared_secret, data, hashlib.sha256).digest()[:16]
-            data = data + mac
-        if len(data) > MAX_PACKET_SIZE:
-            logger.warning("Message too large (%d bytes), dropping", len(data))
+    def _send(self, msg: dict) -> None:
+        data = msgpack.packb(msg, use_bin_type=True)
+        if len(data) > 65507:
             return
         try:
-            if self._tx_sock:
-                self._tx_sock.sendto(data, (self._mcast_group, self._mcast_port))
-        except OSError as exc:
-            logger.debug("Send failed: %s", exc)
+            self._tx.sendto(data, (MCAST_GROUP, MCAST_PORT))
+        except OSError:
+            pass
 
-    def _verify_and_unpack(self, data: bytes) -> dict | None:
-        """Verify HMAC (if secret set) and deserialize."""
-        if self._shared_secret:
-            if len(data) < 16:
-                return None
-            body, mac = data[:-16], data[-16:]
-            expected = hmac.new(self._shared_secret, body, hashlib.sha256).digest()[:16]
-            if not hmac.compare_digest(mac, expected):
-                self._total_dropped += 1
-                return None
-            data = body
-        return _unpack(data)
+    def _on_local_event(self, topic: str, payload: Any) -> None:
+        """Every local EventBus event gets broadcast to the LAN."""
+        # Don't re-broadcast events that came from the network
+        if isinstance(payload, dict) and payload.get("_from_swarm"):
+            return
+        self._send({
+            "v": PROTOCOL_VERSION,
+            "type": "event",
+            "src": self.node_id,
+            "seq": self._next_seq(),
+            "ts": time.time(),
+            "topic": topic,
+            "payload": payload if isinstance(payload, dict) else {"_raw": str(payload)},
+        })
+        self._total_sent += 1
 
-    def _receiver_loop(self) -> None:
-        """Main receive loop — runs in daemon thread."""
+    def _receive_loop(self) -> None:
         while self._running.is_set():
             try:
-                data, addr = self._rx_sock.recvfrom(65535)
+                data, addr = self._rx.recvfrom(65535)
             except socket.timeout:
-                # Expire dead peers on each timeout
-                dead = self._peer_table.expire()
-                for peer in dead:
-                    logger.debug("Peer expired: %s", peer.node_id)
-                    if self._on_peer_left:
-                        self._on_peer_left(peer)
+                self._expire_peers()
                 continue
             except OSError:
                 break
 
-            msg = self._verify_and_unpack(data)
-            if msg is None:
+            try:
+                msg = msgpack.unpackb(data, raw=False)
+            except Exception:
                 continue
 
-            # Protocol version check
             if msg.get("v") != PROTOCOL_VERSION:
                 continue
 
             src = msg.get("src", "")
             seq = msg.get("seq", 0)
 
-            # Skip our own messages
             if src == self.node_id:
                 continue
 
-            # Deduplication
-            if self._seq_tracker.is_duplicate(src, seq):
-                self._total_dropped += 1
+            if self._seen_seqs[src] >= seq:
                 continue
+            self._seen_seqs[src] = seq
 
             self._total_received += 1
             msg_type = msg.get("type")
 
-            if msg_type == MSG_ANNOUNCE:
-                caps = msg.get("caps", [])
-                is_new = self._peer_table.update(src, addr, caps, seq)
-                if is_new:
-                    logger.info("Peer discovered: %s @ %s (caps=%s)", src, addr, caps)
-                    if self._on_peer_joined:
-                        peer = self._peer_table._peers.get(src)
-                        if peer:
-                            self._on_peer_joined(peer)
+            if msg_type == "announce":
+                self._handle_announce(src, addr, msg)
+            elif msg_type == "event":
+                self._handle_event(msg)
+            elif msg_type == "bye":
+                self._handle_bye(src)
 
-            elif msg_type == MSG_EVENT:
-                if self._on_receive:
-                    self._on_receive(msg)
+    def _handle_announce(self, src: str, addr: tuple, msg: dict) -> None:
+        caps = msg.get("caps", [])
+        with self._peers_lock:
+            is_new = src not in self._peers
+            if is_new:
+                self._peers[src] = PeerInfo(node_id=src, address=addr, capabilities=caps, last_seq=msg.get("seq", 0))
+                logger.info("Peer joined: %s @ %s caps=%s", src, addr, caps)
+                self._bus.publish("swarm.peer.joined", {"node_id": src, "capabilities": caps, "address": addr, "_from_swarm": True})
+            else:
+                peer = self._peers[src]
+                peer.last_seen = time.monotonic()
+                peer.last_seq = msg.get("seq", 0)
+                peer.capabilities = caps
+                peer.address = addr
 
-            elif msg_type == MSG_STATE:
-                if self._on_receive:
-                    self._on_receive(msg)
+    def _handle_event(self, msg: dict) -> None:
+        topic = msg.get("topic", "")
+        payload = msg.get("payload", {})
+        if isinstance(payload, dict):
+            payload["_from_swarm"] = True
+            payload["_from_node"] = msg.get("src", "")
+        self._bus.publish(topic, payload)
 
-            elif msg_type == MSG_BYE:
-                removed = self._peer_table.remove(src)
-                if removed:
-                    logger.info("Peer departed: %s (graceful)", src)
-                    if self._on_peer_left:
-                        self._on_peer_left(removed)
+    def _handle_bye(self, src: str) -> None:
+        with self._peers_lock:
+            removed = self._peers.pop(src, None)
+        if removed:
+            logger.info("Peer left: %s", src)
+            self._bus.publish("swarm.peer.left", {"node_id": src, "_from_swarm": True})
+
+    def _expire_peers(self) -> None:
+        now = time.monotonic()
+        with self._peers_lock:
+            dead = [nid for nid, p in self._peers.items() if now - p.last_seen > PEER_TIMEOUT_S]
+            for nid in dead:
+                del self._peers[nid]
+                logger.info("Peer expired: %s", nid)
+                self._bus.publish("swarm.peer.left", {"node_id": nid, "_from_swarm": True})
 
     def _heartbeat_loop(self) -> None:
-        """Periodic announce loop — runs in daemon thread."""
         while self._running.is_set():
-            msg = {
+            self._send({
                 "v": PROTOCOL_VERSION,
-                "type": MSG_ANNOUNCE,
+                "type": "announce",
                 "src": self.node_id,
                 "seq": self._next_seq(),
                 "ts": time.time(),
                 "caps": self.capabilities,
-            }
-            self._send_raw(msg)
-            # Interruptible sleep
+            })
             self._running.wait(timeout=HEARTBEAT_INTERVAL_S)
 
     def __enter__(self):
-        self.start()
         return self
 
     def __exit__(self, *_):
         self.stop()
-
-    def __del__(self):
-        try:
-            self.stop()
-        except Exception:
-            pass
