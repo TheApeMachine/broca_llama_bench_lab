@@ -69,6 +69,22 @@ class TestIntentClassification:
         assert intent.is_actionable is False
         assert intent.allows_storage is False
 
+    def test_fast_request_does_not_invoke_extraction_encoder(self):
+        extraction = StubExtractionEncoder({})
+        gate = IntentGate(extraction)
+        intent = gate.classify("Tell me a joke")
+        assert intent.label == "request"
+        assert extraction.calls == []
+
+    def test_declarative_text_still_invokes_extraction_encoder(self):
+        extraction = StubExtractionEncoder(
+            {"ada lives in rome": [("statement", 0.88), ("question", 0.07)]}
+        )
+        gate = IntentGate(extraction)
+        intent = gate.classify("Ada lives in Rome")
+        assert intent.label == "statement"
+        assert extraction.calls == [("Ada lives in Rome", INTENT_LABELS)]
+
     def test_statement_is_storable(self):
         gate = _gate({
             "ada lives in rome": [("statement", 0.88), ("question", 0.07), ("request", 0.05)],

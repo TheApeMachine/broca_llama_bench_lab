@@ -31,6 +31,7 @@ import random
 import sqlite3
 import threading
 import time
+from collections import deque
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Mapping, Optional, Sequence
@@ -194,6 +195,16 @@ class ParsedQuery:
     predicate: str
     confidence: float
     evidence: dict[str, Any]
+
+
+@dataclass(frozen=True)
+class DeferredRelationIngest:
+    job_id: int
+    utterance: str
+    tokens: tuple[str, ...]
+    intent: UtteranceIntent
+    journal_id: int
+    queued_at: float
 
 
 def _word_tokens(toks: Sequence[str]) -> list[str]:
@@ -1632,6 +1643,7 @@ class CognitiveBackgroundWorker:
         self.mind = mind
         self.interval_s = max(0.1, float(interval_s))
         self._stop = threading.Event()
+        self._wake = threading.Event()
         self._thread: threading.Thread | None = None
         self.iterations = 0
         self.last_error: str | None = None
@@ -1651,24 +1663,30 @@ class CognitiveBackgroundWorker:
         if self.running:
             return
         self._stop.clear()
+        self._wake.clear()
         self._thread = threading.Thread(target=self._loop, name="broca-dmn", daemon=True)
         self._thread.start()
         logger.info("CognitiveBackgroundWorker.start: interval=%.3fs config=%s", self.interval_s, asdict(self.config))
 
     def stop(self, timeout: float = 2.0) -> None:
         self._stop.set()
+        self._wake.set()
         if self._thread is not None:
             self._thread.join(timeout=max(0.0, float(timeout)))
         logger.info("CognitiveBackgroundWorker.stop: iterations=%d last_error=%s", self.iterations, self.last_error)
 
+    def notify_work(self) -> None:
+        self._wake.set()
+
     def run_once(self) -> list[dict]:
-        """Run one DMN tick: phases 1 → 2 → 3, then claim consolidation."""
+        """Run one DMN tick: queued ingest, idle phases, then consolidation."""
 
         tick_started = time.time()
         reflections: list[dict] = []
         phase_summary: dict[str, dict[str, Any]] = {}
 
         for name, fn in (
+            ("relation_ingest", self._phase0_relation_ingest),
             ("consolidation", self._phase1_consolidation),
             ("separation", self._phase2_separation),
             ("latent_discovery", self._phase3_latent_discovery),
@@ -1762,6 +1780,7 @@ class CognitiveBackgroundWorker:
                 "last_rem_summary": dict(self.last_rem_summary),
                 "last_error": self.last_error,
                 "idle_seconds": float(max(0.0, time.time() - last_tau)),
+                "deferred_relation_ingest_pending": self.mind.deferred_relation_ingest_count(),
             }
 
     def mark_user_active(self) -> None:
@@ -1769,6 +1788,13 @@ class CognitiveBackgroundWorker:
 
         with self._snapshot_lock:
             self.last_user_activity_at = time.time()
+
+    def _phase0_relation_ingest(self) -> tuple[list[dict], dict[str, Any]]:
+        reflections = self.mind.process_deferred_relation_ingest()
+        return reflections, {
+            "processed": len(reflections),
+            "pending": self.mind.deferred_relation_ingest_count(),
+        }
 
     # ------------------------------------------------------------------ Phase 1
 
@@ -2327,7 +2353,11 @@ class CognitiveBackgroundWorker:
         return rows
 
     def _loop(self) -> None:
-        while not self._stop.wait(self.interval_s):
+        while not self._stop.is_set():
+            self._wake.wait(self.interval_s)
+            self._wake.clear()
+            if self._stop.is_set():
+                return
             try:
                 self.run_once()
             except Exception as exc:  # pragma: no cover - background safety net
@@ -2729,9 +2759,19 @@ class CognitiveRouter:
         utterance_intent: UtteranceIntent,
     ) -> CognitiveFrame:
         candidates: list[FacultyCandidate] = []
-        claim = self.extractor.extract_claim(utterance, toks, utterance_intent=utterance_intent)
-        if claim is not None:
-            claim = mind.refine_extracted_claim(utterance, toks, claim)
+        claim: ParsedClaim | None = None
+        if utterance_intent.allows_storage and mind.deferred_relation_ingest_online():
+            candidates.append(
+                FacultyCandidate(
+                    "semantic_ingest_pending",
+                    1.45,
+                    lambda: self._memory_ingest_pending(utterance, toks),
+                )
+            )
+        else:
+            claim = self.extractor.extract_claim(utterance, toks, utterance_intent=utterance_intent)
+            if claim is not None:
+                claim = mind.refine_extracted_claim(utterance, toks, claim)
         query = _query_from_tokens(
             toks,
             utterance=utterance,
@@ -2773,6 +2813,21 @@ class CognitiveRouter:
             (utterance[:160] + "…") if len(utterance) > 160 else utterance,
         )
         return frame
+
+    def _memory_ingest_pending(self, utterance: str, toks: Sequence[str]) -> CognitiveFrame:
+        return CognitiveFrame(
+            "memory_ingest_pending",
+            answer="pending",
+            confidence=0.0,
+            evidence={
+                "route": "deferred_relation_ingest",
+                "deferred_relation_ingest": True,
+                "utterance": utterance,
+                "source_words": list(_word_tokens(toks)),
+                "source": "observed_utterance",
+                "instruments": ["runtime_observation", "dmn_relation_ingest"],
+            },
+        )
 
     def _memory_write(self, mind: "SubstrateController", utterance: str, claim: ParsedClaim) -> CognitiveFrame:
         ev = {
@@ -3028,6 +3083,8 @@ class SubstrateController:
         self._background_worker: CognitiveBackgroundWorker | None = None
         self._self_improve_worker: Any | None = None
         self._cognitive_state_lock = threading.Lock()
+        self._deferred_relation_jobs: deque[DeferredRelationIngest] = deque()
+        self._next_deferred_relation_job_id = 1
 
         # New substrates ----------------------------------------------------
         d_model = int(getattr(self.host.cfg, "d_model", 96))
@@ -3125,6 +3182,103 @@ class SubstrateController:
     @property
     def background_worker(self) -> CognitiveBackgroundWorker | None:
         return self._background_worker
+
+    def deferred_relation_ingest_online(self) -> bool:
+        worker = self._background_worker
+        return worker is not None and worker.running
+
+    def deferred_relation_ingest_count(self) -> int:
+        return len(self._deferred_relation_jobs)
+
+    def _enqueue_deferred_relation_ingest(
+        self,
+        utterance: str,
+        toks: Sequence[str],
+        intent: UtteranceIntent,
+        *,
+        journal_id: int,
+    ) -> DeferredRelationIngest:
+        if not intent.allows_storage:
+            raise ValueError(f"cannot defer non-storable intent: {intent.label}")
+
+        job = DeferredRelationIngest(
+            job_id=int(self._next_deferred_relation_job_id),
+            utterance=str(utterance),
+            tokens=tuple(str(t) for t in toks),
+            intent=intent,
+            journal_id=int(journal_id),
+            queued_at=time.time(),
+        )
+        self._next_deferred_relation_job_id += 1
+        self._deferred_relation_jobs.append(job)
+
+        payload = {
+            "job_id": job.job_id,
+            "journal_id": job.journal_id,
+            "intent_label": intent.label,
+            "intent_confidence": float(intent.confidence),
+            "pending": len(self._deferred_relation_jobs),
+            "utterance": job.utterance[:200],
+        }
+        self.event_bus.publish("deferred_relation_ingest.queued", payload)
+
+        worker = self._background_worker
+        if worker is not None:
+            worker.notify_work()
+
+        return job
+
+    def process_deferred_relation_ingest(self) -> list[dict[str, Any]]:
+        with self._cognitive_state_lock:
+            reflections: list[dict[str, Any]] = []
+            while self._deferred_relation_jobs:
+                job = self._deferred_relation_jobs.popleft()
+                reflections.append(self._process_deferred_relation_job(job))
+            return reflections
+
+    def _process_deferred_relation_job(self, job: DeferredRelationIngest) -> dict[str, Any]:
+        claim = self.router.extractor.extract_claim(
+            job.utterance,
+            job.tokens,
+            utterance_intent=job.intent,
+        )
+        if claim is None:
+            reflection = {
+                "kind": "deferred_relation_ingest",
+                "status": "no_relation",
+                "job_id": job.job_id,
+                "journal_id": job.journal_id,
+                "utterance": job.utterance[:200],
+                "intent_label": job.intent.label,
+                "pending": len(self._deferred_relation_jobs),
+            }
+            self.event_bus.publish("deferred_relation_ingest.processed", reflection)
+            return reflection
+
+        refined = self.refine_extracted_claim(job.utterance, job.tokens, claim)
+        frame = self.router._memory_write(self, job.utterance, refined)
+        frame.evidence = {
+            **dict(frame.evidence or {}),
+            "deferred_relation_job_id": job.job_id,
+            "source_journal_id": job.journal_id,
+            "queued_at": job.queued_at,
+            "processed_at": time.time(),
+        }
+        self.workspace.publish(frame)
+
+        reflection = {
+            "kind": "deferred_relation_ingest",
+            "status": frame.intent,
+            "job_id": job.job_id,
+            "journal_id": job.journal_id,
+            "subject": frame.subject,
+            "answer": frame.answer,
+            "confidence": float(frame.confidence),
+            "evidence": dict(frame.evidence),
+            "pending": len(self._deferred_relation_jobs),
+        }
+        self.event_bus.publish("deferred_relation_ingest.processed", reflection)
+        return reflection
 
     def consolidate_once(self) -> list[dict]:
         out = self.memory.consolidate_claims_once()
@@ -3262,6 +3416,7 @@ class SubstrateController:
                 "hawkes_intensity": dict(self.hawkes.intensity_vector()),
                 "tools": int(self.tool_registry.count()),
                 "macros": int(self.macro_registry.count()),
+                "deferred_relation_ingest_pending": self.deferred_relation_ingest_count(),
                 "ontology_axes": len(self.ontology),
                 "discovered_scm": self.discovered_scm is not None,
             }
@@ -3964,6 +4119,16 @@ class SubstrateController:
                 frame = self.router.route(self, utterance, toks, utterance_intent=intent)
                 self._attach_perception(frame, intent, affect)
             out = self._commit_frame(utterance, toks, frame)
+            if bool((out.evidence or {}).get("deferred_relation_ingest")):
+                journal_id = (out.evidence or {}).get("journal_id")
+                if journal_id is None:
+                    raise RuntimeError("deferred relation ingest frame is missing journal_id")
+                self._enqueue_deferred_relation_ingest(
+                    utterance,
+                    toks,
+                    intent,
+                    journal_id=int(journal_id),
+                )
             self._last_user_affect_trace_id = self.affect_trace.record(
                 role="user",
                 text=utterance,

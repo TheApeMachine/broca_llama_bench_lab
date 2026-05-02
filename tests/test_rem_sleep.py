@@ -77,6 +77,8 @@ def _build_synthetic_mind(tmp: Path) -> types.SimpleNamespace:
         conformal_calibration=PersistentConformalCalibration(db, namespace="t__conf"),
         motor_replay=[],
         discovered_scm=None,
+        process_deferred_relation_ingest=lambda: [],
+        deferred_relation_ingest_count=lambda: 0,
         _cognitive_state_lock=threading.Lock(),
         event_bus=types.SimpleNamespace(publish=lambda *args, **kwargs: None),
     )

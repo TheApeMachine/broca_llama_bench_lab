@@ -31,6 +31,7 @@ from dataclasses import dataclass
 
 from ..encoders.extraction import ExtractionEncoder
 from ..system.event_bus import get_default_bus
+from .lexical_intent import LexicalIntentClassifier
 
 logger = logging.getLogger(__name__)
 
@@ -105,6 +106,7 @@ class IntentGate:
                 f"storable_labels {sorted(unknown_storable)} not in labels {labels}"
             )
         self._extraction = extraction
+        self._lexical = LexicalIntentClassifier()
         self._labels = tuple(labels)
         self._actionable = frozenset(actionable_labels)
         self._storable = frozenset(storable_labels)
@@ -123,6 +125,14 @@ class IntentGate:
                 allows_storage=False,
                 scores={l: 0.0 for l in self._labels},
             )
+
+        lexical = self._lexical.classify(text, labels=self._labels)
+        if lexical is not None:
+            top_label, top_score, lexical_scores = lexical
+            intent = self._intent_from_scores(top_label, top_score, lexical_scores)
+            self._record(text, intent, source="lexical")
+            return intent
+
         ranked = self._extraction.classify(
             text,
             labels=self._labels,
@@ -137,15 +147,27 @@ class IntentGate:
             top_label, top_score = ranked[0]
         else:
             top_label, top_score = self._labels[0], 0.0
-        intent = UtteranceIntent(
+        intent = self._intent_from_scores(top_label, top_score, scores)
+        self._record(text, intent, source="encoder")
+        return intent
+
+    def _intent_from_scores(self, top_label: str, top_score: float, raw_scores: dict[str, float]) -> UtteranceIntent:
+        scores = {label: 0.0 for label in self._labels}
+        for label, score in raw_scores.items():
+            if label in scores:
+                scores[label] = float(score)
+        return UtteranceIntent(
             label=top_label,
             confidence=float(top_score),
             is_actionable=top_label in self._actionable,
             allows_storage=top_label in self._storable,
             scores=scores,
         )
+
+    def _record(self, text: str, intent: UtteranceIntent, *, source: str) -> None:
         logger.debug(
-            "IntentGate.classify: utterance=%r label=%s conf=%.3f actionable=%s",
+            "IntentGate.classify: source=%s utterance=%r label=%s conf=%.3f actionable=%s",
+            source,
             text[:160],
             intent.label,
             intent.confidence,
@@ -160,6 +182,6 @@ class IntentGate:
                 "is_actionable": intent.is_actionable,
                 "allows_storage": intent.allows_storage,
                 "scores": dict(intent.scores),
+                "source": source,
             },
         )
-        return intent

@@ -124,6 +124,20 @@ class StubAffectEncoder:
         return self._state
 
 
+class StubBackgroundWorker:
+    running = True
+
+    def __init__(self):
+        self.notified = False
+        self.marked_active = False
+
+    def notify_work(self) -> None:
+        self.notified = True
+
+    def mark_user_active(self) -> None:
+        self.marked_active = True
+
+
 def _wire_stubs(
     mind: SubstrateController,
     *,
@@ -271,6 +285,35 @@ class TestStatementsStillFlowThrough:
         mind.comprehend("Ada lives in Rome")
         after = mind.memory.count()
         assert after > before, "statement must reach semantic memory"
+
+    def test_statement_relation_extraction_deferred_when_dmn_online(self, tmp_path: Path, fake_host_loader):
+        fake_host_loader()
+        mind = _build_mind(tmp_path)
+        stub = _wire_stubs(
+            mind,
+            intent_responses={"ada lives in rome": [("statement", 0.93)]},
+            relation_responses={
+                "ada lives in rome": [
+                    ExtractedRelation(subject="Ada", predicate="lives_in", object="Rome", confidence=0.85),
+                ],
+            },
+        )
+        worker = StubBackgroundWorker()
+        mind._background_worker = worker  # type: ignore[assignment]
+
+        frame = mind.comprehend("Ada lives in Rome")
+
+        assert frame.intent == "memory_ingest_pending"
+        assert mind.memory.count() == 0
+        assert stub.relation_calls == []
+        assert mind.deferred_relation_ingest_count() == 1
+        assert worker.notified is True
+
+        reflections = mind.process_deferred_relation_ingest()
+
+        assert reflections and reflections[0]["status"] == "memory_write"
+        assert stub.relation_calls == ["Ada lives in Rome"]
+        assert mind.memory.count() == 1
 
 
 class TestPerceptionLeavesEvidenceTrace:
