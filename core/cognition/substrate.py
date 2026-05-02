@@ -110,6 +110,7 @@ from .organ_relation_extractor import OrganRelationExtractor
 from .derived_strength import DerivedStrength, StrengthInputs
 from .multimodal_perception import MultimodalPerceptionPipeline
 from .observation import CognitiveObservation
+from .affect_trace import PersistentAffectTrace
 
 logger = logging.getLogger(__name__)
 
@@ -2569,8 +2570,14 @@ def _affect_evidence(affect: AffectState) -> dict[str, Any]:
     return {
         "dominant_emotion": str(affect.dominant_emotion),
         "dominant_score": float(affect.dominant_score),
+        "confidences": [
+            {"label": item.label, "score": float(item.score), "signal": item.signal}
+            for item in affect.confidences
+        ],
         "valence": float(affect.valence),
         "arousal": float(affect.arousal),
+        "entropy": float(affect.entropy),
+        "certainty": float(affect.certainty),
         "preference_signal": str(affect.preference_signal),
         "preference_strength": float(affect.preference_strength),
         "cognitive_states": dict(affect.cognitive_states),
@@ -2580,14 +2587,16 @@ def _affect_evidence(affect: AffectState) -> dict[str, Any]:
 def affect_certainty(affect: AffectState | None) -> float:
     """Affect-driven certainty in ``[0, 1]`` for derived graft strength.
 
-    Uses the dominant emotion's score directly: a peaked affective response
-    (``dominant_score`` near 1) means the user's emotional signal is
-    unambiguous; a flat distribution (no emotion above threshold) means the
-    user is hard to read and the substrate should *nudge*, not hammer.
+    Uses normalized entropy of the full GoEmotions vector when available:
+    a peaked affective response means the user's emotional signal is
+    unambiguous; a flat distribution means the user is hard to read and the
+    substrate should nudge, not hammer.
     """
 
     if affect is None:
         return 1.0
+    if affect.confidences:
+        return max(0.0, min(1.0, float(affect.certainty)))
     return max(0.0, min(1.0, float(affect.dominant_score)))
 
 
@@ -2999,9 +3008,11 @@ class SubstrateController:
         self.workspace = GlobalWorkspace()
         self.extraction_organ = ExtractionOrgan()
         self.affect_organ = AffectOrgan()
+        self.affect_trace = PersistentAffectTrace(rp, namespace=f"{namespace}__affect")
         self.intent_gate = IntentGate(self.extraction_organ)
         self._last_intent: UtteranceIntent | None = None
         self._last_affect: AffectState | None = None
+        self._last_user_affect_trace_id: int | None = None
         self.router = CognitiveRouter(
             extractor=OrganRelationExtractor(
                 intent_gate=self.intent_gate,
@@ -3263,6 +3274,12 @@ class SubstrateController:
         except Exception:
             logger.exception("snapshot.organs failed")
             snap["organs"] = {"error": True}
+
+        try:
+            snap["affect"] = self.affect_trace.summary()
+        except Exception:
+            logger.exception("snapshot.affect failed")
+            snap["affect"] = {"error": True}
 
         try:
             snap["preferences"] = {
@@ -3947,6 +3964,12 @@ class SubstrateController:
                 frame = self.router.route(self, utterance, toks, utterance_intent=intent)
                 self._attach_perception(frame, intent, affect)
             out = self._commit_frame(utterance, toks, frame)
+            self._last_user_affect_trace_id = self.affect_trace.record(
+                role="user",
+                text=utterance,
+                affect=affect,
+                journal_id=(out.evidence or {}).get("journal_id"),
+            )
         self._after_frame_commit(out, utterance, event_topic="frame.comprehend")
         return out
 
@@ -4098,12 +4121,31 @@ class SubstrateController:
             substrate_confidence=confidence,
             substrate_target_snr_scale=float(derived_scale),
         )
+        assistant_affect = self.affect_organ.detect(text)
+        if self._last_affect is None:
+            raise RuntimeError("chat_reply cannot align affect before user affect has been recorded")
+        affect_alignment = self.affect_trace.alignment(self._last_affect, assistant_affect)
+        assistant_affect_trace_id = self.affect_trace.record(
+            role="assistant",
+            text=text,
+            affect=assistant_affect,
+            response_to_id=self._last_user_affect_trace_id,
+            alignment=affect_alignment,
+        )
+        self._last_chat_meta = {
+            **self._last_chat_meta,
+            "assistant_affect": _affect_evidence(assistant_affect),
+            "affect_alignment": affect_alignment,
+            "assistant_affect_trace_id": int(assistant_affect_trace_id),
+            "user_affect_trace_id": self._last_user_affect_trace_id,
+        }
         try:
             self.event_bus.publish(
                 "chat.complete",
                 {
                     "intent": frame.intent,
                     "confidence": float(confidence),
+                    "affect_alignment": float(affect_alignment["alignment"]),
                     "reply_chars": len(text),
                     "reply_preview": text[:200],
                 },

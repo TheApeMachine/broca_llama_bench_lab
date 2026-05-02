@@ -23,6 +23,7 @@ The organ exposes emotions as cognitive signals that the substrate uses for:
 from __future__ import annotations
 
 import logging
+import math
 import time
 from dataclasses import dataclass, field
 from typing import Any, Sequence
@@ -99,12 +100,20 @@ class AffectState:
     """Complete affective state from the organ."""
     dominant_emotion: str = "neutral"
     dominant_score: float = 0.0
+    confidences: list[EmotionScore] = field(default_factory=list)
     emotions: list[EmotionScore] = field(default_factory=list)
     cognitive_states: dict[str, float] = field(default_factory=dict)
     valence: float = 0.0  # -1 (negative) to +1 (positive)
     arousal: float = 0.0  # 0 (calm) to 1 (excited)
+    entropy: float = 0.0
+    certainty: float = 0.0
     preference_signal: str = ""  # "positive_preference" or "negative_preference" or ""
     preference_strength: float = 0.0
+
+    def distribution(self) -> dict[str, float]:
+        """Return the full GoEmotions confidence vector keyed by label."""
+
+        return {item.label: float(item.score) for item in self.confidences}
 
 
 class AffectOrgan(BaseOrgan):
@@ -134,13 +143,14 @@ class AffectOrgan(BaseOrgan):
         super().__init__(
             name="affect",
             model_id=model_id or _GOEMOTION_MODEL,
-            output_dim=28,  # 28 GoEmotions labels
+            output_dim=31,  # 28 GoEmotions labels + valence/arousal/certainty
             device=device,
         )
         self._threshold = threshold
         self._use_onnx = use_onnx
         self._pipeline: Any = None
         self._zero_shot: Any = None
+        self._label_order: list[str] = []
 
     def _load_model(self) -> None:
         """Load the configured GoEmotions backend without silent fallback."""
@@ -164,6 +174,10 @@ class AffectOrgan(BaseOrgan):
             )
             self._tokenizer = AutoTokenizer.from_pretrained(self._model_id)
             self._config = AutoConfig.from_pretrained(self._model_id)
+            self._label_order = [
+                str(self._config.id2label[i])
+                for i in sorted(getattr(self._config, "id2label", {}))
+            ]
             self._session = ort.InferenceSession(
                 model_path,
                 providers=["CPUExecutionProvider"],
@@ -178,6 +192,11 @@ class AffectOrgan(BaseOrgan):
             top_k=None,
             device=self.device if self.device.type != "cpu" else -1,
         )
+        config = getattr(getattr(self._pipeline, "model", None), "config", None)
+        self._label_order = [
+            str(config.id2label[i])
+            for i in sorted(getattr(config, "id2label", {}))
+        ] if config is not None else []
         logger.info("AffectOrgan: loaded standard %s", self._model_id)
 
     def _run_onnx_text_classification(self, text: str) -> list[dict[str, float | str]]:
@@ -240,19 +259,18 @@ class AffectOrgan(BaseOrgan):
             label = item["label"]
             score = float(item["score"])
             all_scores[label] = score
-            if score >= thresh:
-                signal = EMOTION_TO_SIGNAL.get(label, "")
-                state.emotions.append(EmotionScore(label=label, score=score, signal=signal))
+            signal = EMOTION_TO_SIGNAL.get(label, "")
+            state.confidences.append(EmotionScore(label=label, score=score, signal=signal))
 
+        state.confidences.sort(key=lambda e: e.score, reverse=True)
+        state.emotions = [item for item in state.confidences if item.score >= thresh]
         state.emotions.sort(key=lambda e: e.score, reverse=True)
+        state.entropy = self._distribution_entropy(state.confidences)
+        state.certainty = self._distribution_certainty(state.confidences, entropy=state.entropy)
 
-        if state.emotions:
-            state.dominant_emotion = state.emotions[0].label
-            state.dominant_score = state.emotions[0].score
-        elif all_scores:
-            best = max(all_scores, key=all_scores.get)
-            state.dominant_emotion = best
-            state.dominant_score = all_scores[best]
+        if state.confidences:
+            state.dominant_emotion = state.confidences[0].label
+            state.dominant_score = state.confidences[0].score
 
         state.cognitive_states = {
             label: score for label, score in all_scores.items()
@@ -281,17 +299,18 @@ class AffectOrgan(BaseOrgan):
         state.arousal = min(1.0, high_arousal / max(high_arousal + low_arousal, 1e-6))
 
         pos_pref = sum(
-            s.score for s in state.emotions if s.signal == "positive_preference"
+            s.score for s in state.confidences if s.signal == "positive_preference"
         )
         neg_pref = sum(
-            s.score for s in state.emotions if s.signal == "negative_preference"
+            s.score for s in state.confidences if s.signal == "negative_preference"
         )
-        if pos_pref > neg_pref and pos_pref > 0.3:
+        pref_total = pos_pref + neg_pref
+        if pos_pref > neg_pref and pos_pref >= thresh:
             state.preference_signal = "positive_preference"
-            state.preference_strength = pos_pref
-        elif neg_pref > pos_pref and neg_pref > 0.3:
+            state.preference_strength = pos_pref / max(pref_total, 1e-12)
+        elif neg_pref > pos_pref and neg_pref >= thresh:
             state.preference_signal = "negative_preference"
-            state.preference_strength = neg_pref
+            state.preference_strength = neg_pref / max(pref_total, 1e-12)
 
         latency = (time.time() - start) * 1000
         self._record_call(latency, method="detect")
@@ -301,16 +320,41 @@ class AffectOrgan(BaseOrgan):
                 "text": text[:120],
                 "dominant_emotion": state.dominant_emotion,
                 "dominant_score": state.dominant_score,
+                "entropy": state.entropy,
+                "certainty": state.certainty,
                 "valence": state.valence,
                 "arousal": state.arousal,
                 "preference_signal": state.preference_signal,
                 "preference_strength": state.preference_strength,
                 "cognitive_states": dict(state.cognitive_states),
                 "top_emotions": [(e.label, e.score) for e in state.emotions[:5]],
+                "confidences": [(e.label, e.score) for e in state.confidences],
                 "latency_ms": latency,
             },
         )
         return state
+
+    @staticmethod
+    def _distribution_entropy(scores: Sequence[EmotionScore]) -> float:
+        total = sum(max(0.0, float(item.score)) for item in scores)
+        if total <= 0.0:
+            return 0.0
+        entropy = 0.0
+        for item in scores:
+            p = max(0.0, float(item.score)) / total
+            if p > 0.0:
+                entropy -= p * math.log(p)
+        return float(entropy)
+
+    @staticmethod
+    def _distribution_certainty(scores: Sequence[EmotionScore], *, entropy: float) -> float:
+        n = len(scores)
+        if n <= 1:
+            return 1.0 if n == 1 else 0.0
+        max_entropy = math.log(n)
+        if max_entropy <= 0.0:
+            return 0.0
+        return max(0.0, min(1.0, 1.0 - float(entropy) / max_entropy))
 
     def classify_custom(
         self,
@@ -347,30 +391,34 @@ class AffectOrgan(BaseOrgan):
 
         # Encode affect state as a feature vector for substrate integration
         import torch
-        # 28-dim emotion vector + 3 summary dims (valence, arousal, dominant_score)
-        features = torch.zeros(self._output_dim + 3, dtype=torch.float32)
-        # Fill in emotion scores by their index in the model's label list
-        for emo in state.emotions:
-            # Use hash-based indexing since we don't have the exact label order
-            idx = hash(emo.label) % self._output_dim
-            features[idx] = max(features[idx].item(), emo.score)
+
+        distribution = state.distribution()
+        labels = self._label_order or sorted(distribution)
+        features = torch.tensor(
+            [distribution.get(label, 0.0) for label in labels]
+            + [state.valence, state.arousal, state.certainty],
+            dtype=torch.float32,
+        )
         features[-3] = state.valence
         features[-2] = state.arousal
-        features[-1] = state.dominant_score
+        features[-1] = state.certainty
 
         return OrganOutput(
             features=features,
             metadata={
                 "dominant_emotion": state.dominant_emotion,
                 "dominant_score": state.dominant_score,
+                "confidences": [(e.label, e.score) for e in state.confidences],
                 "cognitive_states": state.cognitive_states,
                 "valence": state.valence,
                 "arousal": state.arousal,
+                "entropy": state.entropy,
+                "certainty": state.certainty,
                 "preference_signal": state.preference_signal,
                 "preference_strength": state.preference_strength,
                 "emotions": [(e.label, e.score) for e in state.emotions[:5]],
             },
-            confidence=state.dominant_score,
+            confidence=state.certainty,
             latency_ms=0.0,  # Already recorded internally
             organ_name=self._name,
         )
