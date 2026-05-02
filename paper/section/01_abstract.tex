@@ -1,30 +1,25 @@
-% !TeX root = ../main.tex
-
 \begin{abstract}
 We present \textsc{Mosaic}, an architecture that treats a frozen large language
-model as a \emph{language organ}---a surface-form generator stripped of the
-planning, memory, and reasoning responsibilities that current LLM deployments
-force onto the prompt.  All higher cognition is delegated to a persistent
-\emph{cognitive substrate} built from mathematically grounded components:
-POMDPs under active inference for decision-making, a finite structural causal
-model with exact \texttt{do(\,)} calculus for causal reasoning, holographic
-reduced representations for compositional memory, Modern Continuous Hopfield
-networks for one-step associative retrieval, split-conformal prediction for
-calibrated uncertainty, and multivariate Hawkes processes for temporal
-excitation.  The substrate communicates with the frozen LLM exclusively through
-\emph{grafts}---small modules that bias the residual stream, lexical plan, and
-logit distribution at every decoding step---rather than through the prompt.
+model as a \emph{language organ}---a surface-form generator whose weights are
+never updated.  All higher cognition is delegated to a persistent cognitive
+substrate assembled from mathematically grounded components: POMDPs under active
+inference, finite structural causal models with exact \texttt{do($\cdot$)}
+calculus, holographic reduced representations for compositional memory, Modern
+Continuous Hopfield networks for one-step associative retrieval, split-conformal
+prediction for calibrated uncertainty, and multivariate Hawkes processes for
+temporal excitation.
 
-We evaluate the architecture on three axes.  First, standard NLP benchmarks
-(BoolQ, PIQA, ARC, WinoGrande, HellaSwag, CommonsenseQA, OpenBookQA, MMLU,
-GSM8K) confirm that the graft infrastructure preserves the frozen model's
-leaderboard accuracy when no substrate signal is injected.  Second, scripted
-architecture probes show that the full Broca stack achieves perfect
-speech-exact accuracy on semantic-memory recall, active-inference action
-selection, and causal intervention queries where the bare LLM scores zero.
-Third, a suite of eight substrate-specific benchmarks verifies the algebraic
-and control-theoretic guarantees of every major component: online Bayesian
-belief revision, iterative hypothesis masking, Simpson's paradox resolution via
-do-calculus, triple-store fidelity, conformal coverage, VSA round-trip
-accuracy, Hopfield retrieval scaling, and EFE-driven decision quality.
+The substrate communicates with the frozen LLM exclusively through
+\emph{grafts}---small modules that bias the residual stream and logit
+distribution at every decoding step---preventing catastrophic forgetting by
+construction.  Beyond the LLM, the architecture deploys frozen specialist
+organs for perception (DINOv2, I-JEPA, V-JEPA2, Depth Anything), audition
+(Whisper), multi-sensory binding (ImageBind), language understanding (GLiNER2),
+and emotion detection (GoEmotions).  Multiple instances communicate freely
+via UDP multicast swarm on the local network.
+
+We evaluate on three tiers: standard NLP benchmarks confirm graft transparency,
+architecture probes demonstrate substrate-driven verbalization, and eight
+substrate-specific benchmarks verify algebraic guarantees of every major
+component.
 \end{abstract}
