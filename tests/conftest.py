@@ -138,6 +138,10 @@ class StubGenerationTokenizer:
     def decode(self, ids, skip_special_tokens: bool = True):
         return self._llm._next_response
 
+    def apply_chat_template(self, messages, add_generation_prompt: bool = True, return_tensors: str | None = "pt"):
+        _ = messages, add_generation_prompt, return_tensors
+        return torch.tensor([[1, 2, 3]], dtype=torch.long)
+
 
 class StubGenerationLLM:
     """Pretends to be an HF causal LM. The decode after generate returns whatever the tokenizer primed."""
@@ -176,13 +180,12 @@ def make_stub_llm_pair(extractor: Callable[[str], tuple[str, str, str] | None] |
 # ---------------------------------------------------------------------------
 # Substrate encoder stubbing.
 #
-# Every ``SubstrateController.comprehend`` call now runs through the intent
-# gate (``ExtractionEncoder.classify``) and the affect encoder
-# (``AffectEncoder.detect``), which lazy-load model weights from HuggingFace on
-# first use. Tests that exercise memory, journals, or grafts do not care
-# about the gate's accuracy — they only need a substrate that *functions*.
-# ``stub_substrate_encoders`` swaps in tiny canned implementations so those
-# tests stay fast and deterministic.
+# Every ``SubstrateController.comprehend`` call now runs through the semantic
+# cascade, the extraction encoder, and the affect encoder. Those load model
+# weights from HuggingFace on first use. Tests that exercise memory, journals,
+# or grafts do not care about classifier accuracy — they only need a substrate
+# that functions. ``stub_substrate_encoders`` swaps in tiny canned
+# implementations so those tests stay fast and deterministic.
 #
 # Tests that DO want to exercise the real weights (``test_encoder_integration``,
 # ``test_substrate_intent_gating`` opting into stubs explicitly) should not
@@ -213,6 +216,11 @@ class _CannedExtractionEncoder:
         self._default_intent_score = float(default_intent_score)
         self.classify_calls: list[str] = []
         self.relation_calls: list[str] = []
+        self.identity_calls: list[str] = []
+
+    def extract_identity_relations(self, text: str):
+        self.identity_calls.append(text)
+        return []
 
     def classify(self, text: str, *, labels, multi_label: bool = True, threshold: float = 0.0):
         self.classify_calls.append(text)
@@ -256,6 +264,35 @@ class _CannedAffectEncoder:
         _ = threshold
         self.calls.append(text)
         return self._state
+
+
+class _CannedSemanticCascade:
+    def __init__(self, extraction: _CannedExtractionEncoder):
+        self.extraction = extraction
+
+    def intent_scores(self, text: str):
+        from core.cognition.intent_gate import INTENT_LABELS
+
+        ranked = self.extraction.classify(text, labels=INTENT_LABELS, multi_label=False, threshold=0.0)
+        if not ranked:
+            return {
+                "label": "",
+                "confidence": 0.0,
+                "scores": {},
+                "allows_storage": False,
+                "evidence": {},
+            }
+        scores = {label: 0.0 for label in INTENT_LABELS}
+        for label, score in ranked:
+            scores[label] = float(score)
+        top_label, top_score = ranked[0]
+        return {
+            "label": top_label,
+            "confidence": float(top_score),
+            "scores": scores,
+            "allows_storage": top_label == "statement",
+            "evidence": {"stub": True},
+        }
 
 
 def _heuristic_extract_relations(text: str):
@@ -312,7 +349,8 @@ def stub_substrate_encoders(
     )
     mind.extraction_encoder = extraction
     mind.affect_encoder = _CannedAffectEncoder(affect_state)
-    mind.intent_gate = IntentGate(extraction)
+    mind.semantic_cascade = _CannedSemanticCascade(extraction)
+    mind.intent_gate = IntentGate(mind.semantic_cascade)
     mind.router.extractor = EncoderRelationExtractor(
         intent_gate=mind.intent_gate,
         extraction=extraction,

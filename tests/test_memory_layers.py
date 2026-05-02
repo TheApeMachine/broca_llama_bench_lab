@@ -28,6 +28,10 @@ class FakeHost:
         self.grafts: list | None = [] if track_grafts else None
         self.llm, self._stub_tokenizer = make_stub_llm_pair()
 
+    def parameters(self, recurse=True):
+        _ = recurse
+        return self.llm.parameters()
+
     def add_graft(self, slot, graft):
         if self.grafts is not None:
             self.grafts.append((slot, graft))
@@ -127,6 +131,33 @@ def test_runtime_mind_starts_empty_and_learns_observed_location(tmp_path: Path, 
     assert pred == learned.evidence["predicate"]
 
 
+def test_runtime_mind_stores_observed_location_while_background_worker_running(tmp_path: Path, fake_host_loader):
+    class RunningBackgroundWorker:
+        running = True
+
+        def notify_work(self):
+            raise AssertionError("synchronous claim extraction should not enqueue deferred ingest")
+
+        def mark_user_active(self):
+            pass
+
+    fake_host_loader(track_grafts=False)
+    db = tmp_path / "learn_with_worker.sqlite"
+    subject = _symbol("subject")
+    obj = _symbol("object")
+
+    mind = build_substrate_controller(seed=0, db_path=db, namespace="runtime", device="cpu", hf_token=False)
+    stub_substrate_encoders(mind)
+    mind._background_worker = RunningBackgroundWorker()
+
+    learned = mind.comprehend(f"{subject} is in {obj} .")
+
+    assert learned.intent == "memory_write"
+    assert learned.answer == obj
+    assert learned.evidence.get("deferred_relation_ingest") is None
+    assert mind.memory.count() == 1
+
+
 def test_runtime_mind_routes_faculties_and_installs_feature_graft(tmp_path: Path, fake_host_loader):
     host = fake_host_loader(track_grafts=True)
     mind = build_substrate_controller(seed=0, db_path=tmp_path / "router.sqlite", namespace="runtime", device="cpu", hf_token=False)
@@ -188,6 +219,30 @@ def test_background_worker_start_stop(tmp_path: Path, fake_host_loader):
     assert worker.running
     mind.stop_background()
     assert not worker.running
+
+
+def test_speak_records_motor_replay(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, fake_host_loader) -> None:
+    fake_host_loader(track_grafts=False)
+
+    monkeypatch.setattr(
+        substrate_mod,
+        "generate_from_plan",
+        lambda *a, **k: ("surfaced", [9, 11, 13], 2.25),
+    )
+    mind = build_substrate_controller(seed=0, db_path=tmp_path / "speak_replay.sqlite", namespace="runtime", device="cpu", hf_token=False)
+    stub_substrate_encoders(mind)
+    frame = CognitiveFrame("memory_location", subject=_symbol("subj"), answer=_symbol("loc"), confidence=0.88)
+
+    out = mind.speak(frame)
+    assert out == "surfaced"
+    assert len(mind.motor_replay) == 1
+    row = mind.motor_replay[0]
+    assert list(row["speech_plan_tokens"].tolist()) == [9, 11, 13]
+    assert abs(float(row["substrate_confidence"]) - 0.88) < 1e-6
+    assert abs(float(row["substrate_inertia"]) - 2.25) < 1e-6
+    msgs = row["messages"]
+    assert len(msgs) == 1 and msgs[0]["role"] == "user"
+    assert frame.intent in msgs[0]["content"] and frame.subject in msgs[0]["content"]
 
 
 def test_working_memory_synthesis_binds_episodes():

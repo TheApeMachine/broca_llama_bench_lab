@@ -14,6 +14,7 @@ dependencies = [
     "msgpack",
     "urllib3>=2.2.0",
     "onnxruntime>=1.23.2",
+    "gliclass>=0.1.17",
 ]
 
 [project.scripts]

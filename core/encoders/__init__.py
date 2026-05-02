@@ -14,6 +14,7 @@ Included modalities:
     - Auditory (Whisper)
     - Binding (ImageBind)
     - Extraction (GLiNER2)
+    - Semantic classification (GLiClass)
     - Affect (GoEmotions)
 
 All encoders are:
@@ -26,6 +27,7 @@ All encoders are:
 from __future__ import annotations
 
 from .base import Encoder, EncoderRegistry, EncoderOutput
+from .classification import SemanticClassificationEncoder
 from .extraction import ExtractionEncoder
 from .affect import AffectEncoder
 
@@ -33,6 +35,7 @@ __all__ = [
     "Encoder",
     "EncoderRegistry",
     "EncoderOutput",
+    "SemanticClassificationEncoder",
     "ExtractionEncoder",
     "AffectEncoder",
     "DINOv2Encoder",

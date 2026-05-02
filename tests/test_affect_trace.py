@@ -193,7 +193,7 @@ def test_chat_reply_records_user_and_assistant_affect_alignment(
     monkeypatch.setattr(
         mind,
         "_stream_substrate_chat",
-        lambda *args, **kwargs: "I understand and will help.",
+        lambda *args, **kwargs: ("I understand and will help.", [1], 1.0),
     )
 
     frame, text = mind.chat_reply([{"role": "user", "content": "Please help"}])

@@ -1,10 +1,11 @@
-"""Extraction encoder: zero-shot NER, relation extraction, and classification.
+"""Extraction encoder: zero-shot NER, relation extraction, and identity claims.
 
-Replaces the LLM-based ``LLMRelationExtractor`` and regex intent detection with
-a single GLiNER2 encoder that handles entities, relations, and classification
-in one model call. There is no fallback chain — if the model cannot be loaded
-or a method is missing, this module raises so the flaw is exposed rather than
-papered over.
+Replaces the LLM-based ``LLMRelationExtractor`` with a GLiNER2 encoder for
+grounded entities, structured facts, and first-person identity claims. Intent
+classification is owned by the GLiClass semantic cascade; this module keeps
+``classify_text`` only as a low-level model capability. There is no fallback
+chain — if the model cannot be loaded or a method is missing, this module
+raises so the flaw is exposed rather than papered over.
 
 Model: ``fastino/gliner2-base-v1`` (205M params, ~400MB, CPU-first design),
 loaded via the ``gliner2`` package — *not* ``gliner``. The two libraries
@@ -26,12 +27,6 @@ from .base import BaseEncoder, EncoderOutput
 logger = logging.getLogger(__name__)
 
 
-def _publish(topic: str, payload: dict) -> None:
-    try:
-        get_default_bus().publish(topic, payload)
-    except Exception:
-        pass
-
 EXTRACTION_MODEL_ID = "fastino/gliner2-base-v1"
 
 DEFAULT_ENTITY_LABELS: tuple[str, ...] = (
@@ -49,6 +44,11 @@ STRUCTURED_FACT_FIELDS: tuple[str, ...] = (
     "subject::str::entity in subject role",
     "predicate::str::verb phrase linking subject and object",
     "object::str::entity in object role",
+)
+IDENTITY_CLAIM_KEY = "identity"
+IDENTITY_CLAIM_FIELDS: tuple[str, ...] = (
+    "speaker::str::person speaking",
+    "name::str::name or title claimed by speaker",
 )
 
 _REQUIRED_GLINER2_METHODS: tuple[str, ...] = (
@@ -161,7 +161,7 @@ class ExtractionEncoder(BaseEncoder):
                     )
         latency = (time.time() - start) * 1000
         self._record_call(latency, method="extract_entities")
-        _publish(
+        self._publish(
             "encoder.extraction.entities",
             {
                 "text": text[:120],
@@ -236,6 +236,23 @@ class ExtractionEncoder(BaseEncoder):
         self._ensure_loaded()
         start = time.time()
         _ = entity_labels, relation_labels
+        identity_relations = self.extract_identity_relations(text)
+        if identity_relations:
+            latency = (time.time() - start) * 1000
+            self._record_call(latency, method="extract_relations")
+            self._publish(
+                "encoder.extraction.relations",
+                {
+                    "text": text[:120],
+                    "n_relations": len(identity_relations),
+                    "relations": [
+                        (r.subject, r.predicate, r.object) for r in identity_relations[:5]
+                    ],
+                    "latency_ms": latency,
+                },
+            )
+            return identity_relations
+
         schema = {STRUCTURED_FACT_KEY: list(STRUCTURED_FACT_FIELDS)}
         raw = self._model.extract_json(text, schema)
         records: list[dict] = []
@@ -280,7 +297,7 @@ class ExtractionEncoder(BaseEncoder):
 
         latency = (time.time() - start) * 1000
         self._record_call(latency, method="extract_relations")
-        _publish(
+        self._publish(
             "encoder.extraction.relations",
             {
                 "text": text[:120],
@@ -291,6 +308,65 @@ class ExtractionEncoder(BaseEncoder):
                 "latency_ms": latency,
             },
         )
+        return relations
+
+    def extract_identity_relations(self, text: str) -> list[ExtractedRelation]:
+        """Extract first-person identity claims with GLiNER2 structured JSON."""
+
+        self._ensure_loaded()
+        start = time.time()
+        raw = self._model.extract_json(
+            text,
+            {IDENTITY_CLAIM_KEY: list(IDENTITY_CLAIM_FIELDS)},
+        )
+        relations = self._identity_relations_from_raw(raw)
+        latency = (time.time() - start) * 1000
+        self._record_call(latency, method="extract_identity_relations")
+        self._publish(
+            "encoder.extraction.identity_relations",
+            {
+                "text": text[:120],
+                "n_relations": len(relations),
+                "relations": [
+                    (r.subject, r.predicate, r.object) for r in relations[:5]
+                ],
+                "latency_ms": latency,
+            },
+        )
+        return relations
+
+    def _identity_relations_from_raw(self, raw: Any) -> list[ExtractedRelation]:
+        records: list[dict] = []
+        if isinstance(raw, dict):
+            primary = raw.get(IDENTITY_CLAIM_KEY)
+            if isinstance(primary, list):
+                records.extend(r for r in primary if isinstance(r, dict))
+            elif isinstance(primary, dict) and primary:
+                records.append(primary)
+
+        relations: list[ExtractedRelation] = []
+        for item in records:
+            lower = {str(k).lower().replace("-", "").replace("_", ""): v for k, v in item.items()}
+            speaker = self._unwrap_gliner_scalar(lower.get("speaker"))
+            name = self._unwrap_gliner_scalar(lower.get("name"))
+            if speaker is None or name is None:
+                continue
+            speaker_clean = speaker.strip()
+            name_clean = name.strip()
+            if not speaker_clean or not name_clean:
+                continue
+            if speaker_clean.lower() == name_clean.lower():
+                continue
+            relations.append(
+                ExtractedRelation(
+                    subject=speaker_clean,
+                    predicate="is",
+                    object=name_clean,
+                    confidence=1.0,
+                    subject_label="speaker",
+                    object_label="identity",
+                )
+            )
         return relations
 
     def classify(
@@ -341,7 +417,7 @@ class ExtractionEncoder(BaseEncoder):
         # label appears first *in `labels=`* win whenever every score was 1.0.
         latency = (time.time() - start) * 1000
         self._record_call(latency, method="classify")
-        _publish(
+        self._publish(
             "encoder.extraction.classify",
             {
                 "text": text[:120],
@@ -391,3 +467,7 @@ class ExtractionEncoder(BaseEncoder):
         if idx < 0:
             return (0, 0)
         return (idx, idx + len(mention))
+
+    @staticmethod
+    def _publish(topic: str, payload: dict) -> None:
+        get_default_bus().publish(topic, payload)

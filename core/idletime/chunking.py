@@ -352,6 +352,15 @@ def _journal_evidence_dict(row: dict) -> dict:
     return ev if isinstance(ev, dict) else {}
 
 
+def _motif_is_compilable(pattern: Sequence[str]) -> bool:
+    return all(_intent_is_compilable(intent) for intent in pattern)
+
+
+def _intent_is_compilable(intent: str) -> bool:
+    value = str(intent or "").strip().lower()
+    return bool(value) and value != "unknown" and not value.endswith("_pending")
+
+
 def _row_salience_multiplier(mind: Any, row: dict, cfg: ChunkingDetectionConfig) -> float:
     """Hawkes-normalised intensity × lexical surprise bump for one journal row."""
 
@@ -423,7 +432,7 @@ def find_salience_forced_motifs(
             continue
         for s in range(n - L + 1):
             pat = tuple(intents[s : s + L])
-            if all(p == "unknown" or not p for p in pat):
+            if not _motif_is_compilable(pat):
                 continue
             sal = _window_salience(mind, rows, s, L, cfg)
             if sal < cfg.salience_oneshot_threshold:
@@ -505,8 +514,7 @@ class DMNChunkingCompiler:
             i = 0
             while i + L <= n:
                 pat = tuple(intents[i : i + L])
-                # Skip windows containing only "unknown" intents — those are noise, not motifs.
-                if all(p == "unknown" or not p for p in pat):
+                if not _motif_is_compilable(pat):
                     i += 1
                     continue
                 counts.setdefault(pat, []).append(i)

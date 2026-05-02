@@ -17,7 +17,7 @@ from typing import Sequence
 
 import pytest
 
-from core.cognition.intent_gate import IntentGate
+from core.cognition.intent_gate import INTENT_LABELS, IntentGate
 from core.cognition.encoder_relation_extractor import EncoderRelationExtractor
 from core.encoders.extraction import ExtractedRelation
 
@@ -35,6 +35,11 @@ class StubExtractionEncoder:
         self._relations = relation_responses or {}
         self.classify_calls: list[str] = []
         self.relation_calls: list[str] = []
+        self.identity_calls: list[str] = []
+
+    def extract_identity_relations(self, text: str) -> list[ExtractedRelation]:
+        self.identity_calls.append(text)
+        return []
 
     def classify(
         self,
@@ -65,6 +70,33 @@ class StubExtractionEncoder:
         return []
 
 
+class StubSemanticCascade:
+    def __init__(self, extraction: StubExtractionEncoder):
+        self.extraction = extraction
+
+    def intent_scores(self, text: str) -> dict:
+        ranked = self.extraction.classify(text, labels=INTENT_LABELS, multi_label=False, threshold=0.0)
+        if not ranked:
+            return {
+                "label": "",
+                "confidence": 0.0,
+                "scores": {},
+                "allows_storage": False,
+                "evidence": {},
+            }
+        scores = {label: 0.0 for label in INTENT_LABELS}
+        for label, score in ranked:
+            scores[label] = float(score)
+        top_label, top_score = ranked[0]
+        return {
+            "label": top_label,
+            "confidence": float(top_score),
+            "scores": scores,
+            "allows_storage": top_label == "statement",
+            "evidence": {"stub": True},
+        }
+
+
 def _build(
     *,
     intent_responses: dict[str, list[tuple[str, float]]] | None = None,
@@ -74,7 +106,7 @@ def _build(
         intent_responses=intent_responses,
         relation_responses=relation_responses,
     )
-    gate = IntentGate(extraction)
+    gate = IntentGate(StubSemanticCascade(extraction))
     extractor = EncoderRelationExtractor(intent_gate=gate, extraction=extraction)
     return extractor, extraction
 
@@ -259,7 +291,7 @@ class TestEvidenceIncludesIntentTrace:
                 ],
             },
         )
-        gate = IntentGate(extraction)
+        gate = IntentGate(StubSemanticCascade(extraction))
         cached = gate.classify("Ada lives in Rome")
         extraction.classify_calls.clear()
         claim = ext.extract_claim(

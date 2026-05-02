@@ -106,6 +106,33 @@ def test_compiler_salience_path_compiles_without_frequency_repetition(tmp_path):
     assert result["reflections"][0].get("compile_via") == "salience"
 
 
+def test_compiler_salience_path_skips_unknown_windows(tmp_path):
+    rows = [
+        _row(1, "unknown", evidence={"lexical_surprise_gap": 8.0}),
+        _row(2, "memory_lookup", evidence={"lexical_surprise_gap": 8.0}),
+    ]
+    db = tmp_path / "broca.sqlite"
+    reg = MacroChunkRegistry(db, namespace="dmn")
+    mind = _StubMindSalience(rows)
+    compiler = DMNChunkingCompiler(
+        mind,
+        registry=reg,
+        config=ChunkingDetectionConfig(
+            window_size=32,
+            min_motif_length=2,
+            max_motif_length=2,
+            min_repetitions=99,
+            salience_oneshot_threshold=1.0,
+            max_macros_per_tick=4,
+        ),
+    )
+
+    result = compiler.run_once()
+
+    assert result["compiled"] == 0
+    assert reg.count() == 0
+
+
 # --- find_repeated_motifs --------------------------------------------------
 
 
@@ -149,6 +176,36 @@ def test_find_repeated_motifs_skips_all_unknown_windows():
         min_repetitions=2,
     )
     assert motifs == [], "all-unknown windows should not produce motifs"
+
+
+def test_find_repeated_motifs_skips_mixed_unknown_windows():
+    intents = [
+        "unknown", "memory_lookup",
+        "unknown", "memory_lookup",
+        "unknown", "memory_lookup",
+    ]
+    motifs = DMNChunkingCompiler.find_repeated_motifs(
+        intents,
+        min_motif_length=2,
+        max_motif_length=2,
+        min_repetitions=3,
+    )
+    assert motifs == [], "unknown-bearing windows should not produce motifs"
+
+
+def test_find_repeated_motifs_skips_pending_windows():
+    intents = [
+        "memory_ingest_pending", "memory_lookup",
+        "memory_ingest_pending", "memory_lookup",
+        "memory_ingest_pending", "memory_lookup",
+    ]
+    motifs = DMNChunkingCompiler.find_repeated_motifs(
+        intents,
+        min_motif_length=2,
+        max_motif_length=2,
+        min_repetitions=3,
+    )
+    assert motifs == [], "pending bookkeeping windows should not produce motifs"
 
 
 def test_find_repeated_motifs_short_input_yields_nothing():

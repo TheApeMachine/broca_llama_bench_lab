@@ -1,11 +1,10 @@
-"""Pragmatic intent classification for incoming utterances.
+"""Pragmatic semantic intent gating for incoming utterances.
 
 The substrate's relation extractor must not fire on every utterance: a request
 ("tell me a joke") is not a declarative claim, and forcing it through SVO
-extraction stores garbage triples like ``(me, tell, joke)`` and then biases
-the LLM toward verbalizing them. The :class:`IntentGate` is the first stop in
-``comprehend()`` and decides which faculties downstream are even *allowed* to
-run on this utterance.
+extraction stores garbage triples like ``(me, tell, joke)``. The
+:class:`IntentGate` consumes the semantic cascade's model-derived axes and
+decides which faculties downstream are even *allowed* to run on this utterance.
 
 Categories:
 
@@ -17,30 +16,22 @@ Categories:
   ``greeting``  — phatic / social opener.
   ``feedback``  — acknowledgement / evaluation of a prior turn.
 
-Only ``statement`` allows storage; ``statement`` and ``question`` are
-considered *actionable* (the substrate has something it could legitimately
-contribute). Everything else is non-actionable: the cognitive frame should
-end up ``intent="unknown"`` with confidence 0 so derived graft strength
-collapses to 0 and the LLM speaks freely.
+Only model-confirmed ``statement`` content allows storage; ``statement`` and
+``question`` are considered *actionable* (the substrate has something it could
+legitimately contribute). Everything else is non-actionable: the cognitive
+frame should end up ``intent="unknown"`` with confidence 0 so derived graft
+strength collapses to 0 and the LLM speaks freely.
 """
 
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
-from ..encoders.extraction import ExtractionEncoder
 from ..system.event_bus import get_default_bus
-from .lexical_intent import LexicalIntentClassifier
+from .semantic_cascade import SemanticCascade
 
 logger = logging.getLogger(__name__)
-
-
-def _publish(topic: str, payload: dict) -> None:
-    try:
-        get_default_bus().publish(topic, payload)
-    except Exception:
-        pass
 
 
 INTENT_LABELS: tuple[str, ...] = (
@@ -74,20 +65,20 @@ class UtteranceIntent:
     is_actionable: bool
     allows_storage: bool
     scores: dict[str, float]
+    evidence: dict[str, object] = field(default_factory=dict)
 
 
 class IntentGate:
-    """Zero-shot intent classifier backed by :class:`ExtractionEncoder`.
+    """Intent policy wrapper backed by :class:`SemanticCascade`.
 
     The gate exposes a single :meth:`classify` method that returns an
-    :class:`UtteranceIntent`. Implementation is intentionally thin — the gate
-    is responsible for *deciding*, not for owning a model. All ML capacity
-    lives in the extraction encoder.
+    :class:`UtteranceIntent`. Implementation is intentionally thin: the gate
+    enforces substrate policy, while semantic analysis lives in the cascade.
     """
 
     def __init__(
         self,
-        extraction: ExtractionEncoder,
+        semantic_cascade: SemanticCascade,
         *,
         labels: tuple[str, ...] = INTENT_LABELS,
         actionable_labels: frozenset[str] = ACTIONABLE_LABELS,
@@ -105,9 +96,8 @@ class IntentGate:
             raise ValueError(
                 f"storable_labels {sorted(unknown_storable)} not in labels {labels}"
             )
-        self._extraction = extraction
-        self._lexical = LexicalIntentClassifier()
         self._labels = tuple(labels)
+        self._semantic_cascade = semantic_cascade
         self._actionable = frozenset(actionable_labels)
         self._storable = frozenset(storable_labels)
 
@@ -126,32 +116,39 @@ class IntentGate:
                 scores={l: 0.0 for l in self._labels},
             )
 
-        lexical = self._lexical.classify(text, labels=self._labels)
-        if lexical is not None:
-            top_label, top_score, lexical_scores = lexical
-            intent = self._intent_from_scores(top_label, top_score, lexical_scores)
-            self._record(text, intent, source="lexical")
-            return intent
-
-        ranked = self._extraction.classify(
-            text,
-            labels=self._labels,
-            multi_label=False,
-            threshold=0.0,
+        semantic = self._semantic_cascade.intent_scores(text)
+        label = str(semantic.get("label") or "")
+        confidence = float(semantic.get("confidence") or 0.0)
+        raw_scores = semantic.get("scores")
+        evidence = semantic.get("evidence")
+        allows_storage = semantic.get("allows_storage")
+        if not isinstance(raw_scores, dict):
+            raise RuntimeError(f"IntentGate.classify: semantic cascade returned invalid scores {semantic!r}")
+        if not isinstance(allows_storage, bool):
+            raise RuntimeError(
+                f"IntentGate.classify: semantic cascade returned invalid storage decision {semantic!r}"
+            )
+        intent = self._intent_from_scores(
+            label,
+            confidence,
+            {str(k): float(v) for k, v in raw_scores.items()},
+            allows_storage=allows_storage,
+            evidence=evidence if isinstance(evidence, dict) else {},
         )
-        scores = {label: 0.0 for label in self._labels}
-        for label, score in ranked:
-            if label in scores:
-                scores[label] = float(score)
-        if ranked:
-            top_label, top_score = ranked[0]
-        else:
-            top_label, top_score = self._labels[0], 0.0
-        intent = self._intent_from_scores(top_label, top_score, scores)
-        self._record(text, intent, source="encoder")
+        self._record(text, intent, source="semantic_cascade")
         return intent
 
-    def _intent_from_scores(self, top_label: str, top_score: float, raw_scores: dict[str, float]) -> UtteranceIntent:
+    def _intent_from_scores(
+        self,
+        top_label: str,
+        top_score: float,
+        raw_scores: dict[str, float],
+        *,
+        allows_storage: bool,
+        evidence: dict[str, object] | None = None,
+    ) -> UtteranceIntent:
+        if top_label not in self._labels:
+            raise RuntimeError(f"IntentGate._intent_from_scores: unknown top label {top_label!r}")
         scores = {label: 0.0 for label in self._labels}
         for label, score in raw_scores.items():
             if label in scores:
@@ -160,8 +157,9 @@ class IntentGate:
             label=top_label,
             confidence=float(top_score),
             is_actionable=top_label in self._actionable,
-            allows_storage=top_label in self._storable,
+            allows_storage=top_label in self._storable and allows_storage,
             scores=scores,
+            evidence=dict(evidence or {}),
         )
 
     def _record(self, text: str, intent: UtteranceIntent, *, source: str) -> None:
@@ -173,7 +171,7 @@ class IntentGate:
             intent.confidence,
             intent.is_actionable,
         )
-        _publish(
+        self._publish(
             "cog.intent",
             {
                 "utterance": text[:120],
@@ -182,6 +180,11 @@ class IntentGate:
                 "is_actionable": intent.is_actionable,
                 "allows_storage": intent.allows_storage,
                 "scores": dict(intent.scores),
+                "evidence": dict(intent.evidence),
                 "source": source,
             },
         )
+
+    @staticmethod
+    def _publish(topic: str, payload: dict) -> None:
+        get_default_bus().publish(topic, payload)

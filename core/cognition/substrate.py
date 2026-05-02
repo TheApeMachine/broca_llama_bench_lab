@@ -86,6 +86,7 @@ from ..memory.hopfield import HopfieldAssociativeMemory
 from ..calibration.conformal import ConformalPredictor, PersistentConformalCalibration
 from ..temporal.hawkes import MultivariateHawkesProcess, PersistentHawkes, fit_excitation_em
 from ..learning.preference_learning import DirichletPreference, PersistentPreference, feedback_polarity_from_text
+from ..learning.motor_learning import GraftMotorTrainer
 from ..idletime.ontological_expansion import OntologicalRegistry, PersistentOntologicalRegistry
 from ..causal.causal_discovery import (
     build_scm_from_skeleton,
@@ -97,6 +98,7 @@ from ..natives.native_tools import NativeTool, NativeToolRegistry, ToolSandbox, 
 from ..grafting.dynamic_grafts import DynamicGraftSynthesizer, CapturedActivationMode, ACTIVATION_MODE_KIND
 from ..system.event_bus import EventBus, get_default_bus
 from ..memory import SQLiteActivationMemory
+from ..encoders.classification import SemanticClassificationEncoder
 from ..encoders.extraction import ExtractionEncoder
 from ..encoders.affect import AffectEncoder, AffectState
 
@@ -107,6 +109,7 @@ from .constants import (
     BELIEF_REVISION_MIN_CLAIMS,
 )
 from .intent_gate import IntentGate, UtteranceIntent
+from .semantic_cascade import SemanticCascade
 from .encoder_relation_extractor import EncoderRelationExtractor
 from .derived_strength import DerivedStrength, StrengthInputs
 from .multimodal_perception import MultimodalPerceptionPipeline
@@ -2194,7 +2197,7 @@ class CognitiveBackgroundWorker:
                 "synthesize_tool",
                 f"EFE math recommends synthesizing a new tool (insufficient_prior={insufficient_prior:.3f})",
                 evidence,
-                dedupe_key=f"tool_synthesis_recommended:{int(time.time() // 60)}",
+                dedupe_key=f"tool_synthesis_recommended:{int(registry.count())}",
             )
             if reflection_id is not None:
                 reflections.append({"id": reflection_id, "kind": "tool_synthesis_recommended", **evidence})
@@ -2230,8 +2233,19 @@ class CognitiveBackgroundWorker:
 
         # 1. Motor learning — re-train the Broca grafts on recent journals.
         motor = {"ran": False}
-        if self.motor_trainer is not None and getattr(self.mind, "motor_replay", None):
-            replay = list(self.mind.motor_replay)[-cfg.sleep_max_replay :]
+        if self.motor_trainer is None:
+            summary["motor"] = motor
+        else:
+            replay_buf = getattr(self.mind, "motor_replay", None)
+            if replay_buf is None:
+                raise RuntimeError("REM motor learning requires mind.motor_replay on the substrate")
+            lock = getattr(self.mind, "_cognitive_state_lock", None)
+            if lock is None:
+                raise RuntimeError(
+                    "REM motor learning requires mind._cognitive_state_lock for thread-safe replay access"
+                )
+            with lock:
+                replay = list(replay_buf)[-cfg.sleep_max_replay :]
             try:
                 step = self.motor_trainer.step(replay)
             except Exception:
@@ -2241,7 +2255,7 @@ class CognitiveBackgroundWorker:
             motor["ran"] = True
             if step.get("skipped") is False:
                 reflections.append({"kind": "rem_motor_learning", **step})
-        summary["motor"] = motor
+            summary["motor"] = motor
 
         # 2. Hawkes refit — relearn excitation matrix from recent journal events.
         hawkes_summary: dict[str, Any] = {"ran": False}
@@ -2643,6 +2657,18 @@ def default_lexical_target_snr(model: nn.Module) -> float:
     return DEFAULT_GRAFT_TARGET_SNR
 
 
+def _motor_replay_messages_plan_forced(frame: CognitiveFrame, plan_words: Sequence[str]) -> list[dict[str, str]]:
+    """One user turn synthesizing lexical-plan context for REM chat-template supervision."""
+
+    chunks = (
+        f"intent={frame.intent}",
+        f"subject={frame.subject or ''}",
+        f"answer={frame.answer or ''}",
+        f"plan={' '.join(plan_words)}",
+    )
+    return [{"role": "user", "content": " | ".join(chunks)}]
+
+
 def decode_generation(tokenizer: Any, generated: Sequence[int]) -> str:
     dec = getattr(tokenizer, "decode_tokens", None)
     if callable(dec):
@@ -2658,12 +2684,15 @@ def generate_from_plan(
     prefix: str | None = None,
     max_new_tokens: int | None = None,
     broca_features: torch.Tensor | None = None,
-) -> str:
+) -> tuple[str, list[int], float]:
     plan_ids = list(tokenizer.encode_plan_words(plan_tokens, lowercase=True))
     max_new_tokens = max_new_tokens or len(plan_ids)
     ids = speech_seed_ids(tokenizer, prefix)
     generated: list[int] = []
-    device = next(model.parameters()).device
+    params_fn = getattr(model, "parameters", None)
+    if not callable(params_fn):
+        raise RuntimeError("generate_from_plan requires model.parameters() for device placement")
+    device = next(params_fn()).device
     steps = range(min(max_new_tokens, len(plan_ids)))
     for step in steps:
         row = ids + generated
@@ -2680,7 +2709,9 @@ def generate_from_plan(
         )
         pred = int(logits[0, mask.long().sum().item() - 1].argmax().item())
         generated.append(pred)
-    return decode_generation(tokenizer, generated)
+    text_out = decode_generation(tokenizer, generated)
+    inertia_tail = math.log1p(float(max(1, len(ids) + len(generated))))
+    return text_out, generated, inertia_tail
 
 
 def generate_without_substrate(model: nn.Module, tokenizer: Any, *, prefix: str | None = None, max_new_tokens: int = 5) -> str:
@@ -2759,19 +2790,9 @@ class CognitiveRouter:
         utterance_intent: UtteranceIntent,
     ) -> CognitiveFrame:
         candidates: list[FacultyCandidate] = []
-        claim: ParsedClaim | None = None
-        if utterance_intent.allows_storage and mind.deferred_relation_ingest_online():
-            candidates.append(
-                FacultyCandidate(
-                    "semantic_ingest_pending",
-                    1.45,
-                    lambda: self._memory_ingest_pending(utterance, toks),
-                )
-            )
-        else:
-            claim = self.extractor.extract_claim(utterance, toks, utterance_intent=utterance_intent)
-            if claim is not None:
-                claim = mind.refine_extracted_claim(utterance, toks, claim)
+        claim = self.extractor.extract_claim(utterance, toks, utterance_intent=utterance_intent)
+        if claim is not None:
+            claim = mind.refine_extracted_claim(utterance, toks, claim)
         query = _query_from_tokens(
             toks,
             utterance=utterance,
@@ -3062,9 +3083,14 @@ class SubstrateController:
         self.multimodal_perception = MultimodalPerceptionPipeline(device=encoder_device)
         self.workspace = GlobalWorkspace()
         self.extraction_encoder = ExtractionEncoder()
+        self.classification_encoder = SemanticClassificationEncoder()
+        self.semantic_cascade = SemanticCascade(
+            classifier=self.classification_encoder,
+            extraction=self.extraction_encoder,
+        )
         self.affect_encoder = AffectEncoder()
         self.affect_trace = PersistentAffectTrace(rp, namespace=f"{namespace}__affect")
-        self.intent_gate = IntentGate(self.extraction_encoder)
+        self.intent_gate = IntentGate(self.semantic_cascade)
         self._last_intent: UtteranceIntent | None = None
         self._last_affect: AffectState | None = None
         self._last_user_affect_trace_id: int | None = None
@@ -3125,6 +3151,8 @@ class SubstrateController:
         # Replay buffer for motor learning. Each item is one chat turn the
         # substrate produced; the trainer pulls items from here at REM time.
         self.motor_replay: list[dict] = []
+
+        self.motor_trainer = GraftMotorTrainer(self.host, self.tokenizer, (self.feature_graft,))
 
         # Proceduralization (System 2 → System 1). The macro registry persists
         # compiled motifs across processes; the compiler runs on every DMN tick
@@ -3977,7 +4005,12 @@ class SubstrateController:
         config: DMNConfig | None = None,
     ) -> CognitiveBackgroundWorker:
         if self._background_worker is None:
-            self._background_worker = CognitiveBackgroundWorker(self, interval_s=interval_s, config=config)
+            self._background_worker = CognitiveBackgroundWorker(
+                self,
+                interval_s=interval_s,
+                config=config,
+                motor_trainer=self.motor_trainer,
+            )
         else:
             self._background_worker.interval_s = max(0.1, float(interval_s))
             if config is not None:
@@ -4176,14 +4209,29 @@ class SubstrateController:
         Retained for benchmark code that scores the substrate's ability to
         produce specific tokens. Conversational use should call
         :meth:`chat_reply` so the LLM speaks freely under soft graft bias.
+
+        Uses the same :meth:`_record_motor_replay` path as :meth:`chat_reply`
+        after decoding so REM trains the residual graft on lexical-plan emits.
         """
 
-        return generate_from_plan(
+        plan_words = frame.speech_plan()
+        broca_features = self.broca_features_from_frame(frame)
+        text_out, token_ids, inertia_tail = generate_from_plan(
             self.host,
             self.tokenizer,
-            frame.speech_plan(),
-            broca_features=self.broca_features_from_frame(frame),
+            plan_words,
+            broca_features=broca_features,
         )
+        confidence = max(0.0, min(1.0, float(frame.confidence)))
+        msgs = _motor_replay_messages_plan_forced(frame, plan_words)
+        self._record_motor_replay(
+            msgs,
+            generated_token_ids=token_ids,
+            broca_features=broca_features,
+            substrate_confidence=confidence,
+            substrate_inertia=inertia_tail,
+        )
+        return text_out
 
     def answer(self, utterance: str, *, max_new_tokens: int | None = None) -> tuple[CognitiveFrame, str]:
         """One-shot natural-language reply driven by substrate-biased decoding."""
@@ -4274,7 +4322,7 @@ class SubstrateController:
         except Exception:
             logger.exception("chat_reply: event publish failed")
 
-        text = self._stream_substrate_chat(
+        text, gen_ids, sub_inertia = self._stream_substrate_chat(
             msgs,
             broca_features=broca_features,
             logit_bias=logit_bias,
@@ -4285,6 +4333,13 @@ class SubstrateController:
             on_token=on_token,
             substrate_confidence=confidence,
             substrate_target_snr_scale=float(derived_scale),
+        )
+        self._record_motor_replay(
+            msgs,
+            generated_token_ids=gen_ids,
+            broca_features=broca_features,
+            substrate_confidence=confidence,
+            substrate_inertia=sub_inertia,
         )
         assistant_affect = self.affect_encoder.detect(text)
         if self._last_affect is None:
@@ -4428,6 +4483,35 @@ class SubstrateController:
         )
         return float(strength)
 
+    def _record_motor_replay(
+        self,
+        messages: Sequence[dict[str, str]],
+        *,
+        generated_token_ids: Sequence[int],
+        broca_features: torch.Tensor | None,
+        substrate_confidence: float,
+        substrate_inertia: float,
+    ) -> None:
+        """Append one training target for REM-time :class:`GraftMotorTrainer`."""
+
+        if len(generated_token_ids) == 0:
+            return
+        cap = DMNConfig().sleep_max_replay
+        snap = broca_features.detach().cpu().clone() if broca_features is not None else None
+
+        item: dict[str, Any] = {
+            "messages": [dict(m) for m in messages],
+            "speech_plan_tokens": torch.tensor(list(generated_token_ids), dtype=torch.long),
+            "substrate_confidence": float(substrate_confidence),
+            "substrate_inertia": float(substrate_inertia),
+        }
+        if snap is not None:
+            item["broca_features"] = snap
+        with self._cognitive_state_lock:
+            self.motor_replay.append(item)
+            if len(self.motor_replay) > cap:
+                self.motor_replay[:] = self.motor_replay[-cap:]
+
     def _stream_substrate_chat(
         self,
         messages: Sequence[dict[str, str]],
@@ -4441,7 +4525,7 @@ class SubstrateController:
         on_token: Callable[[str], None] | None,
         substrate_confidence: float = 1.0,
         substrate_target_snr_scale: float = 1.0,
-    ) -> str:
+    ) -> tuple[str, list[int], float]:
         hf_tok = getattr(self.tokenizer, "inner", None)
         if hf_tok is None or not callable(getattr(hf_tok, "apply_chat_template", None)):
             raise RuntimeError("chat_reply requires a HuggingFace chat-template tokenizer at .tokenizer.inner")
@@ -4533,4 +4617,5 @@ class SubstrateController:
                         on_token(piece)
         reply = hf_tok.decode(generated, skip_special_tokens=True, clean_up_tokenization_spaces=False)
         logger.debug("_stream_substrate_chat: emitted_tokens=%d reply_preview=%r", len(generated), reply[:200] if len(reply) > 200 else reply)
-        return reply
+        inertia_tail = math.log1p(float(len(current)))
+        return reply, generated, inertia_tail

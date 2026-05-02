@@ -15,7 +15,7 @@ This test asserts the new behavior, end to end:
   no broca features, no logit bias, the LLM speaks freely.
 
 We stub the actual encoder weights so the test stays fast — the *wiring* is
-what's under test, not GLiNER's classification accuracy.
+what's under test, not GLiClass or GLiNER2 model accuracy.
 """
 
 from __future__ import annotations
@@ -27,7 +27,7 @@ from typing import Sequence
 import pytest
 
 import core.cognition.substrate as substrate_mod
-from core.cognition.intent_gate import IntentGate
+from core.cognition.intent_gate import INTENT_LABELS, IntentGate
 from core.cognition.encoder_relation_extractor import EncoderRelationExtractor
 from core.cli import build_substrate_controller
 from core.cognition.substrate import SubstrateController
@@ -81,6 +81,11 @@ class StubExtractionEncoder:
         self._relations = relation_responses or {}
         self.classify_calls: list[str] = []
         self.relation_calls: list[str] = []
+        self.identity_calls: list[str] = []
+
+    def extract_identity_relations(self, text: str) -> list[ExtractedRelation]:
+        self.identity_calls.append(text)
+        return []
 
     def classify(
         self,
@@ -124,6 +129,27 @@ class StubAffectEncoder:
         return self._state
 
 
+class StubSemanticCascade:
+    def __init__(self, extraction: StubExtractionEncoder):
+        self.extraction = extraction
+
+    def intent_scores(self, text: str) -> dict:
+        ranked = self.extraction.classify(text, labels=INTENT_LABELS, multi_label=False, threshold=0.0)
+        if not ranked:
+            return {"label": "", "confidence": 0.0, "scores": {}, "evidence": {}}
+        scores = {label: 0.0 for label in INTENT_LABELS}
+        for label, score in ranked:
+            scores[label] = float(score)
+        top_label, top_score = ranked[0]
+        return {
+            "label": top_label,
+            "confidence": float(top_score),
+            "scores": scores,
+            "allows_storage": top_label == "statement",
+            "evidence": {"stub": True},
+        }
+
+
 class StubBackgroundWorker:
     running = True
 
@@ -153,7 +179,8 @@ def _wire_stubs(
     )
     mind.extraction_encoder = extraction  # type: ignore[assignment]
     mind.affect_encoder = StubAffectEncoder(affect or AffectState())  # type: ignore[assignment]
-    mind.intent_gate = IntentGate(extraction)  # type: ignore[arg-type]
+    mind.semantic_cascade = StubSemanticCascade(extraction)  # type: ignore[assignment]
+    mind.intent_gate = IntentGate(mind.semantic_cascade)  # type: ignore[arg-type]
     mind.router.extractor = EncoderRelationExtractor(
         intent_gate=mind.intent_gate,
         extraction=extraction,  # type: ignore[arg-type]
@@ -286,7 +313,7 @@ class TestStatementsStillFlowThrough:
         after = mind.memory.count()
         assert after > before, "statement must reach semantic memory"
 
-    def test_statement_relation_extraction_deferred_when_dmn_online(self, tmp_path: Path, fake_host_loader):
+    def test_statement_relation_extraction_stays_synchronous_when_dmn_online(self, tmp_path: Path, fake_host_loader):
         fake_host_loader()
         mind = _build_mind(tmp_path)
         stub = _wire_stubs(
@@ -303,17 +330,12 @@ class TestStatementsStillFlowThrough:
 
         frame = mind.comprehend("Ada lives in Rome")
 
-        assert frame.intent == "memory_ingest_pending"
-        assert mind.memory.count() == 0
-        assert stub.relation_calls == []
-        assert mind.deferred_relation_ingest_count() == 1
-        assert worker.notified is True
-
-        reflections = mind.process_deferred_relation_ingest()
-
-        assert reflections and reflections[0]["status"] == "memory_write"
+        assert frame.intent == "memory_write"
         assert stub.relation_calls == ["Ada lives in Rome"]
         assert mind.memory.count() == 1
+        assert mind.deferred_relation_ingest_count() == 0
+        assert worker.notified is False
+        assert worker.marked_active is True
 
 
 class TestPerceptionLeavesEvidenceTrace:

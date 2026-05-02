@@ -764,6 +764,21 @@ http = [
 ]
 
 [[package]]
+name = "gliclass"
+version = "0.1.17"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "numpy" },
+    { name = "scikit-learn" },
+    { name = "torch" },
+    { name = "transformers" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/f5/4d/a14af220823eccbd4f2edfff303b24f0e2acf1a0f4177318347bf0c8524e/gliclass-0.1.17.tar.gz", hash = "sha256:17d2ec477da2270337cad9d8ae4ae90b8c675d1bfed9c73bc77d44996d36b522", size = 47472, upload-time = "2026-04-30T14:35:58.46Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/52/3f/0b4e6253a14af7bd1e7306f0b1a8dc6af607caa4a9868015234ee94ad27c/gliclass-0.1.17-py3-none-any.whl", hash = "sha256:330c89e4fb39b50cc9c62d52c44dc7c5a13303883680706c71b598ecf88ab354", size = 48821, upload-time = "2026-04-30T14:35:57.003Z" },
+]
+
+[[package]]
 name = "gliner"
 version = "0.2.24"
 source = { registry = "https://pypi.org/simple" }
@@ -1381,6 +1396,7 @@ name = "mosaic"
 version = "0.5.0"
 source = { editable = "." }
 dependencies = [
+    { name = "gliclass" },
     { name = "gliner2" },
     { name = "msgpack" },
     { name = "numpy" },
@@ -1419,6 +1435,7 @@ tui = [
 requires-dist = [
     { name = "accelerate", marker = "extra == 'benchmark'", specifier = ">=1.13.0" },
     { name = "datasets", marker = "extra == 'benchmark'", specifier = ">=4.8.5" },
+    { name = "gliclass", specifier = ">=0.1.17" },
     { name = "gliner2" },
     { name = "lm-eval", marker = "extra == 'benchmark'", specifier = ">=0.4.11" },
     { name = "matplotlib", marker = "extra == 'benchmark'", specifier = ">=3.10.9" },

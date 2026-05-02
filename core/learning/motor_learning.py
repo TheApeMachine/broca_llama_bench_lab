@@ -54,7 +54,10 @@ def freeze_all_but(
     """
 
     keep = {id(p) for p in parameters_to_train}
-    for p in host_root.parameters():
+    params_fn = getattr(host_root, "parameters", None)
+    if not callable(params_fn):
+        return keep
+    for p in params_fn():
         p.requires_grad = id(p) in keep
     return keep
 
@@ -91,6 +94,10 @@ class GraftMotorTrainer:
         self.grafts = list(graft_modules)
         self.config = config or MotorLearningConfig()
         params = [p for graft in self.grafts for p in graft.parameters()]
+        if not params:
+            raise RuntimeError(
+                "GraftMotorTrainer requires graft_modules with at least one trainable parameter"
+            )
         freeze_all_but(parameters_to_train=params, host_root=self.host)
         self.params = params
         self.optimizer = torch.optim.AdamW(
@@ -119,7 +126,7 @@ class GraftMotorTrainer:
             raise RuntimeError(
                 "motor learning requires a chat-template tokenizer at .tokenizer.inner"
             )
-        device = next(self.host.parameters()).device
+        device = self.params[0].device
         prompt = hf_tok.apply_chat_template(
             list(messages), add_generation_prompt=True, return_tensors="pt"
         )
@@ -144,9 +151,7 @@ class GraftMotorTrainer:
         for graft in self.grafts:
             graft.train()
         self.optimizer.zero_grad(set_to_none=True)
-        total_loss = torch.zeros(
-            1, device=next(self.host.parameters()).device, dtype=torch.float32
-        )
+        total_loss = torch.zeros(1, device=self.params[0].device, dtype=torch.float32)
         contributions = 0
         for item in items[: self.config.max_replay_per_tick]:
             messages = item["messages"]

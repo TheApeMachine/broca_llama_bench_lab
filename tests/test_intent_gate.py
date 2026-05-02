@@ -8,15 +8,12 @@ confidence 0.92. The gate must cleanly partition utterances into actionable
 feedback / acknowledgment) categories so the relation extractor downstream
 never even sees the non-actionable ones.
 
-These tests use a stub classifier rather than the real GLiNER2 weights so the
-suite stays fast and the gate's *policy* — not the classifier's accuracy —
-is what is under test. A separate, slower test file exercises the actual
-:class:`ExtractionEncoder` ``classify`` call.
+These tests use a stub semantic cascade rather than real GLiClass/GLiNER2
+weights so the suite stays fast and the gate's *policy* — not model accuracy —
+is what is under test.
 """
 
 from __future__ import annotations
-
-from typing import Sequence
 
 import pytest
 
@@ -28,35 +25,49 @@ from core.cognition.intent_gate import (
 )
 
 
-class StubExtractionEncoder:
-    """Pretends to be an :class:`ExtractionEncoder` for the gate's purposes.
+class StubSemanticCascade:
+    """Pretends to be :class:`SemanticCascade` for the gate's purposes.
 
-    The gate only calls :meth:`classify` on the extraction encoder. The stub stores a
-    canned response per text fragment so each test can spell out exactly
-    what the classifier "sees" without any model weights.
+    The gate consumes already-collapsed semantic cascade output. These tests
+    verify gate policy around that output, not model accuracy.
     """
 
     def __init__(self, responses: dict[str, list[tuple[str, float]]]):
         self._responses = responses
-        self.calls: list[tuple[str, tuple[str, ...]]] = []
+        self.calls: list[str] = []
 
-    def classify(
-        self,
-        text: str,
-        *,
-        labels: Sequence[str],
-        multi_label: bool = True,
-        threshold: float = 0.0,
-    ) -> list[tuple[str, float]]:
-        self.calls.append((text, tuple(labels)))
+    def intent_scores(self, text: str) -> dict:
+        self.calls.append(text)
         for fragment, scores in self._responses.items():
             if fragment in text.lower():
-                return list(scores)
-        return [(labels[0], 0.0)]
+                return self._payload(scores)
+        return self._payload([("statement", 0.0)])
+
+    @staticmethod
+    def _payload(scores_in_order: list[tuple[str, float]]) -> dict:
+        if not scores_in_order:
+            return {
+                "label": "",
+                "confidence": 0.0,
+                "scores": {},
+                "allows_storage": False,
+                "evidence": {},
+            }
+        scores = {label: 0.0 for label in INTENT_LABELS}
+        for label, score in scores_in_order:
+            scores[label] = float(score)
+        label, confidence = scores_in_order[0]
+        return {
+            "label": label,
+            "confidence": float(confidence),
+            "scores": scores,
+            "allows_storage": label == "statement",
+            "evidence": {"stub": True},
+        }
 
 
 def _gate(responses: dict[str, list[tuple[str, float]]]) -> IntentGate:
-    return IntentGate(StubExtractionEncoder(responses))
+    return IntentGate(StubSemanticCascade(responses))
 
 
 class TestIntentClassification:
@@ -69,21 +80,30 @@ class TestIntentClassification:
         assert intent.is_actionable is False
         assert intent.allows_storage is False
 
-    def test_fast_request_does_not_invoke_extraction_encoder(self):
-        extraction = StubExtractionEncoder({})
-        gate = IntentGate(extraction)
+    def test_request_invokes_semantic_cascade(self):
+        cascade = StubSemanticCascade({
+            "tell me a joke": [("request", 0.91), ("statement", 0.04), ("question", 0.05)],
+        })
+        gate = IntentGate(cascade)
         intent = gate.classify("Tell me a joke")
         assert intent.label == "request"
-        assert extraction.calls == []
+        assert cascade.calls == ["Tell me a joke"]
 
     def test_declarative_text_still_invokes_extraction_encoder(self):
-        extraction = StubExtractionEncoder(
+        cascade = StubSemanticCascade(
             {"ada lives in rome": [("statement", 0.88), ("question", 0.07)]}
         )
-        gate = IntentGate(extraction)
+        gate = IntentGate(cascade)
         intent = gate.classify("Ada lives in Rome")
         assert intent.label == "statement"
-        assert extraction.calls == [("Ada lives in Rome", INTENT_LABELS)]
+        assert cascade.calls == ["Ada lives in Rome"]
+
+    def test_first_person_identity_is_model_backed_statement(self):
+        gate = _gate({"i am the magnificent": [("statement", 1.0), ("greeting", 0.2)]})
+        intent = gate.classify("I am the Magnificent")
+        assert intent.label == "statement"
+        assert intent.is_actionable is True
+        assert intent.allows_storage is True
 
     def test_statement_is_storable(self):
         gate = _gate({
@@ -125,15 +145,16 @@ class TestEdgeCases:
         intent = gate.classify("   \n\t  ")
         assert intent.is_actionable is False
 
-    def test_classifier_returning_no_results_falls_to_first_label(self):
-        gate = _gate({})  # no fragment matches → stub returns one (label, 0.0)
+    def test_classifier_returning_zero_confidence_keeps_zero_confidence(self):
+        gate = _gate({})  # no fragment matches -> stub returns one (label, 0.0)
         intent = gate.classify("totally unmatched text")
         assert intent.label in INTENT_LABELS
         assert intent.confidence == 0.0
-        # First label is "statement" by default — that's actionable, but the
-        # confidence is zero, which is the relevant signal for downstream
-        # derived strength.
-        assert intent.confidence == 0.0
+
+    def test_classifier_returning_no_valid_label_raises(self):
+        gate = IntentGate(StubSemanticCascade({"totally unmatched text": []}))
+        with pytest.raises(RuntimeError, match="unknown top label"):
+            gate.classify("totally unmatched text")
 
 
 class TestScoresAreAlwaysComplete:
@@ -159,27 +180,27 @@ class TestScoresAreAlwaysComplete:
 
 class TestConfigurationValidation:
     def test_actionable_labels_must_be_subset_of_labels(self):
-        extraction = StubExtractionEncoder({})
+        cascade = StubSemanticCascade({})
         with pytest.raises(ValueError, match="actionable_labels"):
             IntentGate(
-                extraction,
+                cascade,
                 labels=("statement", "question"),
                 actionable_labels=frozenset({"statement", "command"}),
             )
 
     def test_storable_labels_must_be_subset_of_labels(self):
-        extraction = StubExtractionEncoder({})
+        cascade = StubSemanticCascade({})
         with pytest.raises(ValueError, match="storable_labels"):
             IntentGate(
-                extraction,
+                cascade,
                 labels=("statement", "question"),
                 storable_labels=frozenset({"statement", "command"}),
             )
 
     def test_empty_labels_rejected(self):
-        extraction = StubExtractionEncoder({})
+        cascade = StubSemanticCascade({})
         with pytest.raises(ValueError, match="at least one label"):
-            IntentGate(extraction, labels=())
+            IntentGate(cascade, labels=())
 
 
 class TestActionableLabelsExportedConstant:
