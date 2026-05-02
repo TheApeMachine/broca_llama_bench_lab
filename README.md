@@ -7,7 +7,7 @@
 
 ---
 
-![Inforgraphic of MOSAIC architecture](inforgraphic.jpg)
+![Inforgraphic of MOSAIC architecture](infographic.jpg)
 
 ---
 
