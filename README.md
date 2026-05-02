@@ -5,7 +5,7 @@
 > lives in a persistent cognitive substrate that slips intelligent notes
 > through the vents of the residual stream.**
 
----
+![Inforgraphic of MOSAIC architecture](infographic.jpg)
 
 ## The thesis
 
