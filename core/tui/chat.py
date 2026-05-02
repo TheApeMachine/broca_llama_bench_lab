@@ -30,6 +30,11 @@ from .components import (
     _activity_line_log,
     _activity_line_self_improve_complete,
     _activity_line_self_improve_start,
+    _fmt_float,
+    _fmt_intent,
+    _frame_summary_lines,
+    _rich_yes_no_soft,
+    _rich_yes_no_strong,
 )
 from . import styles as tui_styles
 

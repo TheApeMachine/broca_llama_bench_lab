@@ -1,4 +1,4 @@
-"""Single top-level CLI: ``python -m core.main`` or the ``mosaic`` console script.
+"""Single top-level CLI: ``python -m core``, ``python -m core.main``, or ``mosaic``.
 
 Every subcommand uses the same documented runtime (environment variables,
 substrate DB path, model id resolution) via :mod:`core.cli` where a
