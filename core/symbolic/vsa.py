@@ -34,6 +34,17 @@ import torch.nn.functional as F
 
 logger = logging.getLogger(__name__)
 
+__all__ = [
+    "DEFAULT_VSA_DIM",
+    "VSACodebook",
+    "bind",
+    "bundle",
+    "cleanup",
+    "cosine",
+    "hypervector",
+    "permute",
+    "unbind",
+]
 
 DEFAULT_VSA_DIM = 10_000
 
@@ -114,16 +125,18 @@ def unbind(c: torch.Tensor, a: torch.Tensor) -> torch.Tensor:
             f"VSA unbind requires matching shapes, got {c.shape} vs {a.shape}"
         )
 
-    common = torch.promote_types(c.dtype, a.dtype)
-    compute_dtype = torch.promote_types(common, torch.float32)
-    
+    out_dtype = torch.promote_types(c.dtype, a.dtype)
+    compute_dtype = torch.promote_types(out_dtype, torch.float32)
+
     cc = c.to(compute_dtype)
     aa = a.to(compute_dtype)
     fc = torch.fft.rfft(cc)
     fa = torch.fft.rfft(aa)
     raw = torch.fft.irfft(fc * fa.conj(), n=c.shape[-1])
-    
-    return raw.to(dtype=c.dtype)
+
+    target_dtype = out_dtype if out_dtype.is_floating_point else compute_dtype
+
+    return raw.to(target_dtype)
 
 
 def bundle(vectors: Iterable[torch.Tensor], *, normalize: bool = True) -> torch.Tensor:
@@ -309,7 +322,7 @@ class VSACodebook:
         name, cos = cleanup(unbound, books)
         
         logger.debug(
-            "VSACodebook.decode_role: role=%s -> name=%r cos=%.4f candidates=%s",
+            "VSACodebook.decode_role: role=%s -> name=%r cos=%.4f candidate_count=%d",
             role,
             name,
             cos,

@@ -53,7 +53,7 @@ def snr_magnitude(
     return host_rms(x) * ts * float(max(0.0, confidence)) * float(max(0.0, inertia))
 
 
-def _state_confidence(state: dict) -> float:
+def state_confidence(state: dict) -> float:
     val = state.get("substrate_confidence")
     try:
         return float(val) if val is not None else 1.0
@@ -61,7 +61,7 @@ def _state_confidence(state: dict) -> float:
         return 1.0
 
 
-def _state_inertia(state: dict) -> float:
+def state_inertia(state: dict) -> float:
     val = state.get("substrate_inertia")
     try:
         return float(val) if val is not None else 1.0
@@ -283,8 +283,8 @@ class KVMemoryGraft(BaseGraft):
         mask = state.get("attention_mask")
         if mask is None:
             mask = torch.ones(bsz, seq_len, device=x.device, dtype=torch.bool)
-        confidence = _state_confidence(state)
-        inertia = _state_inertia(state)
+        confidence = state_confidence(state)
+        inertia = state_inertia(state)
         if self.query_mode == "token":
             host_at_query = x.reshape(-1, d_model)
             delta, weights, gate, manifold_dbg = self._retrieve(
@@ -466,8 +466,8 @@ class FeatureVectorGraft(BaseGraft):
         applies = _trigger_mask(state["token_ids"], self.trigger_ids)
         if not bool(applies.any()):
             return x
-        confidence = _state_confidence(state)
-        inertia = _state_inertia(state)
+        confidence = state_confidence(state)
+        inertia = state_inertia(state)
         last = _last_indices(state, x)
         rows = torch.arange(x.shape[0], device=x.device)[applies]
         last_apply = last[applies]
@@ -521,8 +521,8 @@ class TriggeredTokenDirectionGraft(BaseGraft):
         name = self.choose_name(state)
         if name is None or name not in self.token_by_name:
             return x
-        confidence = _state_confidence(state)
-        inertia = _state_inertia(state)
+        confidence = state_confidence(state)
+        inertia = state_inertia(state)
         out = x.clone()
         model = state["model"]
         tok_id = self.token_by_name[name]

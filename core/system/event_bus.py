@@ -70,7 +70,7 @@ class EventBus:
         with self._lock:
             entry = self._subs.get(sub_id)
             if entry is None:
-                return []
+                raise KeyError(sub_id)
             _, q = entry
             out = list(q)
             q.clear()
@@ -82,7 +82,7 @@ class EventBus:
         with self._lock:
             entry = self._subs.get(sub_id)
             if entry is None:
-                return []
+                raise KeyError(sub_id)
             _, q = entry
             return list(q)
 
@@ -134,7 +134,7 @@ def get_default_bus() -> EventBus:
         return _DEFAULT_BUS
 
 
-def reset_default_bus() -> None:
+def _reset_default_bus() -> None:
     """Test helper: drop the process-wide bus so the next call creates a fresh one."""
 
     global _DEFAULT_BUS

@@ -28,11 +28,14 @@ from ..natives.native_tools import SandboxResult, ToolSandbox, ToolSynthesisErro
 logger = logging.getLogger(__name__)
 
 _RUNNER_HEADER = """
+import asyncio
 import importlib.util
+import inspect
 import json
 import sys
 
-def _main():
+
+async def _main_async():
     spec = importlib.util.spec_from_file_location("tool_impl", "/work/tool_impl.py")
     mod = importlib.util.module_from_spec(spec)
     assert spec.loader is not None
@@ -41,8 +44,14 @@ def _main():
     raw = sys.stdin.read() or "{{}}"
     vals = json.loads(raw)
     out = fn(vals)
+    if inspect.isawaitable(out):
+        out = await out
     json.dump({{"ok": True, "result": out}}, sys.stdout, default=str)
     sys.stdout.write("\\n")
+
+
+def _main():
+    asyncio.run(_main_async())
 
 if __name__ == "__main__":
     _main()
@@ -104,7 +113,10 @@ class DockerToolSandbox(ToolSandbox):
         self.network = network or os.environ.get("BROCA_TOOL_DOCKER_NETWORK", "none").strip()
         self.memory = memory or os.environ.get("BROCA_TOOL_DOCKER_MEMORY", "512m").strip()
         self.cpus = cpus or os.environ.get("BROCA_TOOL_DOCKER_CPUS", "1.0").strip()
-        self.timeout_s = float(timeout_s or os.environ.get("BROCA_TOOL_TIMEOUT_S", "30"))
+        if timeout_s is None:
+            self.timeout_s = float(os.environ.get("BROCA_TOOL_TIMEOUT_S", "30"))
+        else:
+            self.timeout_s = float(timeout_s)
 
     def compile(self, source: str, function_name: str) -> SandboxResult:
         if self.docker_binary is None:
@@ -163,6 +175,15 @@ def _docker_invoke(
             "run",
             "--rm",
             "-i",
+            "--read-only",
+            "--tmpfs",
+            "/tmp:rw,nosuid,size=64m",
+            "--pids-limit",
+            "64",
+            "--security-opt",
+            "no-new-privileges:true",
+            "--user",
+            "1000:1000",
             "--network",
             network,
             "--memory",

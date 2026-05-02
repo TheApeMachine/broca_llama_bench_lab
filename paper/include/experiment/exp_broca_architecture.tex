@@ -22,5 +22,4 @@ $\Delta$ (Broca $-$ baseline) & $0.000$ & $0.000$ \\
 \paragraph{Results.}
 Table~\ref{tab:broca-arch-probes} compares the bare frozen language host (\texttt{meta-llama/Llama-3.2-1B-Instruct}) against the full Broca architecture on 2 scripted evaluation cases spanning semantic memory recall, active-inference action selection, and causal intervention queries. 
 Under this snapshot, \emph{both} conditions obtain 0.0\% speech-exact accuracy and 0.0\% answer-present accuracy ($\Delta = 0.000$ speech-exact; $\Delta = 0.000$ answer-present), i.e., neither arm satisfied the scripted scoring criteria on these probes. This invites debugging (prompt formatting vs.\ reference strings, tokenizer alignment, or harness drift) rather than treating the tied zeros as comparable competence. 
-Answer-present accuracy (a relaxed metric accepting any output that contains the correct content word) tracks baseline 0.0\% vs.\ enhanced 0.0\% ($\Delta = 0.000$). 
 

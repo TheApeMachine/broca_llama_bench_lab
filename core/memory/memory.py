@@ -70,7 +70,15 @@ class SQLiteActivationMemory:
 
     def _connect(self) -> sqlite3.Connection:
         con = sqlite3.connect(self.path, timeout=5.0)
-        con.execute("PRAGMA journal_mode=WAL")
+        row = con.execute("PRAGMA journal_mode=WAL").fetchone()
+        mode_raw = row[0] if row else None
+        mode = str(mode_raw).lower() if mode_raw is not None else ""
+        if mode != "wal":
+            logger.warning(
+                "SQLiteActivationMemory(%s): expected journal_mode wal, got %r",
+                self.path,
+                mode_raw,
+            )
         return con
 
     def _init_schema(self) -> None:

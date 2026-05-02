@@ -64,8 +64,8 @@ def _touch_canonical_substrate_sqlite_early(*, model_id: str) -> None:
         return
     p = default_substrate_sqlite_path()
     ensure_parent_dir(p)
-    con = sqlite3.connect(str(p))
-    con.close()
+    with sqlite3.connect(str(p)) as con:
+        pass
 
 
 LM_EVAL_PRESETS: dict[str, dict[str, str | None]] = {
@@ -425,11 +425,16 @@ def main(argv: Sequence[str] | None = None) -> None:
     manifest_dir = run_root
 
     if BENCHMARK_ENGINE in {"native", "both"}:
-        preset = (
-            BENCHMARK_NATIVE_PRESET
-            if BENCHMARK_NATIVE_PRESET in DEFAULT_NATIVE_PRESETS
-            else "quick"
-        )
+        if BENCHMARK_NATIVE_PRESET in DEFAULT_NATIVE_PRESETS:
+            preset = BENCHMARK_NATIVE_PRESET
+        else:
+            logger.warning(
+                "Unknown BENCHMARK_NATIVE_PRESET=%r; falling back to %r. Allowed: %s.",
+                BENCHMARK_NATIVE_PRESET,
+                "quick",
+                sorted(DEFAULT_NATIVE_PRESETS),
+            )
+            preset = "quick"
         tasks = resolve_task_names("", preset=preset)
         print("\n--- Native HuggingFace-datasets benchmark ---", flush=True)
         print(
@@ -454,7 +459,16 @@ def main(argv: Sequence[str] | None = None) -> None:
         )
 
     if BENCHMARK_ENGINE in {"lm-eval", "both"}:
-        lm_preset = BENCHMARK_LM_EVAL_PRESET if BENCHMARK_LM_EVAL_PRESET in LM_EVAL_PRESETS else "quick"
+        if BENCHMARK_LM_EVAL_PRESET in LM_EVAL_PRESETS:
+            lm_preset = BENCHMARK_LM_EVAL_PRESET
+        else:
+            logger.warning(
+                "Unknown BENCHMARK_LM_EVAL_PRESET=%r; falling back to %r. Allowed: %s.",
+                BENCHMARK_LM_EVAL_PRESET,
+                "quick",
+                sorted(LM_EVAL_PRESETS),
+            )
+            lm_preset = "quick"
         code, lm_dir = run_lm_eval_harness(
             model_id=model_id,
             preset=lm_preset,

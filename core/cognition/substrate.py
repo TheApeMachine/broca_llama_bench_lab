@@ -66,7 +66,7 @@ from ..frame.continuous_frame import (
     stable_sketch,
 )
 from ..system.device import pick_torch_device
-from ..grafting.grafts import BaseGraft, DEFAULT_GRAFT_TARGET_SNR, snr_magnitude, _state_confidence, _state_inertia
+from ..grafting.grafts import BaseGraft, DEFAULT_GRAFT_TARGET_SNR, snr_magnitude, state_confidence, state_inertia
 from ..host.hf_tokenizer_compat import HuggingFaceBrocaTokenizer
 from ..substrate.runtime import default_substrate_sqlite_path, ensure_parent_dir
 from ..host.llama_broca_host import LlamaBrocaHost, load_llama_broca_host
@@ -324,7 +324,7 @@ class LLMRelationExtractor(RelationExtractor):
         key = (utterance.strip(), variant)
 
         if key in self._cache:
-            logger.debug(f"_llm_extract: cache hit variant=%s", variant)
+            logger.debug("_llm_extract: cache hit variant=%s", variant)
             return self._cache[key]
 
         result = self._llm_extract_uncached(utterance.strip(), variant=variant)
@@ -623,7 +623,7 @@ class PersistentSemanticMemory:
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.namespace = namespace
-        self._sqlite_lock = threading.Lock()
+        self._sqlite_lock = threading.RLock()
         self._conn: sqlite3.Connection | None = None
         self._init_schema()
 
@@ -900,61 +900,61 @@ class PersistentSemanticMemory:
         log_odds_threshold: float = BELIEF_REVISION_LOG_ODDS_THRESHOLD,
         min_claims: int = BELIEF_REVISION_MIN_CLAIMS,
     ) -> list[dict]:
-        claims = self.claims()
-        grouped: dict[tuple[str, str], list[dict]] = {}
-        for claim in claims:
-            grouped.setdefault((claim["subject"], claim["predicate"]), []).append(claim)
+        with self._sqlite_lock:
+            claims = self.claims()
+            grouped: dict[tuple[str, str], list[dict]] = {}
+            for claim in claims:
+                grouped.setdefault((claim["subject"], claim["predicate"]), []).append(claim)
 
-        gap_stats = _gap_population_stats(claims)
-        reflections: list[dict] = []
-        for (subject, predicate), rows in grouped.items():
-            if len({r["object"] for r in rows}) < 2:
-                continue
-            support: dict[str, dict[str, Any]] = {}
-            for row in rows:
-                entry = support.setdefault(row["object"], {"score": 0.0, "count": 0, "claim_ids": [], "trust_weights": []})
-                trust = _claim_trust_weight(row, gap_stats=gap_stats)
-                entry["score"] += float(row["confidence"]) * trust
-                entry["count"] += 1
-                entry["claim_ids"].append(int(row["id"]))
-                entry["trust_weights"].append(float(trust))
+            gap_stats = _gap_population_stats(claims)
+            reflections: list[dict] = []
+            for (subject, predicate), rows in grouped.items():
+                if len({r["object"] for r in rows}) < 2:
+                    continue
+                support: dict[str, dict[str, Any]] = {}
+                for row in rows:
+                    entry = support.setdefault(row["object"], {"score": 0.0, "count": 0, "claim_ids": [], "trust_weights": []})
+                    trust = _claim_trust_weight(row, gap_stats=gap_stats)
+                    entry["score"] += float(row["confidence"]) * trust
+                    entry["count"] += 1
+                    entry["claim_ids"].append(int(row["id"]))
+                    entry["trust_weights"].append(float(trust))
 
-            current = self.get(subject, predicate)
-            current_obj = current[0] if current is not None else ""
-            current_score = float(support.get(current_obj, {}).get("score", 0.0))
-            best_obj, best = max(support.items(), key=lambda item: (float(item[1]["score"]), int(item[1]["count"])))
-            best_score = float(best["score"])
-            best_count = int(best["count"])
-            # Log-odds of the candidate vs. the current belief, in nats. With
-            # adversarial high-surprise claims the candidate's score collapses
-            # under the EMA Z-score Bayes factor, so the log-odds stay
-            # negative; with low-surprise corroborating evidence the candidate
-            # accumulates above the threshold.
-            log_odds = math.log(max(best_score, 1e-12)) - math.log(max(current_score, 1e-12))
-            evidence = {
-                "support": support,
-                "current_object": current_obj,
-                "candidate_object": best_obj,
-                "log_odds": float(log_odds),
-                "log_odds_threshold": float(log_odds_threshold),
-                "min_claims": int(min_claims),
-                "gap_stats": (
-                    {"mu": float(gap_stats[0]), "sigma": float(gap_stats[1])} if gap_stats else None
-                ),
-                "instrument": "background_claim_consolidation",
-            }
+                current = self.get(subject, predicate)
+                current_obj = current[0] if current is not None else ""
+                current_score = float(support.get(current_obj, {}).get("score", 0.0))
+                best_obj, best = max(support.items(), key=lambda item: (float(item[1]["score"]), int(item[1]["count"])))
+                best_score = float(best["score"])
+                best_count = int(best["count"])
+                # Log-odds of the candidate vs. the current belief, in nats. With
+                # adversarial high-surprise claims the candidate's score collapses
+                # under the EMA Z-score Bayes factor, so the log-odds stay
+                # negative; with low-surprise corroborating evidence the candidate
+                # accumulates above the threshold.
+                log_odds = math.log(max(best_score, 1e-12)) - math.log(max(current_score, 1e-12))
+                evidence = {
+                    "support": support,
+                    "current_object": current_obj,
+                    "candidate_object": best_obj,
+                    "log_odds": float(log_odds),
+                    "log_odds_threshold": float(log_odds_threshold),
+                    "min_claims": int(min_claims),
+                    "gap_stats": (
+                        {"mu": float(gap_stats[0]), "sigma": float(gap_stats[1])} if gap_stats else None
+                    ),
+                    "instrument": "background_claim_consolidation",
+                }
 
-            if (
-                current_obj
-                and best_obj != current_obj
-                and best_count >= int(min_claims)
-                and log_odds >= float(log_odds_threshold)
-            ):
-                claim_ids_digest = hashlib.sha256(
-                    json.dumps(sorted(int(i) for i in best["claim_ids"]), separators=(",", ":")).encode()
-                ).hexdigest()
-                dedupe = f"belief_revision:{subject}:{predicate}:{current_obj}->{best_obj}:{claim_ids_digest}"
-                with self._sqlite_lock:
+                if (
+                    current_obj
+                    and best_obj != current_obj
+                    and best_count >= int(min_claims)
+                    and log_odds >= float(log_odds_threshold)
+                ):
+                    claim_ids_digest = hashlib.sha256(
+                        json.dumps(sorted(int(i) for i in best["claim_ids"]), separators=(",", ":")).encode()
+                    ).hexdigest()
+                    dedupe = f"belief_revision:{subject}:{predicate}:{current_obj}->{best_obj}:{claim_ids_digest}"
                     con = self._ensure_conn()
                     if con.in_transaction:
                         con.rollback()
@@ -991,26 +991,26 @@ class PersistentSemanticMemory:
                     except Exception:
                         con.rollback()
                         raise
-            else:
-                dedupe = f"belief_conflict:{subject}:{predicate}:{','.join(str(r['id']) for r in rows)}"
-                reflection_id = self.record_reflection(
-                    "belief_conflict",
-                    subject,
-                    predicate,
-                    f"unresolved conflict over {subject}.{predicate}",
-                    evidence,
-                    dedupe_key=dedupe,
-                )
-                if reflection_id is not None:
-                    reflections.append({"id": reflection_id, "kind": "belief_conflict", **evidence})
-                    logger.debug(
-                        "consolidate_claims_once: belief_conflict reflection_id=%s %s.%s (unresolved)",
-                        reflection_id,
+                else:
+                    dedupe = f"belief_conflict:{subject}:{predicate}:{','.join(str(r['id']) for r in rows)}"
+                    reflection_id = self.record_reflection(
+                        "belief_conflict",
                         subject,
                         predicate,
+                        f"unresolved conflict over {subject}.{predicate}",
+                        evidence,
+                        dedupe_key=dedupe,
                     )
-        logger.debug("consolidate_claims_once: reflections_emitted=%d", len(reflections))
-        return reflections
+                    if reflection_id is not None:
+                        reflections.append({"id": reflection_id, "kind": "belief_conflict", **evidence})
+                        logger.debug(
+                            "consolidate_claims_once: belief_conflict reflection_id=%s %s.%s (unresolved)",
+                            reflection_id,
+                            subject,
+                            predicate,
+                        )
+            logger.debug("consolidate_claims_once: reflections_emitted=%d", len(reflections))
+            return reflections
 
     def observe_claim(self, subject: str, predicate: str, obj: str, *, confidence: float = 1.0, evidence: dict | None = None) -> dict:
         subj = subject.lower()
@@ -1820,14 +1820,10 @@ class CognitiveBackgroundWorker:
     def _phase2_separation(self) -> tuple[list[dict], dict[str, Any]]:
         cfg = self.config
         memory = self.mind.memory
-        # Clear any prior DMN-flagged ambiguity cues so we don't accumulate stale ones across ticks.
         ws = self.mind.workspace
-        ws.intrinsic_cues = [
-            c for c in ws.intrinsic_cues if not (c.faculty == "entity_ambiguity" and getattr(c, "source", None) == "dmn")
-        ]
-
         pairs = memory.overlapping_subject_pairs(min_shared=cfg.overlap_min_shared)
         emitted: list[dict[str, Any]] = []
+        new_cues: list[IntrinsicCue] = []
         for pair in pairs[: max(0, cfg.overlap_max_cues)]:
             ratio = float(pair["overlap_ratio"])
             if ratio < cfg.overlap_ratio_floor:
@@ -1847,7 +1843,7 @@ class CognitiveBackgroundWorker:
                 "ambiguity_nats": float(ambiguity),
                 "shared_predicates": [list(t) for t in pair["shared"]],
             }
-            ws.intrinsic_cues.append(
+            new_cues.append(
                 IntrinsicCue(urgency=urgency, faculty="entity_ambiguity", evidence=cue_evidence, source="dmn")
             )
             emitted.append(cue_evidence | {"urgency": urgency})
@@ -1859,6 +1855,12 @@ class CognitiveBackgroundWorker:
                 ambiguity,
                 urgency,
             )
+
+        with self.mind._cognitive_state_lock:
+            ws.intrinsic_cues = [
+                c for c in ws.intrinsic_cues if not (c.faculty == "entity_ambiguity" and getattr(c, "source", None) == "dmn")
+            ]
+            ws.intrinsic_cues.extend(new_cues)
 
         reflections: list[dict] = []
         if emitted:
@@ -2198,11 +2200,12 @@ class CognitiveBackgroundWorker:
                 logger.exception("REM.hawkes: EM fit failed")
                 mu, alpha = None, None
             if mu is not None and alpha is not None:
-                self.mind.hawkes.refit(channels, mu, alpha)
-                try:
-                    self.mind.hawkes_persistence.save(self.mind.hawkes)
-                except Exception:
-                    logger.exception("REM.hawkes: persistence save failed")
+                with self.mind._cognitive_state_lock:
+                    self.mind.hawkes.refit(channels, mu, alpha)
+                    try:
+                        self.mind.hawkes_persistence.save(self.mind.hawkes)
+                    except Exception:
+                        logger.exception("REM.hawkes: persistence save failed")
                 hawkes_summary = {
                     "ran": True,
                     "channels": channels,
@@ -2325,12 +2328,17 @@ class LexicalPlanGraft(BaseGraft):
         step = step.to(x.device).long().view(-1)
         step = step.clamp_min(0).clamp_max(plan.shape[1] - 1)
         target_ids = plan[torch.arange(x.shape[0], device=x.device), step]
-        directions = F.normalize(state["model"].lm_head.weight[target_ids].detach().to(x.device, x.dtype), dim=-1)
-        last = state["last_indices"].to(x.device)
+        host_model = state.get("model")
+        last_raw = state.get("last_indices")
+        if host_model is None or last_raw is None:
+            missing = [k for k, v in (("model", host_model), ("last_indices", last_raw)) if v is None]
+            raise ValueError(f"LexicalPlanGraft.forward: missing required state key(s): {', '.join(missing)}")
+        directions = F.normalize(host_model.lm_head.weight[target_ids].detach().to(x.device, x.dtype), dim=-1)
+        last = last_raw.to(x.device)
         rows = torch.arange(x.shape[0], device=x.device)
         host_at_last = x[rows, last]
-        confidence = _state_confidence(state)
-        inertia = _state_inertia(state)
+        confidence = state_confidence(state)
+        inertia = state_inertia(state)
         magnitude = snr_magnitude(host_at_last, target_snr=self.target_snr, confidence=confidence, inertia=inertia)
         out = x.clone()
         out[rows, last] += directions * magnitude
@@ -2382,12 +2390,15 @@ class TrainableFeatureGraft(BaseGraft):
             step = torch.full((x.shape[0],), int(step), device=x.device, dtype=torch.long)
         step = step.to(x.device).long().view(-1).clamp(0, self.max_steps - 1)
         z = torch.cat([self.norm(feats), self.step_emb(step).to(device=x.device, dtype=param_dtype)], dim=-1)
-        last = state["last_indices"].to(x.device)
+        last_raw = state.get("last_indices")
+        if last_raw is None:
+            raise ValueError("TrainableFeatureGraft.forward: missing required state key 'last_indices'")
+        last = last_raw.to(x.device)
         rows = torch.arange(x.shape[0], device=x.device)
         host_at_last = x[rows, last]
         direction = F.normalize(self.net(z).to(device=x.device, dtype=x.dtype), dim=-1)
-        confidence = _state_confidence(state)
-        inertia = _state_inertia(state)
+        confidence = state_confidence(state)
+        inertia = state_inertia(state)
         magnitude = snr_magnitude(host_at_last, target_snr=self.target_snr, confidence=confidence, inertia=inertia)
         out = x.clone()
         out[rows, last] += direction * magnitude
@@ -2443,16 +2454,19 @@ class SubstrateLogitBiasGraft(BaseGraft):
         if decay <= 0.0:
             return x
 
-        confidence = float(_state_confidence(state))
+        confidence = float(state_confidence(state))
         confidence = max(0.0, min(1.0, confidence))
-        inertia = float(_state_inertia(state))
+        inertia = float(state_inertia(state))
         small_inertia = 1e-6
         inertia = max(inertia, small_inertia)
 
-        out = x.clone()
-        last = state["last_indices"].to(x.device)
+        last_raw = state.get("last_indices")
+        if last_raw is None:
+            raise ValueError("SubstrateLogitBiasGraft.forward: missing required state key 'last_indices'")
+        last = last_raw.to(x.device)
         rows = torch.arange(x.shape[0], device=x.device)
 
+        out = x.clone()
         last_logits = out[rows, last].float()                           # [B, V]
         max_logit = last_logits.max(dim=-1, keepdim=True).values         # [B, 1]
         log_probs = F.log_softmax(last_logits, dim=-1)

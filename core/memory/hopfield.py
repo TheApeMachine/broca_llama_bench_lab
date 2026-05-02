@@ -38,11 +38,13 @@ def derived_inverse_temperature(keys: torch.Tensor) -> float:
     """β = √d / σ — the paper's recommendation for separability under noise.
 
     Falls back to ``√d`` (i.e., σ = 1) when the store is too small or too
-    uniform to estimate a meaningful spread.
+    uniform to estimate a meaningful spread. Uses ``√512`` when there are no
+    keys so the returned scale stays on the usual ``√d`` order of magnitude.
     """
 
     if keys.numel() == 0:
-        return 1.0
+        default_dim = 512
+        return math.sqrt(default_dim)
     d = float(keys.shape[-1])
     flat = keys.reshape(-1, keys.shape[-1])
     if flat.shape[0] < 2:
@@ -61,8 +63,13 @@ def hopfield_update(
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """One-shot (or iterated) Modern Continuous Hopfield retrieval.
 
-    Returns ``(retrieved_value, attention_weights, energy)``. ``query`` and the
-    rows of ``keys`` / ``values`` must share the last dim. With β large enough
+    Returns ``(retrieved_value, attention_weights, energy)``.
+    Rows of ``keys`` and the trailing dimension of ``query`` agree (affinity is
+    ``keys @ query`` flattened to length ``keys.shape[-1]``).
+    Rows of ``values`` are softmax-weighted and contracted into the working
+    state, which is then reshaped to ``query``'s layout each iteration — so for
+    typical vector queries ``values.shape[-1]`` must match ``query.shape[-1]``.
+    With β large enough,
     the attention collapses onto a single pattern; with smaller β it returns a
     weighted mixture (which is what the substrate wants when more than one
     memory is genuinely relevant).
@@ -75,10 +82,6 @@ def hopfield_update(
     if keys.shape[-1] != query.shape[-1]:
         raise ValueError(
             f"keys and query disagree on d: {keys.shape[-1]} vs {query.shape[-1]}"
-        )
-    if values.shape[-1] != query.shape[-1]:
-        raise ValueError(
-            f"values and query disagree on d: {values.shape[-1]} vs {query.shape[-1]}"
         )
     if beta is None:
         beta = derived_inverse_temperature(keys)
@@ -114,9 +117,13 @@ class HopfieldAssociativeMemory:
     """Persistent associative memory with Hopfield-style retrieval.
 
     Stored as a pair of tensors so the substrate can serialize and reload the
-    state across runs. Adds rows are appended (older rows aren't forgotten —
-    that's the DMN's job); duplicate keys collapse on cosine cleanup at query
-    time without distorting the energy basin.
+    state across runs. Retrieval uses Modern Hopfield contraction
+    (:func:`hopfield_update`), which mixes ``values`` rows in value space and
+    reshapes back to ``query``; keep ``keys`` and ``query`` aligned on embedding
+    width and ``values`` consistent with ``query`` for the chosen layout.
+    Adds rows are appended (older rows aren't forgotten — that's the DMN's
+    job); duplicate keys collapse on cosine cleanup at query time without
+    distorting the energy basin.
     """
 
     def __init__(
@@ -159,8 +166,9 @@ class HopfieldAssociativeMemory:
         """Chronological keys/values; caller must hold ``_lock``."""
 
         if self._count == 0:
-            z = torch.empty(0, self.d_model, dtype=self.dtype, device=self.device)
-            return z, z
+            z_k = torch.empty(0, self.d_model, dtype=self.dtype, device=self.device)
+            z_v = torch.empty(0, self.d_model, dtype=self.dtype, device=self.device)
+            return z_k, z_v
         if self._count < self.max_items:
             return self._buf_keys[: self._count], self._buf_values[: self._count]
         wp = self._write_pos
@@ -203,6 +211,10 @@ class HopfieldAssociativeMemory:
         if k.shape[0] != v.shape[0]:
             raise ValueError(f"key/value count mismatch: {k.shape[0]} vs {v.shape[0]}")
         b = int(k.shape[0])
+        if b > self.max_items:
+            k = k[-self.max_items :]
+            v = v[-self.max_items :]
+            b = int(k.shape[0])
         md = dict(metadata or {})
         with self._lock:
             start = self._write_pos

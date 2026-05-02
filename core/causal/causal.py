@@ -12,6 +12,12 @@ from .equation import EndogenousEquation
 
 _EPS = 1e-12
 
+# Initialization budgets for evidence-consistent exogenous state search (rejection + local search).
+_INIT_CAP_DOMAIN_MULTIPLIER = 32  # Extra headroom on top of total_mass * exo_n so wide domains get enough tries.
+_INIT_REJECTION_EXO_DIVISOR_FALLBACK = 4  # Lower bound for dividing cap by exo_n when carving out the rejection slice.
+_INIT_RESTART_SLS_DIVISOR_BASE = 16  # WalkSAT restart cadence scales as sls_budget / max(this, exo_n * scale).
+_INIT_RESTART_EXO_SCALE = 2  # Per-exogenous factor in restart denominator so more roots restart slightly more often.
+
 logger = logging.getLogger(__name__)
 
 
@@ -63,7 +69,11 @@ class FiniteSCM:
         scm.add_endogenous("T", [0, 1], ["S", "U_T"], t_fn)
         scm.add_endogenous("Y", [0, 1], ["S", "T", "U_Y"], y_fn)
 
-        logger.debug("FiniteSCM.simpson_paradox_demo: enumerate_worlds=%d vars=%s", scm.exogenous_world_volume, scm.order)
+        logger.debug(
+            "FiniteSCM.simpson_paradox_demo: enumerate_worlds=%d vars=%s",
+            scm.exogenous_world_volume,
+            scm.order,
+        )
 
         return scm
 
@@ -97,7 +107,11 @@ class FiniteSCM:
         scm.add_endogenous("M", [0, 1], ["X", "U_M"], m_fn)
         scm.add_endogenous("Y", [0, 1], ["M", "U", "U_Y"], y_fn)
 
-        logger.debug("FiniteSCM.frontdoor_demo: enumerate_worlds=%d vars=%s", scm.exogenous_world_volume, scm.order)
+        logger.debug(
+            "FiniteSCM.frontdoor_demo: enumerate_worlds=%d vars=%s",
+            scm.exogenous_world_volume,
+            scm.order,
+        )
 
         return scm
 
@@ -107,8 +121,12 @@ class FiniteSCM:
         if len(dom) == 0:
             raise ValueError(f"FiniteSCM.add_exogenous_uniform: empty domain for {name!r}")
 
-        probs = {x: 1.0 / len(dom) for x in dom}
-        self._install_exogenous(name, dom, probs)
+        if len(set(dom)) != len(dom):
+            raise ValueError(f"FiniteSCM.add_exogenous_uniform: domain for {name!r} contains duplicates")
+
+        dom_unique = tuple(dict.fromkeys(dom))
+        probs = {x: 1.0 / len(dom_unique) for x in dom_unique}
+        self._install_exogenous(name, dom_unique, probs)
 
     def add_exogenous(self, name: str, domain: Sequence[object], probs: Mapping[object, float]) -> None:
         dom = tuple(domain)
@@ -134,7 +152,21 @@ class FiniteSCM:
         self.domains[name] = dom
         self.exogenous[name] = probs
 
-    def add_endogenous(self, name: str, domain: Sequence, parents: Sequence[str], fn: Callable[[dict], object]) -> None:
+    def add_endogenous(
+        self, 
+        name: str, 
+        domain: Sequence, 
+        parents: Sequence[str], 
+        fn: Callable[[dict], object]
+    ) -> None:
+        missing = [str(p) for p in parents if str(p) not in self.domains]
+
+        if missing:
+            raise ValueError(
+                f"FiniteSCM.add_endogenous: unknown parent variable(s) {missing} for endogenous {name!r}; "
+                "define each parent with add_exogenous / add_endogenous before adding this variable."
+            )
+        
         self.domains[name] = tuple(domain)
         self.equations[name] = EndogenousEquation(name, tuple(parents), fn)
         self.order.append(name)
@@ -148,7 +180,9 @@ class FiniteSCM:
         parents: Sequence[str] | None = None,
     ) -> None:
         if name not in self.equations:
-            raise ValueError(f"FiniteSCM.update_endogenous: unknown endogenous variable {name!r}")
+            raise ValueError(
+                f"FiniteSCM.update_endogenous: unknown endogenous variable {name!r}"
+            )
 
         cur = self.equations[name]
         new_parents = tuple(parents) if parents is not None else cur.parents
@@ -211,10 +245,14 @@ class FiniteSCM:
         return world
 
     @staticmethod
-    def _valuation_matches(vals: Mapping[str, object], assignment: Mapping[str, object]) -> bool:
+    def _valuation_matches(
+        vals: Mapping[str, object], assignment: Mapping[str, object]
+    ) -> bool:
         return all(vals.get(k) == v for k, v in assignment.items())
 
-    def evaluate_world(self, exo: Mapping[str, object], interventions: Mapping[str, object]) -> dict[str, object]:
+    def evaluate_world(
+        self, exo: Mapping[str, object], interventions: Mapping[str, object]
+    ) -> dict[str, object]:
         values = dict(exo)
 
         for name in self.order:
@@ -225,7 +263,9 @@ class FiniteSCM:
                 values[name] = self.equations[name].fn(values)
 
             if values[name] not in self.domains[name]:
-                raise ValueError(f"{name} returned value {values[name]!r}, outside domain {self.domains[name]!r}")
+                raise ValueError(
+                    f"{name} returned value {values[name]!r}, outside domain {self.domains[name]!r}"
+                )
 
         return values
 
@@ -347,6 +387,7 @@ class FiniteSCM:
         interventions: Mapping[str, object],
         n_samples: int,
         seed: int,
+        gibbs_thin: int = 1,
     ) -> float:
         return self.counterfactual_probability_monte_carlo(
             query_event,
@@ -354,6 +395,7 @@ class FiniteSCM:
             interventions=interventions,
             n_samples=int(n_samples),
             seed=int(seed),
+            gibbs_thin=int(gibbs_thin),
         )
 
     def counterfactual_probability_exact(
@@ -394,6 +436,7 @@ class FiniteSCM:
         interventions: Mapping[str, object],
         n_samples: int,
         seed: int,
+        gibbs_thin: int = 1,
     ) -> float:
         rng = random.Random(int(seed))
         evidence_d = dict(evidence)
@@ -402,6 +445,9 @@ class FiniteSCM:
 
         if n_samples <= 0:
             raise ValueError("FiniteSCM.counterfactual_probability_monte_carlo: n_samples must be positive")
+
+        if gibbs_thin < 1:
+            raise ValueError("FiniteSCM.counterfactual_probability_monte_carlo: gibbs_thin must be >= 1")
 
         if not exo_names:
             actual = self.evaluate_world({}, {})
@@ -431,10 +477,12 @@ class FiniteSCM:
                 state = self._gibbs_resample(rng, name, state, evidence_d)
 
         num = 0
+        thin = int(gibbs_thin)
 
         for _ in range(int(n_samples)):
-            name = rng.choice(exo_names)
-            state = self._gibbs_resample(rng, name, state, evidence_d)
+            for _ in range(thin):
+                name = rng.choice(exo_names)
+                state = self._gibbs_resample(rng, name, state, evidence_d)
             cf = self.evaluate_world(state, interventions)
 
             if self._valuation_matches(cf, query_event_d):
@@ -476,9 +524,10 @@ class FiniteSCM:
 
         return new_state
 
-    def _evidence_violations(self, state: Mapping[str, object], evidence_d: Mapping[str, object]) -> int:
+    def _evidence_violations(
+        self, state: Mapping[str, object], evidence_d: Mapping[str, object]
+    ) -> int:
         actual = self.evaluate_world(dict(state), {})
-
         return sum(1 for k, v in evidence_d.items() if actual.get(k) != v)
 
     def _initialization_budgets(self) -> tuple[int, int, int, float]:
@@ -488,10 +537,10 @@ class FiniteSCM:
         exo_n = len(exo_names)
         domain_total = sum(len(self.exogenous[n]) for n in exo_names) or 1
         total_mass = domain_total * max(exo_n, 1)
-        cap = max(total_mass * max(exo_n, 1), domain_total * 32)
-        rejection_budget = max(domain_total, cap // max(exo_n, 4))
+        cap = max(total_mass * max(exo_n, 1), domain_total * _INIT_CAP_DOMAIN_MULTIPLIER)
+        rejection_budget = max(domain_total, cap // max(exo_n, _INIT_REJECTION_EXO_DIVISOR_FALLBACK))
         sls_budget = max(0, cap - rejection_budget)
-        restart_every = max(1, sls_budget // max(16, exo_n * 2))
+        restart_every = max(1, sls_budget // max(_INIT_RESTART_SLS_DIVISOR_BASE, exo_n * _INIT_RESTART_EXO_SCALE))
         noise = 1.0 / (1 + exo_n)
 
         return rejection_budget, sls_budget, restart_every, noise
@@ -595,7 +644,15 @@ class FiniteSCM:
 
         return good
 
-    def backdoor_adjustment(self, *, treatment: str, treatment_value, outcome: str, outcome_value, adjustment_set: Sequence[str]) -> float:
+    def backdoor_adjustment(
+        self, 
+        *, 
+        treatment: str, 
+        treatment_value, 
+        outcome: str, 
+        outcome_value, 
+        adjustment_set: Sequence[str]
+    ) -> float:
         zvars = tuple(adjustment_set)
 
         if not zvars:
@@ -619,7 +676,9 @@ class FiniteSCM:
 
         return total
 
-    def frontdoor_sets(self, treatment: str, outcome: str) -> list[tuple[str, ...]]:
+    def frontdoor_sets(
+        self, treatment: str, outcome: str
+    ) -> list[tuple[str, ...]]:
         observed = set(self.observed_names)
         candidates = sorted(observed - {treatment, outcome})
         dag_full = CausalDAG(self.graph_parents_full())

@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import logging
 
-from core.system.event_bus import EventBus, LogToBusHandler, get_default_bus, reset_default_bus
+import pytest
+
+from core.system.event_bus import EventBus, LogToBusHandler, _reset_default_bus, get_default_bus
 
 
 def test_subscribe_and_publish_round_trip():
@@ -55,7 +57,8 @@ def test_unsubscribe_stops_delivery():
     sub = bus.subscribe("*")
     bus.unsubscribe(sub)
     bus.publish("x", 1)
-    assert bus.drain(sub) == []
+    with pytest.raises(KeyError):
+        bus.drain(sub)
 
 
 def test_log_handler_forwards_records_as_events():
@@ -80,10 +83,10 @@ def test_log_handler_forwards_records_as_events():
 
 
 def test_default_bus_is_singleton():
-    reset_default_bus()
+    _reset_default_bus()
     a = get_default_bus()
     b = get_default_bus()
     assert a is b
-    reset_default_bus()
+    _reset_default_bus()
     c = get_default_bus()
     assert c is not a

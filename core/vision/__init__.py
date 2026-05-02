@@ -1,1 +1,3 @@
-from .vision import *  # noqa: F403
+from .vision import VisionEncoder
+
+__all__ = ["VisionEncoder"]

@@ -1,5 +1,9 @@
 from core.infra.constants import BRAND, BRAND_BG, BRAND_DEEP, BRAND_SOFT
 
+# The following fragments are defined here and imported by sibling modules
+# ``core.tui.state`` (StatePanel), ``core.tui.systems`` (SystemsMatrix), and
+# ``core.tui.components`` (placeholder lines and activity-log coloring).
+
 # Shared CSS fragment for bordered side panels (Textual widget body, indented).
 _CSS_BRAND_PANEL_BODY = f"""        
     border: round {BRAND} 70%;

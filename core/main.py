@@ -13,6 +13,10 @@ from __future__ import annotations
 
 import argparse
 import sys
+from typing import Callable
+
+
+Handler = Callable[[list[str]], None]
 
 
 def _strip_optional_ddash(args: list[str]) -> list[str]:
@@ -58,7 +62,7 @@ def _cmd_paper(argv: list[str]) -> None:
     paper_main(_strip_optional_ddash(argv))
 
 
-_COMMANDS: dict[str, tuple[str, object]] = {
+_COMMANDS: dict[str, tuple[str, Handler]] = {
     "chat": ("Streaming terminal chat (full stack; same substrate as chat-tui).", _cmd_chat),
     "chat-tui": ("Textual chat dashboard.", _cmd_chat_tui),
     "tui": ("Alias for chat-tui.", _cmd_chat_tui),
@@ -73,7 +77,7 @@ def main(argv: list[str] | None = None) -> None:
     if argv is None:
         argv = sys.argv[1:]
 
-    choices = sorted(set(_COMMANDS))
+    choices = sorted(_COMMANDS)
     parser = argparse.ArgumentParser(
         prog="mosaic",
         description=(

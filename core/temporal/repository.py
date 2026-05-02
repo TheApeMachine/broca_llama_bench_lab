@@ -5,9 +5,10 @@ from __future__ import annotations
 import json
 import sqlite3
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 
 
 @dataclass(frozen=True)
@@ -30,10 +31,18 @@ class HawkesRepository:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.namespace = namespace
 
-    def _connect(self) -> sqlite3.Connection:
+    @contextmanager
+    def _connect(self) -> Iterator[sqlite3.Connection]:
         con = sqlite3.connect(self.path)
-        con.execute("PRAGMA journal_mode=WAL")
-        return con
+        try:
+            con.execute("PRAGMA journal_mode=WAL")
+            yield con
+            con.commit()
+        except BaseException:
+            con.rollback()
+            raise
+        finally:
+            con.close()
 
     def init_schema(self) -> None:
         with self._connect() as con:

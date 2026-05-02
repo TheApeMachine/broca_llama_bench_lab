@@ -354,7 +354,7 @@ class BenchApp(App):
         try:
             with contextlib.redirect_stdout(out_stream), contextlib.redirect_stderr(err_stream):
                 try:
-                    bench_main([])
+                    bench_main(list(self.bench_argv) if self.bench_argv else [])
                 except SystemExit as exc:
                     self.app.call_from_thread(self._on_suite_systemexit, _system_exit_code(exc))
                     return
@@ -427,7 +427,7 @@ class BenchApp(App):
         elif topic == "bench.task.start":
             self._current_task = str(payload.get("task") or "")
             self._current_label = str(payload.get("label") or self._current_task)
-            self._current_total = int(payload.get("total") or 0)
+            self._current_total = _safe_int(payload.get("total"), default=0, field="total")
             self._current_i = 0
             self._reset_progress(total=self._current_total)
             activity.write(
@@ -437,7 +437,7 @@ class BenchApp(App):
             arm = self._current_arm or "vanilla_lm"
             self._upsert_row(arm, self._current_task, n=0, acc=None, secs=None, status="running")
         elif topic == "bench.example":
-            self._current_i = int(payload.get("i") or 0)
+            self._current_i = _safe_int(payload.get("i"), default=0, field="i")
             running_acc = payload.get("running_acc")
             self._update_progress(self._current_i, self._current_total)
             if running_acc is not None:
@@ -703,7 +703,8 @@ class BenchApp(App):
         if self._lm_eval_summary:
             err = self._lm_eval_summary.get("error")
             if err:
-                lm_lines.append(f"[red]error: {err[:48]}[/red]")
+                err_str = err if isinstance(err, str) else str(err)
+                lm_lines.append(f"[red]error: {err_str[:48]}[/red]")
             else:
                 lm_lines.append(f"out: [dim]{self._lm_eval_summary.get('out')}[/dim]")
                 lm_lines.append("[dim]see lm_eval_pair.json for per-task[/dim]")
@@ -805,9 +806,8 @@ def run_bench_tui(argv: list[str] | None = None) -> None:
     helper.add_argument("-h", "--help", action="store_true")
     hpre, trailing = helper.parse_known_args(argv)
 
-    parser = _build_parser()
-
     if hpre.help:
+        parser = _build_parser()
         parser.print_help()
         print()
         from core.benchmarks.__main__ import print_benchmark_cli_help
@@ -816,7 +816,8 @@ def run_bench_tui(argv: list[str] | None = None) -> None:
 
         return
 
-    parser.parse_args(trailing)
+    parser = _build_parser()
+    _, benchmark_argv = parser.parse_known_args(trailing)
 
     os.environ.setdefault("LOG_SILENT", "1")
     os.environ.setdefault("MPLBACKEND", "Agg")
@@ -827,7 +828,7 @@ def run_bench_tui(argv: list[str] | None = None) -> None:
     handler = attach_core_logs_to_bus(bus)
 
     try:
-        app = BenchApp(bus=bus, bench_argv=[])
+        app = BenchApp(bus=bus, bench_argv=list(benchmark_argv))
         app.run()
     finally:
         detach_core_log_handler(handler)

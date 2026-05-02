@@ -28,7 +28,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from core.causal import FiniteSCM
-from core.grafting.grafts import KVMemoryGraft
 from core.cognition.top_down_control import (
     CausalConstraint,
     CausalConstraintGraft,

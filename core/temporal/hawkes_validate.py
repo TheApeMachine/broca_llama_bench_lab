@@ -51,7 +51,7 @@ def normalized_state_entries(
             raise ValueError(
                 f"{where}: states[{si}] missing required keys 'last_t' and/or 'cache'",
             )
-        if not isinstance(s["last_t"], (int, float)):
+        if isinstance(s["last_t"], bool) or not isinstance(s["last_t"], (int, float)):
             raise ValueError(f"{where}: states[{si}]['last_t'] must be numeric")
         if not isinstance(s["cache"], list):
             raise ValueError(f"{where}: states[{si}]['cache'] must be a list")

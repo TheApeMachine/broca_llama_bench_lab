@@ -30,6 +30,8 @@ def entropy(p: Sequence[float]) -> float:
 
 
 def kl(p: Sequence[float], q: Sequence[float]) -> float:
+    if len(p) != len(q):
+        raise ValueError(f"kl: length mismatch len(p)={len(p)} len(q)={len(q)}; distributions must have the same support size")
     return sum(float(pi) * (math.log(max(float(pi), _EPS)) - math.log(max(float(qi), _EPS))) for pi, qi in zip(p, q))
 
 
@@ -52,7 +54,7 @@ class PolicyEvaluation:
 
 @dataclass
 class Decision:
-    action: int
+    action: int | None
     action_name: str
     qs: list[float]
     policies: list[PolicyEvaluation]
@@ -241,7 +243,7 @@ class CategoricalPOMDP:
             for sp in range(n):
                 row = list(self.B[a][sp])
                 row.append(0.5 * row[-1] + 0.5 / (n + 1))
-                self.B[a][sp] = normalize(row)
+                self.B[a][sp] = row
             new_row = normalize([1.0 / (n + 1)] * (n + 1))
             self.B[a].append(list(new_row))
             for s in range(n + 1):
@@ -298,18 +300,23 @@ class ActiveInferenceAgent:
         precision = (1.0 / max(spread, _EPS)) if spread > _EPS else float(len(evals))
         posterior = softmax_neg(g_vals, precision)
         best_index = max(range(len(evals)), key=lambda i: posterior[i])
-        action = evals[best_index].policy[0]
+        chosen_policy = evals[best_index].policy
+        if not chosen_policy:
+            action: int | None = None
+            action_name = ""
+        else:
+            action = chosen_policy[0]
+            action_name = self.pomdp.action_names[action]
         min_g = min(g_vals)
         logger.debug(
-            "ActiveInferenceAgent.decide: action=%s(%d) min_G=%.4f n_policies=%d horizon=%d qs=%s",
-            self.pomdp.action_names[action],
-            action,
+            "ActiveInferenceAgent.decide: action=%s min_G=%.4f n_policies=%d horizon=%d qs=%s",
+            f"{action_name!s}({action})" if action is not None else "none",
             min_g,
             len(evals),
             self.horizon,
             [round(q, 4) for q in self.qs],
         )
-        return Decision(action, self.pomdp.action_names[action], list(self.qs), evals, posterior)
+        return Decision(action, action_name, list(self.qs), evals, posterior)
 
     def update(self, action: int, obs: int, lr: float = 1.0) -> list[float]:
         if self.qs is None:
@@ -534,7 +541,17 @@ def run_episode(agent: ActiveInferenceAgent, env: TigerDoorEnv, *, max_steps: in
     success = False
     for _ in range(max_steps):
         d = agent.decide()
+        if d.action is None:
+            raise ValueError(
+                "run_episode: agent.decide() returned no action (empty policy); "
+                "use horizon >= 1 for TigerDoorEnv episodes."
+            )
         obs_name, reward, done = env.step(d.action_name)
+        if obs_name not in pomdp.observation_names:
+            raise ValueError(
+                f"run_episode: unexpected observation name {obs_name!r}; "
+                f"allowed {list(pomdp.observation_names)}"
+            )
         obs = pomdp.observation_names.index(obs_name)
         post = agent.update(d.action, obs)
         logger.debug(
@@ -784,6 +801,16 @@ class ToolForagingAgent:
     def observe(self, action_name: str, observation_name: str, *, lr: float = 1.0) -> list[float]:
         """Update belief after seeing a real-world observation, e.g. ``info_gained`` or ``info_stagnant``."""
 
-        a = self.pomdp.action_names.index(str(action_name))
-        o = self.pomdp.observation_names.index(str(observation_name))
+        an = str(action_name)
+        on = str(observation_name)
+        if an not in self.pomdp.action_names:
+            raise ValueError(
+                f"observe: unknown action_name {an!r}; valid actions: {list(self.pomdp.action_names)}"
+            )
+        if on not in self.pomdp.observation_names:
+            raise ValueError(
+                f"observe: unknown observation_name {on!r}; valid observations: {list(self.pomdp.observation_names)}"
+            )
+        a = self.pomdp.action_names.index(an)
+        o = self.pomdp.observation_names.index(on)
         return self.agent.update(a, o, lr=lr)

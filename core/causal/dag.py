@@ -2,8 +2,6 @@ from __future__ import annotations
 
 from typing import Iterable, Mapping, Sequence
 
-from .exceptions import SimplePathEnumerationCap
-
 
 class CausalDAG:
     """Directed graph utilities for d-separation and adjustment-set search."""
@@ -32,7 +30,7 @@ class CausalDAG:
         updated = {child: [p for p in ps if p not in blocked] for child, ps in self.parents.items()}
         return CausalDAG(updated)
 
-    def directed_paths(self, start: str, end: str) -> list[list[str]]:
+    def directed_paths(self, start: str, end: str, *, max_paths: int | None = None) -> list[list[str]]:
         children = self._children_adjacency()
         paths: list[list[str]] = []
         stack = [(start, [start])]
@@ -42,6 +40,8 @@ class CausalDAG:
 
             if cur == end:
                 paths.append(path)
+                if max_paths is not None and len(paths) >= max_paths:
+                    return paths
                 continue
 
             for nxt in children.get(cur, []):
@@ -54,18 +54,23 @@ class CausalDAG:
         xs = {x} if isinstance(x, str) else set(x)
         ys = {y} if isinstance(y, str) else set(y)
         conditioned = set(z)
+        conditioned_or_desc = set(conditioned)
+        for z_node in conditioned:
+            conditioned_or_desc.update(self.descendants(z_node))
 
         for a in xs:
             for b in ys:
                 paths = self.simple_paths_between(a, b, max_paths=max_simple_paths)
 
                 for path in paths:
-                    if len(path) > 1 and self.path_active(path, conditioned):
+                    if len(path) > 1 and self.path_active(path, conditioned, conditioned_or_desc):
                         return False
 
         return True
 
     def simple_paths_between(self, start: str, end: str, *, max_len: int | None = None, max_paths: int | None = None) -> list[list[str]]:
+        """Enumerate simple paths; stops and returns when ``max_paths`` paths are found (truncated enumeration)."""
+
         nb = self._undirected_neighbor_sets()
         max_len_eff = max_len if max_len is not None else len(nb) + 1
         paths: list[list[str]] = []
@@ -81,9 +86,7 @@ class CausalDAG:
                 paths.append(path)
 
                 if max_paths is not None and len(paths) >= max_paths:
-                    raise SimplePathEnumerationCap(
-                        f"simple path enumeration exceeded max_paths={max_paths} between {start!r} and {end!r}",
-                    )
+                    return paths
 
                 continue
 
@@ -93,14 +96,7 @@ class CausalDAG:
 
         return paths
 
-    def path_active(self, path: Sequence[str], conditioned: set[str]) -> bool:
-        conditioned_or_desc = set(conditioned)
-
-        for z in conditioned:
-            conditioned_or_desc.update(self.descendants(z))
-
-        parents = self.parents
-
+    def path_active(self, path: Sequence[str], conditioned: set[str], conditioned_or_desc: set[str]) -> bool:
         for i in range(1, len(path) - 1):
             a, b, c = path[i - 1], path[i], path[i + 1]
             collider = self.has_arrow(self.parents, a, b) and self.has_arrow(self.parents, c, b)

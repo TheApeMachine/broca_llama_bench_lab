@@ -216,6 +216,7 @@ class DirichletPreference:
 
 _NEGATIVE_SENTIMENT = re.compile(
     r"\b(?:stop|worse|bad|wrong|annoying)\b|\btoo many\b|\bno\s+(?:thanks?|thank you)\b",
+    re.I,
 )
 _POSITIVE_SENTIMENT = re.compile(
     r"\b(?:thanks|great|perfect|good|concise|love|helpful)\b",
@@ -355,16 +356,16 @@ class PersistentPreference:
         try:
             raw_alpha = json.loads(alpha_js)
         except json.JSONDecodeError as exc:
-            raise ValueError(f"PreferenceStore.load({faculty!r}): invalid alpha_json") from exc
+            raise ValueError(f"PersistentPreference.load({faculty!r}): invalid alpha_json") from exc
         
         if not isinstance(raw_alpha, list):
             raise ValueError(
-                f"PreferenceStore.load({faculty!r}): alpha must be a JSON list, got {type(raw_alpha).__name__}",
+                f"PersistentPreference.load({faculty!r}): alpha must be a JSON list, got {type(raw_alpha).__name__}",
             )
         
         if len(raw_alpha) != n_exp:
             raise ValueError(
-                f"PreferenceStore.load({faculty!r}): alpha length {len(raw_alpha)} != n_observations {n_exp}",
+                f"PersistentPreference.load({faculty!r}): alpha length {len(raw_alpha)} != n_observations {n_exp}",
             )
         
         parsed_alpha: list[float] = []
@@ -374,12 +375,12 @@ class PersistentPreference:
                 v = float(x)
             except (TypeError, ValueError) as exc:
                 raise ValueError(
-                    f"PreferenceStore.load({faculty!r}): alpha[{i}]={x!r} is not numeric",
+                    f"PersistentPreference.load({faculty!r}): alpha[{i}]={x!r} is not numeric",
                 ) from exc
         
             if v < 0:
                 raise ValueError(
-                    f"PreferenceStore.load({faculty!r}): alpha[{i}]={v!r} must be non-negative",
+                    f"PersistentPreference.load({faculty!r}): alpha[{i}]={v!r} must be non-negative",
                 )
         
             parsed_alpha.append(v)
@@ -387,10 +388,32 @@ class PersistentPreference:
         prior = DirichletPreference(n_exp, prior_strength=ps)
         prior.alpha = parsed_alpha
         
-        prior.history = deque(
-            (_preference_event_from_dict(e) for e in json.loads(hist_js)),
-            maxlen=_HISTORY_MAXLEN,
-        )
+        try:
+            raw_hist = json.loads(hist_js)
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"PersistentPreference.load({faculty!r}): invalid history_json") from exc
+        
+        if not isinstance(raw_hist, list):
+            raise ValueError(
+                f"PersistentPreference.load({faculty!r}): prior.history must be a JSON list, "
+                f"got {type(raw_hist).__name__}",
+            )
+        
+        hist_events: list[PreferenceEvent] = []
+        for i, raw in enumerate(raw_hist):
+            if not isinstance(raw, dict):
+                raise ValueError(
+                    f"PersistentPreference.load({faculty!r}): history_json entry [{i}] must be object, "
+                    f"got {type(raw).__name__}",
+                )
+            try:
+                hist_events.append(_preference_event_from_dict(raw))
+            except (KeyError, TypeError, ValueError) as exc:
+                raise ValueError(
+                    f"PersistentPreference.load({faculty!r}): invalid prior.history entry at [{i}]",
+                ) from exc
+        
+        prior.history = deque(hist_events, maxlen=_HISTORY_MAXLEN)
         
         return prior
 

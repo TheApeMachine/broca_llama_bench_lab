@@ -30,19 +30,19 @@ def parse_device_env() -> str | None:
 
     raw_m = os.environ.get("M_DEVICE")
 
-    if raw_m is not None and str(raw_m).strip() != "":
-        return str(raw_m).strip()
+    if raw_m is not None and raw_m.strip() != "":
+        return raw_m.strip()
 
     legacy = os.environ.get("ASI_DEVICE")
 
-    if legacy is not None and str(legacy).strip() != "":
+    if legacy is not None and legacy.strip() != "":
         warnings.warn(
             "ASI_DEVICE is deprecated; set M_DEVICE for the default torch device override.",
             DeprecationWarning,
             stacklevel=2,
         )
 
-        return str(legacy).strip()
+        return legacy.strip()
 
     return None
 
@@ -122,6 +122,12 @@ def build_substrate_controller(*, bus: EventBus | None = None) -> SubstrateContr
 def build_broca_mind(*, bus: EventBus | None = None) -> SubstrateController:
     """Deprecated name for :func:`build_substrate_controller`."""
 
+    warnings.warn(
+        "build_broca_mind is deprecated; use build_substrate_controller",
+        DeprecationWarning,
+        stacklevel=2,
+    )
+
     return build_substrate_controller(bus=bus)
 
 
@@ -137,8 +143,8 @@ def attach_core_logs_to_bus(bus: EventBus, *, env_var: str = "TUI_LOG_LEVEL") ->
 def detach_core_log_handler(handler: logging.Handler) -> None:
     try:
         logging.getLogger("core").removeHandler(handler)
-    except Exception:
-        pass
+    except Exception as e:
+        logging.getLogger("core").debug("Failed to remove handler %s: %s", handler, e)
 
 
 def default_bus() -> EventBus:

@@ -17,7 +17,7 @@ def default_substrate_sqlite_path() -> Path:
     per-test database file (set by pytest ``conftest``).
     """
 
-    if os.environ.get("MOSAIC_UNDER_TEST", "").strip() in {"1", "true", "yes"}:
+    if os.environ.get("MOSAIC_UNDER_TEST", "").strip().casefold() in {"1", "true", "yes"}:
         raw = os.environ.get("MOSAIC_TEST_DB", "").strip()
         if not raw:
             raise RuntimeError(
@@ -35,7 +35,14 @@ def ensure_parent_dir(path: Path) -> None:
 
 
 def default_model_id() -> str:
-    return os.environ.get("MODEL_ID") or os.environ.get("BENCHMARK_MODEL") or "meta-llama/Llama-3.2-1B-Instruct"
+    for key in ("MODEL_ID", "BENCHMARK_MODEL"):
+        raw = os.environ.get(key)
+        if raw is None:
+            continue
+        s = raw.strip()
+        if s:
+            return s
+    return "meta-llama/Llama-3.2-1B-Instruct"
 
 
 def benchmark_output_root() -> Path:

@@ -275,6 +275,20 @@ class PersistentConformalCalibration:
                 "CREATE INDEX IF NOT EXISTS idx_conformal_lookup ON conformal_scores(namespace, channel, method)"
             )
 
+    def close(self) -> None:
+        with self._lock:
+            if self._conn is not None:
+                try:
+                    self._conn.close()
+                finally:
+                    self._conn = None
+
+    def __enter__(self) -> PersistentConformalCalibration:
+        return self
+
+    def __exit__(self, *_exc: object) -> None:
+        self.close()
+
     def add(self, channel: str, method: str, score: float, label: str = "") -> int:
         with self._lock:
             con = self._ensure_conn_locked()
@@ -289,6 +303,7 @@ class PersistentConformalCalibration:
                     time.time(),
                 ),
             )
+            con.commit()
             return int(cur.lastrowid)
 
     def scores(self, channel: str, method: str) -> list[float]:
@@ -359,8 +374,29 @@ class PersistentConformalCalibration:
                         raise
                 return
         new_tail = mem[len(existing) :]
-        for s in new_tail:
-            self.add(channel, predictor.method, float(s), label)
+        if not new_tail:
+            return
+        with self._lock:
+            con = self._ensure_conn_locked()
+            con.execute("BEGIN IMMEDIATE")
+            try:
+                ts = time.time()
+                for s in new_tail:
+                    con.execute(
+                        "INSERT INTO conformal_scores(namespace, channel, method, score, label, created_at) VALUES (?,?,?,?,?,?)",
+                        (
+                            self.namespace,
+                            channel,
+                            predictor.method,
+                            float(s),
+                            str(label),
+                            ts,
+                        ),
+                    )
+                con.commit()
+            except Exception:
+                con.rollback()
+                raise
 
 
 def empirical_coverage(

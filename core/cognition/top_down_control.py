@@ -45,9 +45,9 @@ import torch.nn.functional as F
 from ..grafting.grafts import (
     BaseGraft,
     KVMemoryGraft,
-    _state_confidence,
-    _state_inertia,
     snr_magnitude,
+    state_confidence,
+    state_inertia,
 )
 
 
@@ -132,6 +132,11 @@ class HypothesisMaskingGraft(BaseGraft):
         for tid in token_ids:
             tid_int = int(tid)
             if tid_int < 0:
+                logger.debug(
+                    "HypothesisMaskingGraft.ban: skipping negative token id=%r reason=%r",
+                    tid,
+                    reason,
+                )
                 continue
             self.banned[tid_int] = max(self.banned.get(tid_int, 0.0), p)
             added.append(tid_int)
@@ -249,11 +254,11 @@ class IterativeHypothesisSearch:
     """Generate–evaluate–ban–retry loop driven by :class:`HypothesisMaskingGraft`.
 
     The search owns nothing except references to the host, tokenizer, and
-    masking graft; it does not mutate other grafts. Each iteration:
+    masking graft; it does not mutate other grafts.     Each iteration:
 
-    1.  Resets the masking graft's banned set is *not* cleared between
-        iterations — that's the entire point of the search, every rejected
-        hypothesis prunes the search space for the next one.
+    1.  The masking graft's banned set is *not* cleared between iterations —
+        that's the entire point of the search: every rejected hypothesis prunes
+        the search space for the next one.
     2.  Generates ``hypothesis_max_tokens`` tokens autoregressively by calling
         ``host.forward`` (so any logits-slot grafts, including the masking
         graft, are honored).
@@ -758,8 +763,8 @@ class ModalityShiftGraft(BaseGraft):
         self.last_mode_used = str(mode_name)
         direction = self.modes[mode_name].to(device=x.device, dtype=x.dtype)
         bsz, seq_len, _ = x.shape
-        confidence = _state_confidence(state)
-        inertia = _state_inertia(state)
+        confidence = state_confidence(state)
+        inertia = state_inertia(state)
 
         mask = state.get("attention_mask")
         if mask is None:
@@ -965,7 +970,7 @@ class CausalConstraintGraft(KVMemoryGraft):
 
         # Build value direction as probability-weighted sum of outcome token rows.
         weight = lm_head.weight
-        accumulator = torch.zeros(self.d_model, dtype=torch.float32)
+        accumulator = torch.zeros(weight.shape[1], device=weight.device, dtype=torch.float32)
         missing: list[Any] = []
         present: list[Any] = []
         for v, p in distribution.items():

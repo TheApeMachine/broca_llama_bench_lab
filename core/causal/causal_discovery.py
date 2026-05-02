@@ -162,17 +162,16 @@ def _g_squared_independence(
     x_levels = len({r[x] for r in rows if x in r})
     y_levels = len({r[y] for r in rows if y in r})
     df_per_z = max(0, (x_levels - 1) * (y_levels - 1))
-    
+
     if z_vals:
-        df_z_count = 1
-    
-        for zvar in z_vals:
-            df_z_count *= len({r[zvar] for r in rows if zvar in r})
-    
-        df_z_count = max(1, df_z_count)
+        observed_z: set[tuple[object, ...]] = set()
+        for r in rows:
+            if all(zvar in r for zvar in z_vals):
+                observed_z.add(tuple(r[zvar] for zvar in z_vals))
+        df_z_count = max(1, len(observed_z))
     else:
         df_z_count = 1
-    
+
     df = df_per_z * df_z_count
     p = _chi2_sf(g, df) if df > 0 else 1.0
     independent = bool(p >= alpha)
@@ -626,7 +625,7 @@ def local_predicate_cluster(
         keys = sorted({str(k) for k in row})
     
         for a, b in combinations(keys, 2):
-            edge = (a, b) if a < b else (b, a)
+            edge = (a, b)
             co[edge] = co.get(edge, 0) + 1
     
     seed = rnd.choice(all_preds)
@@ -641,7 +640,7 @@ def local_predicate_cluster(
                 continue
     
             score = sum(
-                co[tuple(sorted((cand, c)))] for c in cluster
+                co.get(tuple(sorted((cand, c))), 0) for c in cluster
             )
     
             if score > best_score:

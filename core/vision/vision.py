@@ -36,11 +36,17 @@ logger = logging.getLogger(__name__)
 
 
 def _to_tensor(image: Any) -> torch.Tensor:
-    """Normalize an arbitrary image input to a [3, H, W] float tensor in [0, 1]."""
+    """Normalize an arbitrary image input to a [3, H, W] float tensor in [0, 1].
+
+    For tensor inputs, values are assumed to already lie in ``[0, 1]`` when
+    ``max <= 1.5``. If ``max > 1.5``, the tensor is treated as an 8-bit style
+    range and scaled by ``1/255`` (avoids mis-scaling HDR or normalized floats
+    whose maximum only barely exceeds 1.0).
+    """
 
     if isinstance(image, torch.Tensor):
         t = image.detach().float()
-        if t.numel() > 0 and float(t.max().item()) > 1.0:
+        if t.numel() > 0 and float(t.max().item()) > 1.5:
             t = t / 255.0
     else:
         try:
@@ -181,7 +187,7 @@ class VisionEncoder:
                 AutoModel.from_pretrained(self.model_id).to(self.device).eval()
             )
             self._real = True
-        except (FileNotFoundError, OSError, RuntimeError) as exc:  # pragma: no cover
+        except (FileNotFoundError, OSError, RuntimeError, ValueError) as exc:  # pragma: no cover
             logger.warning(
                 "VisionEncoder: failed to load %s [%s]: %s; using perceptual sketch",
                 self.model_id,
@@ -205,23 +211,21 @@ class VisionEncoder:
                 t = image.detach().float().cpu()
                 if t.ndim == 3:
                     t = t.unsqueeze(0)
-                if t.numel() > 0 and float(t.max().item()) > 1.0:
+                if t.numel() > 0 and float(t.max().item()) > 1.5:
                     t = t / 255.0
                 t = t.clamp(0.0, 1.0)
                 from PIL import Image as PILImage  # type: ignore
 
-                pil_images: list[Any] = []
-                for bi in range(int(t.shape[0])):
-                    arr = (
-                        (t[bi].clamp(0.0, 1.0) * 255.0)
-                        .clamp(0, 255)
-                        .to(dtype=torch.uint8)
-                        .permute(1, 2, 0)
-                        .contiguous()
-                        .numpy()
-                    )
-                    pil_images.append(PILImage.fromarray(arr, mode="RGB"))
-                inputs = self._processor(images=pil_images, return_tensors="pt")
+                arr = (
+                    (t[0].clamp(0.0, 1.0) * 255.0)
+                    .clamp(0, 255)
+                    .to(dtype=torch.uint8)
+                    .permute(1, 2, 0)
+                    .contiguous()
+                    .numpy()
+                )
+                pil_image = PILImage.fromarray(arr, mode="RGB")
+                inputs = self._processor(images=pil_image, return_tensors="pt")
                 inputs = {k: v.to(self.device) for k, v in inputs.items()}
             elif pil is None:
                 from PIL import Image as PILOpen  # type: ignore
@@ -290,3 +294,6 @@ def _embed_to_cognitive_frame(embed: torch.Tensor) -> torch.Tensor:
             tail[8] = float(base.norm().item())
     out = torch.cat([intent, base, scene, tail])
     return out
+
+
+__all__ = ["VisionEncoder"]

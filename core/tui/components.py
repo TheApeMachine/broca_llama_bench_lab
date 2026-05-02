@@ -71,15 +71,17 @@ def _activity_line_dmn_tick(ts: str, payload: dict[str, Any], duration_ms: float
 
 
 def _activity_line_self_improve_start(ts: str, payload: dict[str, Any]) -> str:
-    return f"[blue]{ts}[/blue] self-improve start run={payload.get('run_id', '')[:8]}"
+    run_id = str(payload.get("run_id") or "")[:8]
+    return f"[blue]{ts}[/blue] self-improve start run={run_id}"
 
 
 def _activity_line_self_improve_complete(ts: str, payload: dict[str, Any]) -> str:
-    err = payload.get("error")
-    run_id = payload.get("run_id", "")[:8]
+    run_id = str(payload.get("run_id") or "")[:8]
+    err_raw = payload.get("error")
 
-    if err:
-        return f"[red]{ts}[/red] self-improve fail run={run_id}  {err[:80]}"
+    if err_raw:
+        err_str = str(err_raw)[:80]
+        return f"[red]{ts}[/red] self-improve fail run={run_id}  {err_str}"
 
     return f"[blue]{ts}[/blue] self-improve done run={run_id}  {payload.get('summary') or ''}"
 

@@ -5,6 +5,8 @@ from __future__ import annotations
 import argparse
 import sys
 
+import torch
+
 from core.cli import (
     build_substrate_controller,
     configure_lab_session,
@@ -24,7 +26,6 @@ from core.substrate.runtime import (
 
 def _build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="Mosaic chat (full substrate; no tuning flags).")
-    p.add_argument("-h", "--help", action="help", help="Show this message and exit.")
 
     return p
 
@@ -39,7 +40,8 @@ def run_chat_repl(argv: list[str] | None = None) -> None:
     mind = build_substrate_controller()
     print(f"Mosaic substrate  db={mind.db_path.resolve()}  namespace={CHAT_NAMESPACE}", flush=True)
 
-    dev = next(mind.host.parameters()).device
+    p = next(mind.host.parameters(), None)
+    dev = p.device if p is not None else torch.device("cpu")
     print(f"Model: {mind.llama_model_id}  device: {dev}", flush=True)
     print(f"Persistent memory: records={mind.memory.count()}  journal_rows={mind.journal.count()}", flush=True)
 

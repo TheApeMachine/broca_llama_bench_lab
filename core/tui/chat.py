@@ -152,37 +152,48 @@ class Chat(App):
             payload = ev.payload or {}
             ts = time.strftime("%H:%M:%S", time.localtime(ev.ts))
 
-            if topic == "frame.comprehend":
-                activity.write(_activity_line_frame_comprehend(ts, payload))
+            try:
+                if topic == "frame.comprehend":
+                    activity.write(_activity_line_frame_comprehend(ts, payload))
 
-                conf = payload.get("confidence")
+                    conf = payload.get("confidence")
 
-                if conf is not None:
-                    self._confidence_trend.append(float(conf))
+                    if conf is not None:
+                        self._confidence_trend.append(float(conf))
 
-            elif topic == "intrinsic_cue":
-                activity.write(_activity_line_intrinsic_cue(ts, payload))
+                elif topic == "intrinsic_cue":
+                    activity.write(_activity_line_intrinsic_cue(ts, payload))
 
-            elif topic == "consolidation":
-                activity.write(_activity_line_consolidation(ts, payload))
+                elif topic == "consolidation":
+                    activity.write(_activity_line_consolidation(ts, payload))
 
-            elif topic == "dmn.tick":
-                duration_ms = float(payload.get("duration_ms", 0))
-                self._dmn_duration_trend.append(duration_ms)
+                elif topic == "dmn.tick":
+                    duration_ms = float(payload.get("duration_ms", 0))
+                    self._dmn_duration_trend.append(duration_ms)
 
-                activity.write(_activity_line_dmn_tick(ts, payload, duration_ms))
+                    activity.write(_activity_line_dmn_tick(ts, payload, duration_ms))
 
-            elif topic == "self_improve.cycle_start":
-                activity.write(_activity_line_self_improve_start(ts, payload))
+                elif topic == "self_improve.cycle_start":
+                    activity.write(_activity_line_self_improve_start(ts, payload))
 
-            elif topic == "self_improve.cycle_complete":
-                activity.write(_activity_line_self_improve_complete(ts, payload))
+                elif topic == "self_improve.cycle_complete":
+                    activity.write(_activity_line_self_improve_complete(ts, payload))
 
-            elif topic.startswith("log."):
-                activity.write(_activity_line_log(ts, payload))
+                elif topic.startswith("log."):
+                    activity.write(_activity_line_log(ts, payload))
 
-            else:
-                activity.write(f"[dim]{ts} {topic}[/dim]  {payload}")
+                else:
+                    activity.write(f"[dim]{ts} {topic}[/dim]  {payload}")
+            except Exception as exc:
+                logger.exception(
+                    "TUI chat: failed handling bus event topic=%r ts=%s payload=%r",
+                    topic,
+                    ev.ts,
+                    payload,
+                )
+                activity.write(
+                    f"[red]{ts}[/red] bad event topic={topic!r} payload={payload!r} err={exc!r}"
+                )
 
     def _sync_sparkline(self, css_id: str, trend: deque[float]) -> None:
         if not trend:
@@ -442,10 +453,10 @@ class Chat(App):
         self.query_one("#streaming", Static).update("[bold magenta]Assistant[/bold magenta]  …")
         self.busy = True
 
-        self._run_chat(text)
+        self._run_chat()
 
     @work(thread=True, exclusive=True)
-    def _run_chat(self, _user_text: str) -> None:
+    def _run_chat(self) -> None:
         def on_token(piece: str) -> None:
             self.app.call_from_thread(self._on_token, piece)
 
@@ -512,10 +523,7 @@ class Chat(App):
 
 
 def _build_chat_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(description="Mosaic chat TUI (fixed runtime).")
-    p.add_argument("-h", "--help", action="help", help="Show this message and exit.")
-
-    return p
+    return argparse.ArgumentParser(description="Mosaic chat TUI (fixed runtime).")
 
 
 def run_chat_tui(argv: list[str] | None = None) -> None:

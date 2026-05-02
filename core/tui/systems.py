@@ -4,7 +4,7 @@ from typing import Any
 
 from textual.widgets import Static
 
-from core.infra.constants import BRAND_SOFT, OFFLINE, ONLINE, WARNING
+from core.infra.constants import OFFLINE, ONLINE, WARNING
 
 from .components import _rich_section_title, _titled_placeholder
 from .styles import _CSS_BRAND_PANEL_BODY
@@ -58,5 +58,5 @@ class SystemsMatrix(Static):
         return "\n".join(lines)
 
     def set_entries(self, entries: list[tuple[str, str, str]]) -> None:
-        self._entries = entries
+        self._entries = list(entries)
         self.refresh()

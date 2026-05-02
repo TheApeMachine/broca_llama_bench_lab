@@ -95,6 +95,7 @@ def test_persistent_calibration_round_trip(tmp_path: Path):
     store.hydrate(fresh, channel="rel")
     assert len(fresh) == len(predictor)
     assert fresh.scores == predictor.scores
+    store.close()
 
 
 def test_conformal_set_p_values_emits_deprecation():

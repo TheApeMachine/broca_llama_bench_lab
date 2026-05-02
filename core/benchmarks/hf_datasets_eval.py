@@ -645,7 +645,7 @@ class HFLocalSubstrateBench:
         substrate_confidence = float(max(0.0, min(1.0, float(frame.confidence))))
         encoded = [self._encode_context_choice(context, c) for c in choices]
         max_len = max(len(ids) for ids, _, _ in encoded)
-        substrate_inertia = math.log1p(float(max(len(ids) for ids, _, _ in encoded)))
+        substrate_inertia = math.log1p(float(max_len))
         pad_id = getattr(self.tokenizer, "pad_token_id", None)
         if pad_id is None:
             pad_id = getattr(self.tokenizer, "eos_token_id", 0) or 0
@@ -1209,12 +1209,12 @@ def run_hf_datasets_benchmark(
         arm_label="vanilla_lm" if do_compare else None,
     )
 
-    macro = sum(float(v["accuracy"]) for v in per_task.values()) / max(1, len(per_task))
+    macro_raw = sum(float(v["accuracy"]) for v in per_task.values()) / max(1, len(per_task))
     micro_n = sum(int(v["n"]) for v in per_task.values())
     micro_correct = sum(int(v["correct"]) for v in per_task.values())
-    micro_acc = micro_correct / max(1, micro_n)
-    macro = round(float(macro), 2)
-    micro_acc = round(float(micro_acc), 2)
+    micro_acc_raw = micro_correct / max(1, micro_n)
+    macro = round(float(macro_raw), 2)
+    micro_acc = round(float(micro_acc_raw), 2)
     if not do_compare:
         print(f"\nvanilla_lm  macro_accuracy={macro:.3f} micro_accuracy={micro_acc:.3f}", flush=True)
 
@@ -1274,12 +1274,14 @@ def run_hf_datasets_benchmark(
             silent=True,
             arm_label="broca_shell",
         )
-        macro_s = sum(float(v["accuracy"]) for v in per_shell.values()) / max(1, len(per_shell))
+        macro_s_raw = sum(float(v["accuracy"]) for v in per_shell.values()) / max(1, len(per_shell))
         micro_n_s = sum(int(v["n"]) for v in per_shell.values())
         micro_c_s = sum(int(v["correct"]) for v in per_shell.values())
-        micro_acc_s = micro_c_s / max(1, micro_n_s)
-        macro_s = round(float(macro_s), 2)
-        micro_acc_s = round(float(micro_acc_s), 2)
+        micro_acc_s_raw = micro_c_s / max(1, micro_n_s)
+        macro_delta_shell = macro_s_raw - macro_raw
+        micro_delta_shell = micro_acc_s_raw - micro_acc_raw
+        macro_s = round(float(macro_s_raw), 2)
+        micro_acc_s = round(float(micro_acc_s_raw), 2)
         comparison = {
             "llama_broca_shell": {
                 "device": str(shell_back.device),
@@ -1288,8 +1290,8 @@ def run_hf_datasets_benchmark(
                     "micro_accuracy": micro_acc_s,
                     "micro_n": micro_n_s,
                     "micro_correct": micro_c_s,
-                    "macro_delta_vs_vanilla_lm": round(macro_s - macro, 2),
-                    "micro_delta_vs_vanilla_lm": round(micro_acc_s - micro_acc, 2),
+                    "macro_delta_vs_vanilla_lm": round(macro_delta_shell, 2),
+                    "micro_delta_vs_vanilla_lm": round(micro_delta_shell, 2),
                 },
                 "per_task": per_shell,
                 "artifacts_subdir": "broca_shell",
@@ -1323,12 +1325,16 @@ def run_hf_datasets_benchmark(
             silent=True,
             arm_label="broca_mind",
         )
-        macro_m = sum(float(v["accuracy"]) for v in per_mind.values()) / max(1, len(per_mind))
+        macro_m_raw = sum(float(v["accuracy"]) for v in per_mind.values()) / max(1, len(per_mind))
         micro_n_m = sum(int(v["n"]) for v in per_mind.values())
         micro_c_m = sum(int(v["correct"]) for v in per_mind.values())
-        micro_acc_m = micro_c_m / max(1, micro_n_m)
-        macro_m = round(float(macro_m), 2)
-        micro_acc_m = round(float(micro_acc_m), 2)
+        micro_acc_m_raw = micro_c_m / max(1, micro_n_m)
+        macro_delta_mind_v = macro_m_raw - macro_raw
+        micro_delta_mind_v = micro_acc_m_raw - micro_acc_raw
+        macro_delta_mind_s = macro_m_raw - macro_s_raw
+        micro_delta_mind_s = micro_acc_m_raw - micro_acc_s_raw
+        macro_m = round(float(macro_m_raw), 2)
+        micro_acc_m = round(float(micro_acc_m_raw), 2)
         comparison["broca_mind"] = {
             "device": str(shell_back.device),
             "aggregate": {
@@ -1336,10 +1342,10 @@ def run_hf_datasets_benchmark(
                 "micro_accuracy": micro_acc_m,
                 "micro_n": micro_n_m,
                 "micro_correct": micro_c_m,
-                "macro_delta_vs_vanilla_lm": round(macro_m - macro, 2),
-                "micro_delta_vs_vanilla_lm": round(micro_acc_m - micro_acc, 2),
-                "macro_delta_vs_llama_broca_shell": round(macro_m - macro_s, 2),
-                "micro_delta_vs_llama_broca_shell": round(micro_acc_m - micro_acc_s, 2),
+                "macro_delta_vs_vanilla_lm": round(macro_delta_mind_v, 2),
+                "micro_delta_vs_vanilla_lm": round(micro_delta_mind_v, 2),
+                "macro_delta_vs_llama_broca_shell": round(macro_delta_mind_s, 2),
+                "micro_delta_vs_llama_broca_shell": round(micro_delta_mind_s, 2),
             },
             "per_task": per_mind,
             "artifacts_subdir": "broca_mind",
@@ -1396,7 +1402,7 @@ def main(argv: Sequence[str] | None = None) -> None:
     if trailing:
         print("hf_datasets_eval has no tuning flags; use `python -m core.benchmarks`.", file=sys.stderr)
         raise SystemExit(2)
-
+    print_hf_datasets_benchmark_help()
 
 
 

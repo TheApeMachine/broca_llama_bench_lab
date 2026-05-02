@@ -164,21 +164,48 @@ def _m_step(
     return new_mu, new_alpha
 
 
-def fit_excitation_em(
+def hawkes_em(
     events: Sequence[tuple[str, float]],
     channels: Sequence[str],
     *,
     beta: float,
     iterations: int = 25,
     smoothing: float = 1e-3,
+    tol: float | None = None,
 ) -> tuple[list[float], list[list[float]]]:
     """Maximum-likelihood EM for exponential-kernel Hawkes (Veen & Schoenberg 2008).
 
-    Returns ``(mu, alpha)``. Branching probabilities ``p_{ij}`` (the probability
-    that event i was triggered by event j) are computed in the E-step; the
-    M-step then re-estimates ``mu`` from un-triggered events and ``alpha`` from
-    triggered ones. Convergence is monotone in NLL.
+    Branching probabilities :math:`p_{ij}` (probability event *i* was triggered
+    by event *j*) are computed in the E-step; the M-step re-estimates baseline
+    :math:`\\mu` and excitation matrix :math:`\\alpha`.
+
+    Args:
+        events: Observed arrivals as ``(channel_name, timestamp_seconds)``.
+            Ordering is unrestricted; timestamps are sorted internally.
+        channels: Ordered list of ``K`` channel identifiers; fixes matrix layout.
+        beta: Positive scalar exponential decay rate (kernel time scale).
+            Must be ``> 0`` (same role as ``MultivariateHawkesProcess.beta``).
+        iterations: Maximum EM iterations (always at least one full pass).
+        smoothing: Small additive constant to avoid zeros in denominators/counts.
+        tol: Optional stop when :math:`\\max(\\Delta\\mu, \\Delta\\alpha) <
+            \\texttt{tol}` after an M-step. ``None`` (default) runs all
+            ``iterations`` with no convergence early exit.
+
+    Returns:
+        ``(mu, alpha)`` where ``mu`` is a length-``K`` list of baseline rates and
+        ``alpha`` is a ``K×K`` nested list (:math:`\\alpha_{ij}` excitation from
+        channel *j* to *i*).
+
+        Convergence is monotone in NLL under standard regularity assumptions.
     """
+
+    try:
+        b = float(beta)
+    except (TypeError, ValueError) as exc:
+        raise TypeError(f"hawkes_em: beta must be numeric, got {beta!r}") from exc
+    if b <= 0.0:
+        raise ValueError(f"hawkes_em: beta must be strictly positive, got {beta!r}")
+    beta_used = float(b)
 
     sorted_events = sorted(events, key=lambda e: e[1])
     chans = list(channels)
@@ -195,26 +222,64 @@ def fit_excitation_em(
     mu, alpha = _initial_mu_alpha(n_events=n, K=K, T=T, smoothing=smoothing)
 
     for _ in range(max(1, int(iterations))):
+        mu_old, alpha_old = mu, alpha
         baseline_counts, triggered_counts = _e_step(
-            n=n, K=K, times=times, types=types, mu=mu, alpha=alpha, beta=beta
+            n=n,
+            K=K,
+            times=times,
+            types=types,
+            mu=mu_old,
+            alpha=alpha_old,
+            beta=beta_used,
         )
-        mu, alpha = _m_step(
+        mu_new, alpha_new = _m_step(
             n=n,
             K=K,
             times=times,
             types=types,
             baseline_counts=baseline_counts,
             triggered_counts=triggered_counts,
-            beta=beta,
+            beta=beta_used,
             smoothing=smoothing,
             T=T,
         )
+        mu, alpha = mu_new, alpha_new
+        if tol is not None:
+            delta_mu = max(abs(mu[i] - mu_old[i]) for i in range(K))
+            delta_alpha = max(
+                abs(alpha[i][j] - alpha_old[i][j])
+                for i in range(K)
+                for j in range(K)
+            )
+            if max(delta_mu, delta_alpha) < tol:
+                break
 
     logger.debug(
-        "fit_excitation_em: iterations=%d events=%d K=%d mu=%s",
+        "hawkes_em: iterations=%d events=%d K=%d mu=%s",
         int(iterations),
         n,
         K,
         [round(m, 5) for m in mu],
     )
     return mu, alpha
+
+
+def fit_excitation_em(
+    events: Sequence[tuple[str, float]],
+    channels: Sequence[str],
+    *,
+    beta: float,
+    iterations: int = 25,
+    smoothing: float = 1e-3,
+    tol: float | None = None,
+) -> tuple[list[float], list[list[float]]]:
+    """Alias for :func:`hawkes_em` (historic name); parameters and behavior match ``hawkes_em``."""
+
+    return hawkes_em(
+        events,
+        channels,
+        beta=beta,
+        iterations=iterations,
+        smoothing=smoothing,
+        tol=tol,
+    )

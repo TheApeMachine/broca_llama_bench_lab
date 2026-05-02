@@ -1,0 +1,20 @@
+{
+  "benchmark_key": "adversarial_prompt_resistance",
+  "passed": true,
+  "score": 1.0,
+  "n_trials": 50,
+  "duration_seconds": 0.0002460479736328125,
+  "description": "Hypothesis masking convergence on valid tokens under adversarial rejection",
+  "details": {
+    "successes": 50,
+    "vocab_size": 100,
+    "n_bad_tokens": 15,
+    "max_iterations": 10,
+    "avg_convergence_steps": 1.12,
+    "convergence_steps_histogram": {
+      "1": 45,
+      "2": 4,
+      "3": 1
+    }
+  }
+}

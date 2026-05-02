@@ -27,8 +27,8 @@ def _json_safe(obj: Any) -> Any:
 def run_active_inference_experiment(seed: int = 0, episodes: int = 80, verbose: bool = True) -> dict:
     """Compare active inference to a random baseline on the tiger POMDP (``episodes`` must be >= 1)."""
 
-    if int(episodes) <= 0:
-        raise ValueError(f"episodes must be a positive integer, got {episodes!r}")
+    if not isinstance(episodes, int) or episodes <= 0:
+        raise ValueError(f"episodes must be a positive int, got {episodes!r} (type {type(episodes).__name__})")
     pomdp = build_tiger_pomdp()
     agent = ActiveInferenceAgent(pomdp, horizon=1, learn=True)
     d0 = agent.decide()
@@ -180,3 +180,6 @@ def run_all(seed: int = 0, out_dir: str | Path = "runs", verbose: bool = True) -
     if verbose:
         print(f"\nSaved run summary: {path}")
     return result
+
+
+__all__ = ["run_active_inference_experiment", "run_causal_experiment", "run_all"]

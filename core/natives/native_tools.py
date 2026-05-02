@@ -92,9 +92,6 @@ _SAFE_BUILTIN_NAMES: tuple[str, ...] = (
     "sum",
     "tuple",
     "zip",
-    "True",
-    "False",
-    "None",
 )
 
 
@@ -152,6 +149,20 @@ class _ASTValidator(ast.NodeVisitor):
     def visit_Attribute(self, node: ast.Attribute) -> None:  # noqa: N802
         if isinstance(node.attr, str) and node.attr.startswith("__") and node.attr.endswith("__"):
             self.errors.append(f"dunder attribute access {node.attr!r} is not permitted")
+        self.generic_visit(node)
+
+    def visit_Subscript(self, node: ast.Subscript) -> None:  # noqa: N802
+        sl = node.slice
+        index_t = getattr(ast, "Index", None)
+        if index_t is not None and isinstance(sl, index_t):  # type: ignore[arg-type]
+            sl = getattr(sl, "value", sl)
+        if isinstance(sl, ast.Constant) and isinstance(sl.value, str):
+            nm = sl.value
+            if nm.startswith("__") or nm.endswith("__"):
+                self.errors.append(f"dunder attribute access {nm!r} is not permitted")
+        self.generic_visit(node)
+
+    def visit_JoinedStr(self, node: ast.JoinedStr) -> None:  # noqa: N802
         self.generic_visit(node)
 
     def visit_Name(self, node: ast.Name) -> None:  # noqa: N802
@@ -265,7 +276,19 @@ class ToolSandbox:
         if not sample_inputs:
             raise ToolSynthesisError("at least one sample input is required for verification")
         domain_elems = list(domain)
-        domain_set = set(domain_elems)
+        try:
+            domain_set = set(domain_elems)
+        except TypeError as exc:
+            bad: list[str] = []
+            for elt in domain_elems:
+                try:
+                    hash(elt)
+                except TypeError:
+                    bad.append(f"{elt!r} ({type(elt).__name__})")
+            detail = "; ".join(bad) if bad else repr(exc)
+            raise ToolSynthesisError(
+                f"domain elements must be hashable for membership checks ({detail})",
+            ) from exc
         outputs: list[Any] = []
         for i, sample in enumerate(sample_inputs):
             try:
@@ -527,54 +550,46 @@ class NativeToolRegistry:
         domain_repr = self._serialize_domain(tool.domain)
         sample_inputs_repr = self._serialize_samples(tool.sample_inputs)
         sample_outputs_repr = self._serialize_outputs(tool.sample_outputs)
+        parents_json = json.dumps(list(tool.parents))
+        created_at_f = float(tool.created_at or time.time())
         with self._db_lock:
             con = self._lazy_open()
             row = con.execute(
-                "SELECT id FROM native_tools WHERE namespace=? AND name=?",
-                (self.namespace, tool.name),
+                """
+                INSERT INTO native_tools(namespace, name, source, function_name, parents_json,
+                    domain_json, sample_inputs_json, sample_outputs_json, description, verified, created_at)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?)
+                ON CONFLICT(namespace, name) DO UPDATE SET
+                    source=excluded.source,
+                    function_name=excluded.function_name,
+                    parents_json=excluded.parents_json,
+                    domain_json=excluded.domain_json,
+                    sample_inputs_json=excluded.sample_inputs_json,
+                    sample_outputs_json=excluded.sample_outputs_json,
+                    description=excluded.description,
+                    verified=excluded.verified
+                RETURNING id
+                """,
+                (
+                    self.namespace,
+                    tool.name,
+                    tool.source,
+                    tool.function_name,
+                    parents_json,
+                    domain_repr,
+                    sample_inputs_repr,
+                    sample_outputs_repr,
+                    tool.description,
+                    int(bool(tool.verified)),
+                    created_at_f,
+                ),
             ).fetchone()
             if row is None:
-                cur = con.execute(
-                    """
-                    INSERT INTO native_tools(namespace, name, source, function_name, parents_json,
-                        domain_json, sample_inputs_json, sample_outputs_json, description, verified, created_at)
-                    VALUES (?,?,?,?,?,?,?,?,?,?,?)
-                    """,
-                    (
-                        self.namespace,
-                        tool.name,
-                        tool.source,
-                        tool.function_name,
-                        json.dumps(list(tool.parents)),
-                        domain_repr,
-                        sample_inputs_repr,
-                        sample_outputs_repr,
-                        tool.description,
-                        int(bool(tool.verified)),
-                        float(tool.created_at or time.time()),
-                    ),
+                raise ToolSynthesisError(
+                    f"native tool upsert produced no RETURNING row for namespace={self.namespace!r}, "
+                    f"name={tool.name!r}",
                 )
-                tool.id = int(cur.lastrowid)
-            else:
-                tool.id = int(row[0])
-                con.execute(
-                    """
-                    UPDATE native_tools SET source=?, function_name=?, parents_json=?,
-                        domain_json=?, sample_inputs_json=?, sample_outputs_json=?,
-                        description=?, verified=? WHERE id=?
-                    """,
-                    (
-                        tool.source,
-                        tool.function_name,
-                        json.dumps(list(tool.parents)),
-                        domain_repr,
-                        sample_inputs_repr,
-                        sample_outputs_repr,
-                        tool.description,
-                        int(bool(tool.verified)),
-                        tool.id,
-                    ),
-                )
+            tool.id = int(row[0])
 
     @staticmethod
     def _serialize_domain(domain: Sequence[Any]) -> str:
@@ -602,7 +617,14 @@ class NativeToolRegistry:
                 elif isinstance(v, int):
                     bv = bool(v)
                 elif isinstance(v, str):
-                    bv = bool(int(v))
+                    try:
+                        iv = int(v)
+                    except ValueError as ive:
+                        raise ToolSynthesisError(
+                            f"cannot coerce serialized bool payload {v!r} ({type(v).__name__}); "
+                            f"non-numeric string for int coercion"
+                        ) from ive
+                    bv = bool(iv)
                 else:
                     raise ToolSynthesisError(
                         f"cannot coerce serialized bool payload {v!r} (got {type(v).__name__})"
@@ -725,7 +747,7 @@ class NativeToolRegistry:
 
     # ----------------------- SCM integration -----------------------
 
-    def attach_to_scm(self, scm, *, allow_unknown_parents: bool = True) -> int:
+    def attach_to_scm(self, scm, *, allow_unknown_parents: bool = True, strict_tool_wrappers: bool = False) -> int:
         """Register every verified tool as an endogenous equation on ``scm``.
 
         Tools whose parents reference variables not yet declared on the SCM
@@ -748,7 +770,7 @@ class NativeToolRegistry:
             if tool.name in scm.equations:
                 scm.update_endogenous(
                     tool.name,
-                    fn=self._wrap_for_scm(tool),
+                    fn=self._wrap_for_scm(tool, strict=strict_tool_wrappers),
                     domain=list(tool.domain),
                     parents=tuple(tool.parents),
                 )
@@ -784,7 +806,7 @@ class NativeToolRegistry:
                 tool.name,
                 list(tool.domain),
                 list(tool.parents),
-                self._wrap_for_scm(tool),
+                self._wrap_for_scm(tool, strict=strict_tool_wrappers),
             )
             attached += 1
             logger.info(
@@ -796,7 +818,7 @@ class NativeToolRegistry:
         return attached
 
     @staticmethod
-    def _wrap_for_scm(tool: NativeTool) -> Callable[[dict], Any]:
+    def _wrap_for_scm(tool: NativeTool, *, strict: bool = False) -> Callable[[dict], Any]:
         """Wrap ``tool.fn`` for SCM queries with tolerant fallbacks on errors.
 
         Any exception inside the synthesized function yields the declared domain's
@@ -817,11 +839,15 @@ class NativeToolRegistry:
             try:
                 out = fn(values)
             except Exception:
+                if strict:
+                    raise
                 logger.exception("NativeTool %s raised; using fallback %r", name, fallback)
                 return fallback
             try:
                 return tool.domain_coerce(out)
             except ToolSynthesisError:
+                if strict:
+                    raise
                 logger.warning(
                     "NativeTool %s produced out-of-domain output; using fallback %r (domain=%r)",
                     name,

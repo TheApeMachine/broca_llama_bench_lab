@@ -29,15 +29,13 @@ def _batch_from_ids(rows: Sequence[Sequence[int]], pad_id: int, *, device: torch
         z_mask = torch.zeros((0, 1), dtype=torch.bool, device=device)
         return z_ids, z_mask
     max_len = max(1, max(len(r) for r in rows))
-    ids = torch.full((len(rows), max_len), pad_id, dtype=torch.long)
-    mask = torch.zeros((len(rows), max_len), dtype=torch.bool)
+    ids = torch.full((len(rows), max_len), pad_id, dtype=torch.long, device=device)
+    mask = torch.zeros((len(rows), max_len), dtype=torch.bool, device=device)
     for i, row in enumerate(rows):
         if not row:
             continue
-        ids[i, : len(row)] = torch.tensor(row, dtype=torch.long)
+        ids[i, : len(row)] = torch.tensor(row, dtype=torch.long, device=device)
         mask[i, : len(row)] = True
-    ids = ids.to(device)
-    mask = mask.to(device)
     return ids, mask
 
 
@@ -52,7 +50,12 @@ def lexical_plan_cross_entropy_mean(
     grafts_on: bool,
     broca_features: torch.Tensor | None = None,
 ) -> float:
-    """Mean negative log-likelihood of ``target_ids`` under teacher-forced prefixes."""
+    """Mean negative log-likelihood of ``target_ids`` under teacher-forced prefixes.
+
+    Complexity: each target token runs a full forward over the growing prefix (length
+    grows with step), so cost scales quadratically in utterance length unless the host
+    supports KV-cache incremental forwards with graft state replay.
+    """
 
     if not target_ids:
         return 0.0
@@ -77,7 +80,7 @@ def lexical_plan_cross_entropy_mean(
                 if bf_device is not None:
                     extra["broca_features"] = bf_device
 
-            last_pos = max(int(mask.long().sum().item()) - 1, 0)
+            last_pos = max(int(mask[0].long().sum().item()) - 1, 0)
 
             if grafts_on and lm_head is not None:
                 out = model(batch_ids, mask, extra_state=extra, return_cache=True)
@@ -110,7 +113,12 @@ def lexical_surprise_gap(
     prefix: str | None = None,
     broca_features: torch.Tensor | None = None,
 ) -> tuple[float, float, float]:
-    """``(mean_nll_graft, mean_nll_plain, gap)`` with ``gap = graft - plain``."""
+    """``(mean_nll_graft, mean_nll_plain, gap)`` with ``gap = graft - plain``.
+
+    Like :func:`lexical_plan_cross_entropy_mean`, the dual CE path performs one forward
+    per target token over an lengthening prefix (quadratic in utterance length for long
+    sequences) unless KV-cache reuse is added at the host layer.
+    """
 
     prefix_ids = speech_seed_ids(tokenizer, prefix)
     target_ids = tokenizer.encode(utterance)
@@ -134,14 +142,15 @@ def lexical_surprise_gap(
         for step, tgt in enumerate(target_ids):
             tid = int(tgt)
             batch_ids, mask = _batch_from_ids([row], pad_id, device=device)
-            extra = {
-                "broca_plan_token_ids": plan_tensor,
-                "broca_step": torch.tensor([min(step, max(0, len(plan_ids) - 1))], device=device),
-                "tokenizer": tokenizer,
-            }
+            # Mirror lexical_plan_cross_entropy_mean ``extra`` (incl. empty ``plan_ids``:
+            # ``broca_step`` uses ``min(step, max(0, len(plan_ids)-1))``, same as graft-on CE).
+            extra: dict = {}
+            extra["broca_plan_token_ids"] = plan_tensor
+            extra["broca_step"] = torch.tensor([min(step, max(0, len(plan_ids) - 1))], device=device)
+            extra["tokenizer"] = tokenizer
             if prepared_broca is not None:
                 extra["broca_features"] = prepared_broca
-            last_pos = max(int(mask.long().sum().item()) - 1, 0)
+            last_pos = max(int(mask[0].long().sum().item()) - 1, 0)
 
             if lm_head is None:
                 use_dual = False

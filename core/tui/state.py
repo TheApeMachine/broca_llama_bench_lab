@@ -11,7 +11,7 @@ from .styles import _CSS_BRAND_PANEL_BODY
 
 
 class StatePanel(Static):
-    """A titled panel that renders a dict of key/value pairs."""
+    """A titled panel that renders a list of string lines under the header."""
 
     DEFAULT_CSS = f"""
     StatePanel {{
@@ -37,5 +37,5 @@ class StatePanel(Static):
         return head + "\n" + "\n".join(self._lines)
 
     def set_lines(self, lines: list[str]) -> None:
-        self._lines = lines
+        self._lines = list(lines)
         self.refresh()

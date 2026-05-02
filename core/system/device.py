@@ -76,7 +76,11 @@ def pick_torch_device(pref: str | None = None, *, preferred_order: tuple[str, ..
 def inference_dtype(device: torch.device) -> torch.dtype:
     """Heuristic dtype for loading inference models on the given device."""
     if device.type == "cuda":
-        if torch.cuda.is_bf16_supported():
+        if device.index is not None:
+            bf16_ok = torch.cuda.is_bf16_supported(device)
+        else:
+            bf16_ok = torch.cuda.is_bf16_supported()
+        if bf16_ok:
             return torch.bfloat16
         return torch.float16
     if device.type == "mps":

@@ -201,7 +201,8 @@ def write_comparison_table_tex(summary: Mapping[str, Any], dest: Path) -> None:
             n = int(pv.get("n", 0))
             safe_task = _latex_escape(str(task))
             lines.append(
-                f"{safe_task} & {n} & {acc_v:.4f} & {acc_s:.4f} & {acc_m:.4f} & {acc_s - acc_v:+.4f} & {acc_m - acc_v:+.4f} \\\\",
+                f"{safe_task} & {n} & {acc_v:.4f} & {acc_s:.4f} & {acc_m:.4f} & "
+                f"{_delta_tex(acc_s - acc_v, prec=4)} & {_delta_tex(acc_m - acc_v, prec=4)} \\\\",
             )
         v_agg = summary.get("aggregate") or {}
         shell_agg = (comp.get("llama_broca_shell") or {}).get("aggregate") or {}
@@ -215,8 +216,10 @@ def write_comparison_table_tex(summary: Mapping[str, Any], dest: Path) -> None:
         m_micro = float(mind_agg.get("micro_accuracy", 0.0))
         lines.extend([
             r"\midrule",
-            f"\\textit{{Macro avg}} & & {v_macro:.4f} & {s_macro:.4f} & {m_macro:.4f} & {s_macro - v_macro:+.4f} & {m_macro - v_macro:+.4f} \\\\",
-            f"\\textit{{Micro avg}} & {micro_n} & {v_micro:.4f} & {s_micro:.4f} & {m_micro:.4f} & {s_micro - v_micro:+.4f} & {m_micro - v_micro:+.4f} \\\\",
+            f"\\textit{{Macro avg}} & & {v_macro:.4f} & {s_macro:.4f} & {m_macro:.4f} & "
+            f"{_delta_tex(s_macro - v_macro, prec=4)} & {_delta_tex(m_macro - v_macro, prec=4)} \\\\",
+            f"\\textit{{Micro avg}} & {micro_n} & {v_micro:.4f} & {s_micro:.4f} & {m_micro:.4f} & "
+            f"{_delta_tex(s_micro - v_micro, prec=4)} & {_delta_tex(m_micro - v_micro, prec=4)} \\\\",
             r"\bottomrule",
             r"\end{tabular}",
             "",
@@ -239,7 +242,7 @@ def write_comparison_table_tex(summary: Mapping[str, Any], dest: Path) -> None:
         n = int(pv.get("n", 0))
         safe_task = _latex_escape(str(task))
         lines.append(
-            f"{safe_task} & {n} & {acc_v:.4f} & {acc_s:.4f} & {acc_s - acc_v:+.4f} \\\\",
+            f"{safe_task} & {n} & {acc_v:.4f} & {acc_s:.4f} & {_delta_tex(acc_s - acc_v, prec=4)} \\\\",
         )
     shell_agg = (comp.get("llama_broca_shell") or {}).get("aggregate") or {}
     v_agg = summary.get("aggregate") or {}
@@ -247,7 +250,7 @@ def write_comparison_table_tex(summary: Mapping[str, Any], dest: Path) -> None:
     s_macro = float(shell_agg.get("macro_accuracy", 0.0))
     lines.extend([
         r"\midrule",
-        f"\\textit{{Macro avg}} & & {v_macro:.4f} & {s_macro:.4f} & {s_macro - v_macro:+.4f} \\\\",
+        f"\\textit{{Macro avg}} & & {v_macro:.4f} & {s_macro:.4f} & {_delta_tex(s_macro - v_macro, prec=4)} \\\\",
         r"\bottomrule",
         r"\end{tabular}",
         "",
@@ -954,7 +957,9 @@ def write_substrate_experiment_tex(
         r"\centering",
         r"\caption{Substrate benchmark suite: per-benchmark scores and pass/fail status. "
         r"\textit{Suite total}: the Pass column reports $n_{\mathrm{passed}}/n_{\mathrm{benchmarks}}$; "
-        r"the Score column is the arithmetic mean of the eight per-benchmark scores (not the pass rate).}",
+        r"the Score column is the arithmetic mean of the eight per-benchmark scores (not the pass rate). "
+        r"Each benchmark Time rounds its duration (same precision regime as Score); Suite total Time rounds "
+        r"recorded wall-clock aggregate and need not agree with summed rounded benchmark times.}",
         r"\label{tab:substrate-benchmarks}",
         r"\input{include/experiment/substrate_benchmark_table}",
         r"\end{table}",
@@ -1156,6 +1161,9 @@ def refresh_paper_experiments(*, root: Path | None = None) -> dict[str, Any]:
 
             logger.info("--- Substrate-specific benchmarks ---")
             substrate_out = exp_dir / "substrate_benchmark_results.json"
+            # Deliberately ignore the returned _suite dict: prose/tables consume suite_summary parsed
+            # from substrate_out (substrate_benchmark_results.json) so they match what consumers reading
+            # on-disk serialization see—not the richer in-memory object from run_substrate_benchmark_suite.
             _suite = run_substrate_benchmark_suite(
                 seed=bench_seed,
                 output_path=substrate_out,

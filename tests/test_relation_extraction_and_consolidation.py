@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-import core.cognition.substrate as broca_mod
+import core.cognition.substrate as substrate_mod
 from core.cognition.substrate import (
     SubstrateController,
     LLMRelationExtractor,
@@ -49,7 +49,7 @@ def fake_host_loader(monkeypatch: pytest.MonkeyPatch):
     def _make() -> FakeHost:
         host = FakeHost()
         tokenizer = FakeTokenizer(host._stub_tokenizer)
-        monkeypatch.setattr(broca_mod, "load_llama_broca_host", lambda *args, **kwargs: (host, tokenizer))
+        monkeypatch.setattr(substrate_mod, "load_llama_broca_host", lambda *args, **kwargs: (host, tokenizer))
         return host
 
     return _make

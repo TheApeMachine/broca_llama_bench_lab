@@ -29,6 +29,7 @@ from __future__ import annotations
 import logging
 import math
 import time
+from collections import defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Sequence
@@ -69,9 +70,16 @@ class MultivariateHawkesProcess:
     """
 
     def __init__(self, *, beta: float = 0.5, baseline: float = 0.05):
-        self.beta = float(beta)
+        fb = float(beta)
+        if fb <= 0.0:
+            raise ValueError(
+                f"MultivariateHawkesProcess: beta must be strictly positive "
+                f"(compensator and decay divide by beta); got {beta!r}"
+            )
+        self.beta = fb
         self.baseline = float(baseline)
         self.channels: list[str] = []
+        self.channel_index: dict[str, int] = {}
         self.mu: list[float] = []
         self.alpha: list[list[float]] = []
         self._states: list[HawkesState] = []
@@ -91,6 +99,7 @@ class MultivariateHawkesProcess:
 
         now = time.time()
         self.channels = chan_list
+        self.channel_index = {c: i for i, c in enumerate(chan_list)}
         self.mu = [float(m) for m in mu]
         self.alpha = alpha_rows
         self._states = [HawkesState(last_t=now) for _ in self.channels]
@@ -100,10 +109,11 @@ class MultivariateHawkesProcess:
     def _ensure_channel(
         self, name: str, *, default_alpha: float = 0.0, default_self_excite: float = 0.6
     ) -> int:
-        if name in self.channels:
-            return self.channels.index(name)
+        if name in self.channel_index:
+            return self.channel_index[name]
         idx = len(self.channels)
         self.channels.append(name)
+        self.channel_index[name] = idx
         self.mu.append(self.baseline)
         for row in self.alpha:
             row.append(float(default_alpha))
@@ -118,6 +128,18 @@ class MultivariateHawkesProcess:
             len(self.channels),
         )
         return idx
+
+    def export_state(self) -> list[dict[str, object]]:
+        """Serializable per-channel caches for persistence (same keys as load validation).
+
+        Keys are ``last_t`` (float) and ``cache`` (list of floats).
+
+        """
+
+        return [
+            {"last_t": float(s.last_t), "cache": [float(x) for x in s.cache]}
+            for s in self._states
+        ]
 
     def couple(self, source: str, target: str, *, weight: float) -> None:
         """Set ``alpha[target][source] = weight`` so source events excite target."""
@@ -153,14 +175,17 @@ class MultivariateHawkesProcess:
 
         idx = self._ensure_channel(channel)
         when = float(t) if t is not None else time.time()
-        last_t = self._states[idx].last_t
-        if when < last_t:
+        global_last_t = (
+            max(s.last_t for s in self._states) if self._states else float("-inf")
+        )
+        if when < global_last_t:
             logger.warning(
-                "MultivariateHawkesProcess.observe: out-of-order event for channel=%r when=%.6f last_t=%.6f; "
+                "MultivariateHawkesProcess.observe: out-of-order event for channel=%r when=%.6f "
+                "global_last_t=%.6f (max over channels); "
                 "events out of chronological order may produce incorrect intensities",
                 channel,
                 when,
-                last_t,
+                global_last_t,
             )
         self._decay_all(when)
         self._states[idx].cache.append(1.0)
@@ -175,6 +200,16 @@ class MultivariateHawkesProcess:
         """Conditional intensity λ_i(t) given the recorded history."""
 
         idx = self._ensure_channel(channel)
+        when = float(t) if t is not None else time.time()
+        self._decay_all(when)
+        return self._intensity_no_decay(idx)
+
+    def get_intensity(self, channel: str, *, t: float | None = None) -> float:
+        """Intensity for an existing ``channel`` only; raises KeyError if unknown."""
+
+        idx = self.channel_index.get(channel)
+        if idx is None:
+            raise KeyError(channel)
         when = float(t) if t is not None else time.time()
         self._decay_all(when)
         return self._intensity_no_decay(idx)
@@ -201,11 +236,18 @@ class MultivariateHawkesProcess:
         """
 
         if not events:
-            return 0.0
+            horizon_h = horizon
+            if horizon_h is None:
+                return 0.0
+            return float(sum(self.mu) * float(horizon_h))
         sorted_events = sorted(events, key=lambda e: e[1])
+        arrivals_by_channel: defaultdict[str, list[float]] = defaultdict(list)
+        for ch, evt_t in sorted_events:
+            arrivals_by_channel[ch].append(float(evt_t))
         # Reset state for evaluation.
         local = MultivariateHawkesProcess(beta=self.beta, baseline=self.baseline)
         local.channels = list(self.channels)
+        local.channel_index = {c: i for i, c in enumerate(local.channels)}
         local.mu = list(self.mu)
         local.alpha = [row[:] for row in self.alpha]
         local._states = [HawkesState(last_t=sorted_events[0][1]) for _ in self.channels]
@@ -224,7 +266,7 @@ class MultivariateHawkesProcess:
         compensator = sum(local.mu) * (T - T0)
         # Per-channel α_{ij} contributions to compensator.
         for j, name in enumerate(local.channels):
-            arrivals = [t for c, t in sorted_events if c == name]
+            arrivals = arrivals_by_channel.get(name, [])
             for s in arrivals:
                 tail = max(0.0, T - s)
                 kernel_int = (1.0 - math.exp(-local.beta * tail)) / max(
@@ -264,10 +306,7 @@ class PersistentHawkes:
             channels=list(process.channels),
             mu=list(process.mu),
             alpha=[list(row) for row in process.alpha],
-            state_dicts=[
-                {"last_t": s.last_t, "cache": s.cache}
-                for s in process._states
-            ],
+            state_dicts=process.export_state(),
         )
 
     def load(self) -> MultivariateHawkesProcess | None:
@@ -289,6 +328,7 @@ class PersistentHawkes:
         ]
         proc = MultivariateHawkesProcess(beta=snap.beta, baseline=snap.baseline)
         proc.channels = snap.channels
+        proc.channel_index = {c: i for i, c in enumerate(snap.channels)}
         proc.mu = [float(x) for x in snap.mu]
         proc.alpha = [[float(x) for x in row] for row in snap.alpha]
         proc._states = states

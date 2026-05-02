@@ -187,16 +187,39 @@ def _extract_json_object(text: str) -> dict[str, Any]:
     brace = s.find("{")
     if brace < 0:
         return json.loads(s)
-    tail = s[brace:]
-    for i, ch in enumerate(tail):
-        if ch != "}":
-            continue
-        candidate = tail[: i + 1]
-        try:
-            return json.loads(candidate)
-        except json.JSONDecodeError:
-            continue
-    return json.loads(tail)
+
+    while brace >= 0:
+        tail = s[brace:]
+        depth = 0
+        in_string = False
+        escape = False
+        for i, ch in enumerate(tail):
+            if escape:
+                escape = False
+                continue
+            if in_string:
+                if ch == "\\":
+                    escape = True
+                elif ch == '"':
+                    in_string = False
+                continue
+            if ch == '"':
+                in_string = True
+                continue
+            if ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0:
+                    candidate = tail[: i + 1]
+                    try:
+                        return json.loads(candidate)
+                    except json.JSONDecodeError:
+                        break
+        brace = s.find("{", brace + 1)
+
+    tail_all = s[s.find("{") :]
+    return json.loads(tail_all)
 
 
 @dataclass

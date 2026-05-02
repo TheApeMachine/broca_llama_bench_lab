@@ -1,0 +1,24 @@
+{
+  "benchmark_key": "causal_reasoning_simpson",
+  "passed": true,
+  "score": 1.0,
+  "n_trials": 1,
+  "duration_seconds": 0.21066594123840332,
+  "description": "Simpson's paradox: do-calculus recovers correct ATE despite confounding",
+  "details": {
+    "p_y_given_t1": 0.35,
+    "p_y_given_t0": 0.65,
+    "naive_suggests_helps": false,
+    "p_y_do_t1": 0.55,
+    "p_y_do_t0": 0.45,
+    "ate": 0.1,
+    "do_says_helps": true,
+    "counterfactual_p_y0_given_t1y1_do_t0": 0.2857,
+    "backdoor_sets": [
+      [
+        "S"
+      ]
+    ],
+    "backdoor_adjusted_p": 0.55
+  }
+}

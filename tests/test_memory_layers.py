@@ -14,7 +14,7 @@ from core.cognition.substrate import (
     WorkspaceJournal,
     working_memory_synthesize,
 )
-import core.cognition.substrate as broca_mod
+import core.cognition.substrate as substrate_mod
 from core.memory import SQLiteActivationMemory
 from core.substrate.graph import EpisodeAssociationGraph, merge_epistemic_evidence_dict
 
@@ -43,7 +43,7 @@ def fake_host_loader(monkeypatch: pytest.MonkeyPatch):
     def _make(track_grafts: bool = False) -> FakeHost:
         host = FakeHost(track_grafts=track_grafts)
         tokenizer = FakeTokenizer(host._stub_tokenizer)
-        monkeypatch.setattr(broca_mod, "load_llama_broca_host", lambda *args, **kwargs: (host, tokenizer))
+        monkeypatch.setattr(substrate_mod, "load_llama_broca_host", lambda *args, **kwargs: (host, tokenizer))
         return host
 
     return _make
@@ -93,7 +93,7 @@ def test_runtime_mind_creates_sqlite_before_model_load_failure(tmp_path: Path, m
         raise RuntimeError("model unavailable")
 
     db = tmp_path / "early.sqlite"
-    monkeypatch.setattr(broca_mod, "load_llama_broca_host", fail_load)
+    monkeypatch.setattr(substrate_mod, "load_llama_broca_host", fail_load)
 
     with pytest.raises(RuntimeError, match="model unavailable"):
         SubstrateController(seed=0, db_path=db, namespace="early")

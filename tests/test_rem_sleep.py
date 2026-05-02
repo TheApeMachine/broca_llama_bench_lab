@@ -8,6 +8,7 @@ sleep-cycle plumbing from the heavy substrate stack.
 from __future__ import annotations
 
 import random
+import threading
 import types
 from pathlib import Path
 
@@ -75,6 +76,8 @@ def _build_synthetic_mind(tmp: Path) -> types.SimpleNamespace:
         conformal_calibration=PersistentConformalCalibration(db, namespace="t__conf"),
         motor_replay=[],
         discovered_scm=None,
+        _cognitive_state_lock=threading.Lock(),
+        event_bus=types.SimpleNamespace(publish=lambda *args, **kwargs: None),
     )
     return mind
 

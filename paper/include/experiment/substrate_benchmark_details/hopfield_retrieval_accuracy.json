@@ -1,0 +1,43 @@
+{
+  "benchmark_key": "hopfield_retrieval_accuracy",
+  "passed": true,
+  "score": 0.7125,
+  "n_trials": 160,
+  "duration_seconds": 0.0317387580871582,
+  "description": "Modern Continuous Hopfield one-step retrieval at varying store sizes",
+  "details": {
+    "d_model": 256,
+    "per_store_size": {
+      "10": {
+        "accuracy": 1.0,
+        "avg_cosine": 1.0,
+        "n_queries": 10,
+        "correct": 10
+      },
+      "50": {
+        "accuracy": 0.72,
+        "avg_cosine": 0.7402,
+        "n_queries": 50,
+        "correct": 36
+      },
+      "100": {
+        "accuracy": 0.84,
+        "avg_cosine": 0.8485,
+        "n_queries": 50,
+        "correct": 42
+      },
+      "500": {
+        "accuracy": 0.52,
+        "avg_cosine": 0.5783,
+        "n_queries": 50,
+        "correct": 26
+      }
+    },
+    "store_sizes_tested": [
+      10,
+      50,
+      100,
+      500
+    ]
+  }
+}
