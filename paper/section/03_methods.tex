@@ -1,120 +1,117 @@
-% !TeX root = ../main.tex
-
 \section{Methods}
 \label{sec:methods}
 
-\subsection{Architecture Overview}
+\subsection{Architectural Philosophy: The Frozen Language Organ}
 
-The \textsc{Mosaic} system consists of two interacting systems, inspired by dual-process
-theories of cognition \cite{kahneman2011thinking}:
+The central design decision in \textsc{Mosaic} is the complete separation of
+language generation from cognition.  The LLM's weights are \emph{never updated}.
+This is not an engineering shortcut to avoid training cost---it is a deliberate
+architectural choice that prevents catastrophic forgetting.  When a model's
+weights are fine-tuned to incorporate a new fact, existing knowledge degrades
+(McCloskey \& Cohen, 1989; Kirkpatrick et al., 2017).  By injecting all new
+knowledge through grafts on the residual stream, the base model's capabilities
+remain bit-for-bit identical while the substrate accumulates unbounded new
+knowledge.
+
+The LLM is thus \textbf{demoted to a speech interface}---an associative cortex
+locked in a glass box.  The trainable grafts are the frontal cortex, slipping
+intelligent notes through the vents of the residual stream.  When the substrate
+discovers a concept the LLM has no vocabulary for (via Hebbian
+orthogonalization and Gram--Schmidt), the graft forces the LLM to \emph{invent a
+metaphor}---to describe the negative space of the novel concept using its
+existing subword repertoire.
+
+\subsection{Perceptual Organ Models}
+
+Beyond the frozen LLM (Broca's area), the architecture deploys a constellation
+of frozen pre-trained specialist models as sensory organs:
 
 \begin{itemize}[nosep]
-  \item \textbf{System~1 (Language Organ):} A frozen causal language model
-    (Llama~3.2 1B Instruct checkpoint) that produces fluent surface forms.  Its
-    weights are never modified.
-  \item \textbf{System~2 (Cognitive Substrate):} A persistent collection of
-    algebraic and probabilistic modules---memory, world model, agents, algebra,
-    and control---that runs inference, maintains state, and biases the language
-    organ through grafts.
+  \item \textbf{Visual cortex} (DINOv2-Large, 307M): general-purpose visual
+    features via self-supervised ViT.
+  \item \textbf{Ventral stream} (I-JEPA ViT-H, 632M): semantic visual features
+    via Joint Embedding Predictive Architecture---predicts in representation
+    space, not pixel space.
+  \item \textbf{Dorsal stream} (V-JEPA2 ViT-H, 632M): temporal dynamics and
+    world prediction from video---LeCun's world model instantiated.
+  \item \textbf{Spatial cortex} (Depth Anything V2, 335M): monocular depth
+    estimation for spatial reasoning.
+  \item \textbf{Auditory cortex} (Whisper-large-v3-turbo, 809M): speech
+    transcription and audio embeddings.
+  \item \textbf{Association cortex} (ImageBind, 1.13B): six-modality shared
+    embedding space for cross-modal binding.
+  \item \textbf{Extraction} (GLiNER2, 205M): zero-shot NER, relation extraction,
+    and classification---replaces LLM-based few-shot prompting at 50$\times$
+    lower latency.
+  \item \textbf{Affect} (GoEmotions RoBERTa, 125M): 28-label multi-label emotion
+    detection providing cognitive state signals (curiosity, confusion,
+    annoyance) to the active-inference loop.
 \end{itemize}
 
-Communication flows exclusively through three \emph{graft slots} in the frozen
-model's forward pass.  Throughout we refer to the graft-augmented frozen LM arm as the
-\emph{Broca shell} (sometimes ``Broca stack''): it is the surface decoder paired with this substrate inside \textsc{Mosaic}, not a separate system.
+All organs are frozen, loaded lazily, and communicate with the substrate via
+uniform \texttt{OrganOutput} dataclasses carrying features, metadata, and
+confidence.  The total memory footprint for all organs loaded simultaneously is
+${\sim}10.7$\,GB at fp16---well within a single-GPU or M-series Mac budget.
 
-\begin{enumerate}[nosep]
-  \item \textbf{Residual-stream graft} (\texttt{final\_hidden}): Projects a
-    continuous cognitive-frame vector into the host's residual stream at a
-    target signal-to-noise ratio calibrated to win over an arbitrarily deep
-    autoregressive prefix.
-  \item \textbf{Lexical-plan graft} (\texttt{final\_hidden}): Biases the
-    next-token distribution toward a small ``speech plan'' of tokens the
-    substrate would like the host to emit, with confidence-modulated decay.
-  \item \textbf{Logit-bias graft} (\texttt{logits}): Content-aware token bias
-    derived from the cognitive frame's subject, predicate, and answer, encoded
-    into subwords.
-\end{enumerate}
+\subsection{Algebraic Substrate Components}
 
-\subsection{Cognitive Substrate Components}
+Each algebraic component has a \emph{functional job title} within the
+architecture:
 
-\paragraph{Persistent semantic memory.}
-All symbolic knowledge is stored in SQLite with WAL journaling.  The memory
-supports subject--predicate--object triples with confidence scores, an
-append-only claims ledger, and a reflections table that records every belief
-revision decision with full provenance.
+\paragraph{VSA/HRR (zero-shot analogy).}
+Holographic Reduced Representations bind concepts via circular convolution in
+$O(d \log d)$.  A triple \texttt{(subject, predicate, object)} becomes a single
+10,000-dim hypervector that can be mathematically unbound later without any
+gradient update.  This is how the agent relates novel concepts on the fly.
 
-\paragraph{Active inference.}
-Two categorical POMDPs run in parallel: a spatial/action POMDP (Tiger-door
-problem) and a causal epistemic POMDP derived from the structural causal model.
-A \texttt{CoupledEFEAgent} arbitrates by comparing the minimal one-step Expected
-Free Energy of each faculty.  The winning posterior entropy modulates the LLM's
-sampling temperature: a confused substrate produces exploratory decoding; a
-decisive substrate produces near-greedy decoding.
+\paragraph{Hopfield (memory retrieval).}
+Modern Continuous Hopfield networks (Ramsauer et al., 2020) provide one-step
+content-addressable retrieval.  They take noisy, degraded input vectors and
+converge to the nearest stored pattern.  The VSA does binding; the Hopfield does
+retrieval.
 
-\paragraph{Structural causal model.}
-A finite SCM (\texttt{FiniteSCM}) supports exact $\doop(\cdot)$ interventions,
-counterfactual queries, d-separation, and automatic identification of backdoor
-and frontdoor adjustment sets.  The default bootstrap is Simpson's paradox; the
-SCM grows during REM sleep via the PC algorithm applied to journal
-observations.
+\paragraph{Hawkes (temporal intuition).}
+A multivariate self-exciting point process provides the substrate's sense of
+conversational ``heat.''  When a conversational event fires, the baseline
+intensity spikes and decays exponentially---this is how the system maintains
+fluid short-term conversational spacing rather than filling a context window
+with static timestamps.
 
-\paragraph{VSA / HRR algebra.}
-Holographic Reduced Representations encode triples as role/filler bundles via
-circular convolution ($O(d \log d)$).  Unbinding recovers fillers via circular
-correlation.  The codebook is persistent: the same atom name always produces the
-same hypervector across runs.
+\paragraph{Conformal prediction (calibrated uncertainty).}
+Split-conformal predictors wrap the LLM's outputs with a finite-sample coverage
+guarantee.  When $|C| > 1$, the substrate raises a Fristonian ambiguity signal
+and steers the LLM toward a clarifying question.
 
-\paragraph{Hopfield associative memory.}
-Modern Continuous Hopfield networks \cite{Ramsauer2020} provide one-step
-content-addressable retrieval with exponential storage capacity in the
-embedding dimension~$d$.  The inverse temperature $\beta = \sqrt{d}/\sigma$ is
-derived from the geometry of the stored patterns.
+\paragraph{SCM (causal reasoning).}
+A finite structural causal model supports exact \texttt{do($\cdot$)}
+interventions, counterfactual queries, and automatic backdoor/frontdoor
+identification.  It grows during REM sleep via the PC algorithm applied to
+journal observations.
 
-\paragraph{Conformal prediction.}
-Split-conformal predictors (LAC and APS variants) wrap the LLM's softmax
-outputs with a finite-sample coverage guarantee.  The size of the prediction set
-$|C|$ serves as a Fristonian ambiguity signal: $|C| = 1$ collapses to a
-confident answer; $|C| > 1$ raises an intrinsic cue that steers the LLM toward
-a clarifying question.
+\paragraph{Active inference (decision-making).}
+Two categorical POMDPs minimize Expected Free Energy.  The winning posterior
+entropy modulates the LLM's sampling temperature: confused substrate $\to$
+exploratory decoding; decisive substrate $\to$ near-greedy decoding.
 
-\paragraph{Top-down cognitive control.}
-Four predictive-coding-inspired mechanisms let the substrate override the LLM:
-\begin{itemize}[nosep]
-  \item \emph{Hypothesis masking:} Negative logit bias physically blocks
-    rejected tokens; an iterative search prunes the hypothesis space until the
-    LLM produces a valid answer.
-  \item \emph{Epistemic interruption:} A streaming evaluator checks generated
-    tokens every $k$ steps and, on a logical violation, truncates and
-    re-injects a correction feature vector.
-  \item \emph{Modality shifting:} A continuous unit-norm direction biases the
-    residual stream toward a named cognitive mood (analytical, fluent, etc.).
-  \item \emph{Causal constraint injection:} KV-memory grafts pre-loaded with
-    $P(Y \mid \doop(T{=}t))$ pull the LLM toward the SCM's verdict whenever
-    it attends to the cause concept.
-\end{itemize}
+\subsection{Swarm Communication}
+
+Multiple \textsc{Mosaic} instances on a LAN communicate via UDP multicast
+(\texttt{239.255.77.1:50077}, TTL=1).  Every local EventBus event flows to the
+network; every received network event flows to the local bus.  Peers discover
+each other via heartbeat (2\,s interval, 8\,s timeout).  There is no
+orchestrator---nodes are peers that communicate freely, and the substrate
+decides what to do with what it hears.
 
 \subsection{Evaluation Framework}
 
 We evaluate on three tiers:
-
 \begin{enumerate}[nosep]
-  \item \textbf{Standard NLP benchmarks:} Multiple-choice tasks scored by
-    length-normalized continuation log-likelihood (BoolQ, PIQA, ARC,
-    WinoGrande, HellaSwag, CommonsenseQA, OpenBookQA, MMLU) and
-    generation tasks scored by deterministic greedy decode with normalized
-    exact matching (GSM8K).  A paired vanilla-vs-\emph{Broca shell} comparison
-    verifies that the graft infrastructure does not degrade leaderboard
-    accuracy.
-  \item \textbf{Architecture probes:} Scripted prompts where the bare LLM and
-    the full \emph{Broca shell} are scored on speech-exact and answer-present metrics.
-    The probes cover semantic-memory recall, active-inference action selection,
-    and causal-intervention queries.
-  \item \textbf{Substrate benchmarks:} Eight CPU-only benchmarks that exercise
-    each algebraic component directly: belief revision, hypothesis masking,
-    Simpson's paradox resolution, memory fidelity, conformal coverage, VSA
-    round-trip, Hopfield retrieval, and active-inference decision quality.
+  \item \textbf{Standard NLP benchmarks}: length-normalized MC scoring and
+    greedy generation, with paired vanilla/shell/mind comparison.
+  \item \textbf{Architecture probes}: scripted prompts scoring speech-exact and
+    answer-present metrics (bare LLM vs.\ full substrate).
+  \item \textbf{Substrate benchmarks}: eight CPU-only tests verifying algebraic
+    guarantees (belief revision, hypothesis masking, Simpson's paradox, memory
+    fidelity, conformal coverage, VSA round-trip, Hopfield retrieval, active
+    inference decision quality).
 \end{enumerate}
-
-All experiments are reproducible from a single command (\texttt{make paper})
-and the results, tables, figures, and prose in Section~\ref{sec:experiments}
-are regenerated automatically from the latest benchmark run.
