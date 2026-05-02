@@ -32,7 +32,7 @@ import os
 import random
 from collections import Counter
 from dataclasses import dataclass, field
-from itertools import combinations
+from itertools import combinations, product
 from typing import Iterable, Mapping, Sequence
 
 from .causal import FiniteSCM
@@ -104,6 +104,30 @@ class DiscoveredGraph:
 
     def children(self, v: str) -> list[str]:
         return list(self._children_of.get(v, ()))
+
+
+def orient_temporal_edges(graph: DiscoveredGraph) -> DiscoveredGraph:
+    """Direct undirected lagged-variable edges from past variables into present variables."""
+
+    directed = set(graph.directed_edges)
+    undirected = set(graph.undirected_edges)
+    for edge in list(undirected):
+        a, b = tuple(edge)
+        a_lag = "_t_minus_" in str(a)
+        b_lag = "_t_minus_" in str(b)
+        if a_lag == b_lag:
+            continue
+        source, target = (a, b) if a_lag else (b, a)
+        directed.add((str(source), str(target)))
+        undirected.discard(edge)
+        logger.info("orient_temporal_edges: %s -> %s", source, target)
+    return DiscoveredGraph(
+        variables=list(graph.variables),
+        domains=dict(graph.domains),
+        undirected_edges=undirected,
+        directed_edges=directed,
+        separating_sets=dict(graph.separating_sets),
+    )
 
 
 def _g_squared_independence(
@@ -529,9 +553,13 @@ def build_scm_from_skeleton(graph: DiscoveredGraph, rows: Sequence[Mapping[str, 
     
         smoothed: dict[tuple, dict[object, float]] = {}
     
-        for key, counts in cpt.items():
+        parent_domains = [graph.domains[p] for p in ps]
+        keys = list(product(*parent_domains)) if parent_domains else [tuple()]
+
+        for key in keys:
+            counts = cpt.get(tuple(key), Counter())
             denom = sum(counts.values()) + len(graph.domains[v]) * 1.0
-            smoothed[key] = {value: (counts.get(value, 0) + 1.0) / denom for value in graph.domains[v]}
+            smoothed[tuple(key)] = {value: (counts.get(value, 0) + 1.0) / denom for value in graph.domains[v]}
     
         for row_probs in smoothed.values():
             min_p = min((float(p) for p in row_probs.values()), default=1.0)
@@ -563,13 +591,9 @@ def build_scm_from_skeleton(graph: DiscoveredGraph, rows: Sequence[Mapping[str, 
                 row = table.get(key)
     
                 if row is None:
-                    logger.warning(
-                        "build_scm_from_skeleton.CPT: missing CPT key=%r for node=%r; using dom[0]=%r as fallback",
-                        key,
-                        var,
-                        dom[0],
+                    raise KeyError(
+                        f"build_scm_from_skeleton.CPT: missing CPT key={key!r} for node={var!r}"
                     )
-                    return dom[0]
     
                 u_val = int(values[u]) % exo_domain
                 cumulative = 0.0

@@ -26,7 +26,9 @@ The pipeline:
     SQLite.
 5.  **Attach.**  ``NativeToolRegistry.attach_to_scm`` calls
     ``scm.add_endogenous(...)`` for every persisted tool, growing the SCM's
-    structural graph at runtime.
+    structural graph at runtime. Attached equations carry an online conformal
+    martingale; exchangeability drift quarantines the tool and exposes its SCM
+    node as exogenous uncertainty.
 
 Optional **Docker** execution (``BROCA_USE_DOCKER_TOOLS``) uses
 :class:`core.system.sandbox.DockerToolSandbox`: tools run in ``python:3.11-slim``
@@ -48,7 +50,7 @@ from pathlib import Path
 from collections import Counter
 from typing import Any, Callable, Mapping, Sequence
 
-from ..calibration.conformal import ConformalPredictor
+from ..calibration.conformal import ConformalPredictor, OnlineConformalMartingale
 
 
 logger = logging.getLogger(__name__)
@@ -338,6 +340,28 @@ def full_domain_empirical_distribution(
     return dist
 
 
+def tool_output_nonconformity_scores(
+    domain: Sequence[Any],
+    calibration_outputs: Sequence[Any],
+) -> tuple[list[float], dict[str, float]]:
+    """Nonconformity scores induced by a tool's verifier output histogram."""
+
+    dist = full_domain_empirical_distribution(domain, calibration_outputs)
+    if not dist:
+        raise ToolSynthesisError("tool drift monitor requires verifier outputs")
+    scores = [
+        1.0 - float(dist.get(native_tool_domain_label(output), 0.0))
+        for output in calibration_outputs
+    ]
+    return scores, dist
+
+
+def tool_output_nonconformity_score(value: Any, distribution: Mapping[str, float]) -> float:
+    """Nonconformity score for one live tool output under the verifier law."""
+
+    return 1.0 - float(distribution.get(native_tool_domain_label(value), 0.0))
+
+
 def assert_singleton_conformal_for_tool_outputs(
     predictor: ConformalPredictor,
     domain: Sequence[Any],
@@ -508,7 +532,7 @@ class NativeToolRegistry:
         if not domain_t:
             raise ToolSynthesisError(
                 f"native tool {name!r}: domain must declare at least one allowed output "
-                "(empty domains are ambiguous for SCM fallbacks and verification)",
+                "(empty domains are ambiguous for SCM verification)",
             )
         # Verify produces outputs as a side-effect; we keep the recorded outputs for telemetry.
         outputs = self.sandbox.verify(
@@ -736,6 +760,28 @@ class NativeToolRegistry:
             )
         return int(cur.rowcount or 0) > 0
 
+    def mark_unverified(self, name: str, *, reason: str, evidence: Mapping[str, Any]) -> None:
+        with self._db_lock:
+            con = self._lazy_open()
+            cur = con.execute(
+                """
+                UPDATE native_tools
+                SET verified=0, description=description || ?
+                WHERE namespace=? AND name=?
+                """,
+                (
+                    "\n[quarantined] " + json.dumps(
+                        {"reason": str(reason), "evidence": dict(evidence)},
+                        sort_keys=True,
+                        default=str,
+                    ),
+                    self.namespace,
+                    str(name),
+                ),
+            )
+        if int(cur.rowcount or 0) <= 0:
+            raise ToolSynthesisError(f"cannot quarantine unknown native tool {name!r}")
+
     def count(self) -> int:
         with self._db_lock:
             con = self._lazy_open()
@@ -747,7 +793,14 @@ class NativeToolRegistry:
 
     # ----------------------- SCM integration -----------------------
 
-    def attach_to_scm(self, scm, *, allow_unknown_parents: bool = True, strict_tool_wrappers: bool = False) -> int:
+    def attach_to_scm(
+        self,
+        scm,
+        *,
+        allow_unknown_parents: bool = True,
+        strict_tool_wrappers: bool = False,
+        on_tool_drift: Callable[[NativeTool, Mapping[str, Any]], None] | None = None,
+    ) -> int:
         """Register every verified tool as an endogenous equation on ``scm``.
 
         Tools whose parents reference variables not yet declared on the SCM
@@ -770,7 +823,13 @@ class NativeToolRegistry:
             if tool.name in scm.equations:
                 scm.update_endogenous(
                     tool.name,
-                    fn=self._wrap_for_scm(tool, strict=strict_tool_wrappers),
+                    fn=self._wrap_for_scm(
+                        tool,
+                        scm=scm,
+                        registry=self,
+                        strict=strict_tool_wrappers,
+                        on_tool_drift=on_tool_drift,
+                    ),
                     domain=list(tool.domain),
                     parents=tuple(tool.parents),
                 )
@@ -806,7 +865,13 @@ class NativeToolRegistry:
                 tool.name,
                 list(tool.domain),
                 list(tool.parents),
-                self._wrap_for_scm(tool, strict=strict_tool_wrappers),
+                self._wrap_for_scm(
+                    tool,
+                    scm=scm,
+                    registry=self,
+                    strict=strict_tool_wrappers,
+                    on_tool_drift=on_tool_drift,
+                ),
             )
             attached += 1
             logger.info(
@@ -818,43 +883,68 @@ class NativeToolRegistry:
         return attached
 
     @staticmethod
-    def _wrap_for_scm(tool: NativeTool, *, strict: bool = False) -> Callable[[dict], Any]:
-        """Wrap ``tool.fn`` for SCM queries with tolerant fallbacks on errors.
-
-        Any exception inside the synthesized function yields the declared domain's
-        first value. Outputs that violate the domain invoke the same coercion path
-        as :meth:`NativeTool.domain_coerce`, then fall back if coercion rejects.
-        """
+    def _wrap_for_scm(
+        tool: NativeTool,
+        *,
+        scm,
+        registry: "NativeToolRegistry",
+        strict: bool = False,
+        on_tool_drift: Callable[[NativeTool, Mapping[str, Any]], None] | None = None,
+    ) -> Callable[[dict], Any]:
+        """Wrap ``tool.fn`` for SCM queries with live conformal drift quarantine."""
 
         if not tool.domain:
             raise ToolSynthesisError(
                 f"native tool {tool.name!r} has empty domain; cannot synthesize SCM wrapper"
             )
-        fallback = tool.domain[0]
-        domain_elems = list(tool.domain)
         name = tool.name
         fn = tool.callable_or_raise()
+        calibration_scores, verifier_distribution = tool_output_nonconformity_scores(
+            tool.domain,
+            tool.sample_outputs,
+        )
+        monitor = OnlineConformalMartingale(
+            calibration_scores,
+            alpha=1.0 / float(len(calibration_scores) + 1),
+        )
+
+        def quarantine(reason: str, evidence: Mapping[str, Any]) -> None:
+            payload = {
+                "tool": name,
+                "reason": str(reason),
+                "verifier_distribution": dict(verifier_distribution),
+                **dict(evidence),
+            }
+            try:
+                scm.detach_endogenous_as_exogenous(name)
+            except ValueError:
+                logger.debug("NativeTool %s already detached from SCM", name)
+            registry.mark_unverified(name, reason=reason, evidence=payload)
+            if on_tool_drift is not None:
+                on_tool_drift(tool, payload)
 
         def _wrapped(values: dict) -> Any:
             try:
                 out = fn(values)
-            except Exception:
-                if strict:
-                    raise
-                logger.exception("NativeTool %s raised; using fallback %r", name, fallback)
-                return fallback
+            except Exception as exc:
+                quarantine("runtime_exception", {"error": repr(exc)})
+                raise ToolSynthesisError(
+                    f"native tool {name!r} raised during SCM evaluation"
+                ) from exc
             try:
-                return tool.domain_coerce(out)
-            except ToolSynthesisError:
-                if strict:
-                    raise
-                logger.warning(
-                    "NativeTool %s produced out-of-domain output; using fallback %r (domain=%r)",
-                    name,
-                    fallback,
-                    domain_elems,
+                coerced = tool.domain_coerce(out)
+            except ToolSynthesisError as exc:
+                quarantine("out_of_domain_output", {"output": repr(out)})
+                raise exc
+            score = tool_output_nonconformity_score(coerced, verifier_distribution)
+            drift = monitor.update(score)
+            if bool(drift["drifted"]):
+                quarantine("conformal_drift", {"output": repr(coerced), **drift})
+                raise ToolSynthesisError(
+                    f"native tool {name!r} violated live conformal martingale "
+                    f"(p={float(drift['p_value']):.6f}, M={float(drift['martingale']):.6f})"
                 )
-                return fallback
+            return coerced
 
         return _wrapped
 
@@ -868,5 +958,7 @@ __all__ = [
     "NativeToolRegistry",
     "native_tool_domain_label",
     "full_domain_empirical_distribution",
+    "tool_output_nonconformity_score",
+    "tool_output_nonconformity_scores",
     "assert_singleton_conformal_for_tool_outputs",
 ]

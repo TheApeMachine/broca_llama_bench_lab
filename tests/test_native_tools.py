@@ -383,8 +383,8 @@ def test_attach_to_scm_supports_intervention_via_native_tool(tmp_path):
     assert p_alarm_smoke0 == 0.0
 
 
-def test_synthesized_tool_wraps_runtime_failure_with_fallback(tmp_path):
-    """If the synthesized fn raises at runtime, the wrapper must coerce to a domain default."""
+def test_synthesized_tool_runtime_failure_quarantines_and_detaches(tmp_path):
+    """If the synthesized fn raises at runtime, the SCM node is explicitly quarantined."""
 
     db = tmp_path / "tools.sqlite"
     reg = NativeToolRegistry(db, namespace="t")
@@ -398,11 +398,35 @@ def test_synthesized_tool_wraps_runtime_failure_with_fallback(tmp_path):
     )
     scm = FiniteSCM(domains={})
     reg.attach_to_scm(scm)
-    # The wrapped equation handles missing keys by returning the domain's first value (0).
     out = scm.equations["lookup"].fn({"x": 1})
     assert out == 1
-    out_missing = scm.equations["lookup"].fn({})
-    assert out_missing == 0
+    with pytest.raises(ToolSynthesisError, match="raised during SCM evaluation"):
+        scm.equations["lookup"].fn({})
+    assert "lookup" not in scm.equations
+    assert "lookup" in scm.exogenous
+    quarantined = reg.get("lookup", rehydrate=False)
+    assert quarantined is not None
+    assert quarantined.verified is False
+
+
+def test_synthesized_tool_conformal_drift_detaches_node(tmp_path):
+    db = tmp_path / "tools.sqlite"
+    reg = NativeToolRegistry(db, namespace="t")
+    reg.synthesize(
+        "switch",
+        "def switch(v):\n    return v['x']\n",
+        parents=("x",),
+        domain=(0, 1),
+        sample_inputs=[{"x": 0} for _ in range(12)],
+    )
+    scm = FiniteSCM(domains={})
+    reg.attach_to_scm(scm)
+
+    assert scm.equations["switch"].fn({"x": 0}) == 0
+    with pytest.raises(ToolSynthesisError, match="conformal martingale"):
+        scm.equations["switch"].fn({"x": 1})
+    assert "switch" not in scm.equations
+    assert "switch" in scm.exogenous
 
 
 def test_attach_to_scm_rejects_non_scm():

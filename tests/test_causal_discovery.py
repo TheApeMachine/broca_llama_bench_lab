@@ -8,9 +8,11 @@ from core.causal.causal_discovery import (
     _g_squared_independence,
     build_scm_from_skeleton,
     local_predicate_cluster,
+    orient_temporal_edges,
     pc_algorithm,
     project_rows_to_variables,
 )
+from core.causal.temporal import TemporalCausalTraceBuilder
 
 
 def _generate_chain_data(n: int, seed: int = 0) -> list[dict[str, int]]:
@@ -133,3 +135,40 @@ def test_project_rows_to_variables_drops_sparse_rows():
     ]
     out = project_rows_to_variables(rows, ["A", "B", "C", "D"])
     assert len(out) == 2
+
+
+def test_temporal_trace_builder_preserves_hawkes_residuals_and_lagged_events():
+    rows = [
+        {
+            "id": 1,
+            "ts": 1.0,
+            "intent": "meal",
+            "subject": "restaurant",
+            "answer": "sushi",
+            "evidence": {"hawkes_trace": {"excitation": {"meal": 0.0}}},
+        },
+        {
+            "id": 2,
+            "ts": 9.0,
+            "intent": "sick",
+            "subject": "body",
+            "answer": "nausea",
+            "evidence": {"hawkes_trace": {"excitation": {"meal": 0.25}}},
+        },
+    ]
+    built = TemporalCausalTraceBuilder(rows).build_rows()
+    assert built[-1]["intent_t"] == "sick"
+    assert built[-1]["intent_t_minus_1"] == "meal"
+    assert built[-1]["hawkes_residual__meal"] == "present"
+
+
+def test_orient_temporal_edges_points_lagged_variables_forward():
+    graph = DiscoveredGraph(
+        variables=["intent_t_minus_1", "intent_t"],
+        domains={"intent_t_minus_1": ("meal",), "intent_t": ("sick",)},
+        undirected_edges={frozenset(("intent_t_minus_1", "intent_t"))},
+        directed_edges=set(),
+    )
+    oriented = orient_temporal_edges(graph)
+    assert ("intent_t_minus_1", "intent_t") in oriented.directed_edges
+    assert not oriented.undirected_edges

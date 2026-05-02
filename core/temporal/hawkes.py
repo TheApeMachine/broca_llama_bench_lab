@@ -223,6 +223,29 @@ class MultivariateHawkesProcess:
             name: self._intensity_no_decay(i) for i, name in enumerate(self.channels)
         }
 
+    def excitation_vector(self, *, t: float | None = None) -> dict[str, float]:
+        """All channel excitation above each baseline intensity at time ``t``."""
+
+        when = float(t) if t is not None else time.time()
+        self._decay_all(when)
+        out: dict[str, float] = {}
+        for i, name in enumerate(self.channels):
+            out[name] = max(0.0, self._intensity_no_decay(i) - float(self.mu[i]))
+        return out
+
+    def trace(self, *, t: float | None = None) -> dict[str, object]:
+        """Serializable temporal trace for journal and semantic consolidation."""
+
+        when = float(t) if t is not None else time.time()
+        return {
+            "ts": when,
+            "beta": float(self.beta),
+            "baseline": float(self.baseline),
+            "channels": list(self.channels),
+            "intensity": self.intensity_vector(t=when),
+            "excitation": self.excitation_vector(t=when),
+        }
+
     # ------------------------------------------------------------------ learning
 
     def negative_log_likelihood(

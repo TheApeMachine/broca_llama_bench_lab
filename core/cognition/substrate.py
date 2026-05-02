@@ -91,9 +91,11 @@ from ..idletime.ontological_expansion import OntologicalRegistry, PersistentOnto
 from ..causal.causal_discovery import (
     build_scm_from_skeleton,
     local_predicate_cluster,
+    orient_temporal_edges,
     pc_algorithm,
     project_rows_to_variables,
 )
+from ..causal.temporal import TemporalCausalTraceBuilder
 from ..natives.native_tools import NativeTool, NativeToolRegistry, ToolSandbox, ToolSynthesisError
 from ..grafting.dynamic_grafts import DynamicGraftSynthesizer, CapturedActivationMode, ACTIVATION_MODE_KIND
 from ..system.event_bus import EventBus, get_default_bus
@@ -1362,8 +1364,8 @@ class WorkspaceJournal:
                 """
             )
 
-    def append(self, utterance: str, frame: CognitiveFrame) -> int:
-        now = time.time()
+    def append(self, utterance: str, frame: CognitiveFrame, *, ts: float | None = None) -> int:
+        now = float(ts) if ts is not None else time.time()
         payload = (
             now,
             utterance,
@@ -2323,6 +2325,7 @@ class CognitiveBackgroundWorker:
                     alpha=cfg.sleep_pc_alpha,
                     max_conditioning_size=int(cfg.sleep_pc_max_conditioning_size),
                 )
+                graph = orient_temporal_edges(graph)
                 if graph.directed_edges or graph.undirected_edges:
                     new_scm = build_scm_from_skeleton(graph, observations)
                     self.mind.discovered_scm = new_scm
@@ -2364,6 +2367,8 @@ class CognitiveBackgroundWorker:
             record = {pred: obj for pred, obj, _conf, _ev in self.mind.memory.records_for_subject(subject)}
             if record:
                 rows.append(record)
+        journal_rows = self.mind.journal.recent(limit=int(self.config.sleep_max_replay))
+        rows.extend(TemporalCausalTraceBuilder(journal_rows).build_rows())
         return rows
 
     def _loop(self) -> None:
@@ -3165,7 +3170,7 @@ class SubstrateController:
         # into the live SCM as an endogenous equation.
         self.tool_registry = NativeToolRegistry(rp, namespace=f"{namespace}__tools")
         try:
-            self.tool_registry.attach_to_scm(self.scm)
+            self.tool_registry.attach_to_scm(self.scm, on_tool_drift=self._handle_native_tool_drift)
         except Exception:
             logger.exception("SubstrateController: initial tool attachment failed")
 
@@ -3842,6 +3847,30 @@ class SubstrateController:
 
     # -- Native tool synthesis -------------------------------------------------
 
+    def _handle_native_tool_drift(self, tool: NativeTool, evidence: Mapping[str, Any]) -> None:
+        """Turn native-tool exchangeability drift into an active-inference cue."""
+
+        cue = IntrinsicCue(
+            urgency=1.0,
+            faculty="tool_resynthesis",
+            evidence={
+                "tool": tool.name,
+                "parents": list(tool.parents),
+                "domain": [repr(v) for v in tool.domain],
+                **dict(evidence),
+            },
+            source="native_tool_martingale",
+        )
+        self.workspace.intrinsic_cues.append(cue)
+        self.tool_foraging_agent = ToolForagingAgent.build(
+            n_existing_tools=self.tool_registry.count(),
+            insufficient_prior=1.0 - 1e-6,
+        )
+        self.event_bus.publish(
+            "native_tool.drift",
+            {"tool": tool.name, "urgency": cue.urgency, "evidence": dict(cue.evidence)},
+        )
+
     def synthesize_native_tool(
         self,
         name: str,
@@ -3875,7 +3904,7 @@ class SubstrateController:
         )
         if attach:
             try:
-                self.tool_registry.attach_to_scm(self.scm)
+                self.tool_registry.attach_to_scm(self.scm, on_tool_drift=self._handle_native_tool_drift)
             except Exception:
                 logger.exception("SubstrateController.synthesize_native_tool: SCM re-attach failed")
         # Rebuild the tool foraging agent so its likelihoods reflect the new tool count.
@@ -3888,7 +3917,7 @@ class SubstrateController:
     def attach_tools_to_scm(self) -> int:
         """Re-attach every persisted native tool onto :attr:`scm`. Returns the count attached."""
 
-        return self.tool_registry.attach_to_scm(self.scm)
+        return self.tool_registry.attach_to_scm(self.scm, on_tool_drift=self._handle_native_tool_drift)
 
     def should_synthesize_tool(self) -> bool:
         """Run the tool foraging agent against the current substrate state.
@@ -3928,9 +3957,19 @@ class SubstrateController:
             return []
         return [str(r.get("intent", "") or "unknown") for r in rows]
 
-    def find_matching_macro(self, *, recent_intents: Sequence[str] | None = None) -> CompiledMacro | None:
+    def find_matching_macro(
+        self,
+        *,
+        recent_intents: Sequence[str] | None = None,
+        features: torch.Tensor | None = None,
+    ) -> CompiledMacro | None:
         """Return the most-observed macro whose prefix matches the recent intent tail."""
 
+        if features is not None:
+            return self.macro_registry.find_macro_by_features(
+                features,
+                min_cosine=self.chunking_compiler.config.hopfield_weight_min_for_oneshot,
+            )
         recent = list(recent_intents) if recent_intents is not None else self.recent_intents()
         return self.macro_registry.find_macro_matching_prefix(recent)
 
@@ -4172,13 +4211,19 @@ class SubstrateController:
         return out
 
     def _commit_frame(self, utterance: str, toks: Sequence[str], frame: CognitiveFrame) -> CognitiveFrame:
-        jid = self.journal.append(utterance, frame)
+        commit_ts = time.time()
+        trace = self.hawkes.trace(t=commit_ts)
+        frame.evidence = {**dict(frame.evidence or {}), "hawkes_trace": trace}
+        jid = self.journal.append(utterance, frame, ts=commit_ts)
         frame.evidence = {**frame.evidence, "journal_id": jid}
         if self._last_journal_id is not None:
             self.episode_graph.bump(self._last_journal_id, jid)
         self._last_journal_id = jid
         logger.debug("_commit_frame: journal_id=%s intent=%s pred_error=%s", jid, frame.intent, frame.intent == "prediction_error")
         out = self.workspace.publish(frame)
+        predicate = str((out.evidence or {}).get("predicate", ""))
+        if out.intent == "memory_write" and out.subject and predicate:
+            self.memory.merge_epistemic_evidence(out.subject, predicate, out.evidence)
         for tail in self.workspace.frames:
             pred = str((tail.evidence or {}).get("predicate", ""))
             if tail.intent == "synthesis_bundle" and tail.subject and pred:

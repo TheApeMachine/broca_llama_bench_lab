@@ -485,6 +485,59 @@ def test_compiler_run_once_caps_at_max_macros_per_tick(tmp_path):
     assert reg.count() == 1
 
 
+def test_compiler_clusters_repeated_multimodal_trajectories_without_intent_repeat(tmp_path):
+    rows = []
+    intent_pairs = [
+        ("confused_a", "repair_a"),
+        ("confused_b", "repair_b"),
+        ("confused_c", "repair_c"),
+    ]
+    jid = 0
+    affect = {"valence": -0.7, "arousal": 0.8, "entropy": 0.2, "certainty": 0.9}
+    for first, second in intent_pairs:
+        rows.append(
+            _row(
+                jid,
+                first,
+                subject="vision",
+                answer="ambiguous_scene",
+                evidence={"affect": affect, "friston_ambiguity": 0.9},
+            )
+        )
+        jid += 1
+        rows.append(
+            _row(
+                jid,
+                second,
+                subject="vision",
+                answer="disambiguate_scene",
+                evidence={"affect": affect, "friston_ambiguity": 0.8},
+            )
+        )
+        jid += 1
+
+    db = tmp_path / "broca.sqlite"
+    reg = MacroChunkRegistry(db, namespace="dmn")
+    compiler = DMNChunkingCompiler(
+        _StubMind(rows),
+        registry=reg,
+        config=ChunkingDetectionConfig(
+            window_size=32,
+            min_motif_length=2,
+            max_motif_length=2,
+            min_repetitions=3,
+            max_macros_per_tick=4,
+        ),
+    )
+
+    result = compiler.run_once()
+
+    assert any(r.get("compile_via") == "multimodal_trajectory" for r in result["reflections"])
+    macro = next(m for m in reg.all_macros() if m.name.startswith("macro_multimodal_"))
+    assert macro.observation_count == 3
+    assert macro.pattern == ("multimodal_0", "multimodal_1")
+
+
 def test_macro_frame_features_pads_to_broca_dim():
     # A short feature vector should be zero-padded to BROCA_FEATURE_DIM.
     short = torch.tensor([1.0, 2.0, 3.0])

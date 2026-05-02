@@ -11,17 +11,19 @@ vectors produced by every instance of the motif: a single point in
 substrate had each time it walked the motif.  The macro is persisted to
 SQLite so subsequent sessions inherit it.
 
-When the user produces a new utterance, the substrate compares the recent
-intent prefix against the registry; if a known macro's prefix matches, the
-substrate can short-circuit the slow multi-step routing by injecting the
-macro's compiled feature vector directly into the residual stream.  This is
-the "System 2 → System 1" transition.
+When the user produces a new utterance, the substrate compares both recent
+intent prefixes and continuous cognitive-frame geometry against the registry;
+if a known macro matches, the substrate can short-circuit the slow multi-step
+routing by injecting the macro's compiled feature vector directly into the
+residual stream.  This is the "System 2 → System 1" transition.
 """
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
+import math
 import sqlite3
 import time
 from dataclasses import dataclass, field
@@ -30,6 +32,7 @@ from typing import Any, Sequence
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 
 from ..frame.continuous_frame import BROCA_FEATURE_DIM
 
@@ -318,6 +321,24 @@ class MacroChunkRegistry:
         self._prefix_match_cache[cache_key] = best
         return best
 
+    def find_macro_by_features(self, query: torch.Tensor, *, min_cosine: float) -> CompiledMacro | None:
+        """Return the strongest macro whose feature basin contains ``query``."""
+
+        q = F.normalize(query.detach().float().reshape(1, -1), dim=-1)
+        best: tuple[CompiledMacro, float] | None = None
+        for macro in self.all_macros():
+            feat = _align_vec_to_dim(macro.feature_vector, q.shape[-1])
+            score = float((q @ F.normalize(feat.reshape(1, -1), dim=-1).T).item())
+            if score < float(min_cosine):
+                continue
+            if best is None or (score, macro.observation_count, macro.avg_confidence) > (
+                best[1],
+                best[0].observation_count,
+                best[0].avg_confidence,
+            ):
+                best = (macro, score)
+        return best[0] if best is not None else None
+
 
 def _frame_features_from_row(row: dict, *, text_encoder=None) -> torch.Tensor:
     from ..frame.continuous_frame import pack_cognitive_frame
@@ -330,6 +351,66 @@ def _frame_features_from_row(row: dict, *, text_encoder=None) -> torch.Tensor:
         row.get("evidence") if isinstance(row.get("evidence"), dict) else None,
         text_encoder=text_encoder,
     )
+
+
+def _row_multimodal_features(row: dict, *, text_encoder=None) -> torch.Tensor:
+    """BROCA-width continuous state vector including affect and perceptual ambiguity."""
+
+    out = _align_vec_to_dim(
+        _frame_features_from_row(row, text_encoder=text_encoder),
+        BROCA_FEATURE_DIM,
+    )
+    ev = _journal_evidence_dict(row)
+    affect = ev.get("affect")
+    if isinstance(affect, dict):
+        vals = [
+            float(affect.get("valence", 0.0) or 0.0),
+            float(affect.get("arousal", 0.0) or 0.0),
+            float(affect.get("entropy", 0.0) or 0.0),
+            float(affect.get("certainty", 0.0) or 0.0),
+        ]
+        out[-8:-4] = torch.tensor(vals, dtype=torch.float32)
+    ambiguity = _perceptual_ambiguity(ev)
+    out[-4] = float(ambiguity)
+    return out
+
+
+def _perceptual_ambiguity(evidence: dict) -> float:
+    explicit = evidence.get("friston_ambiguity", evidence.get("visual_ambiguity", None))
+    if explicit is not None:
+        value = float(explicit)
+        if not math.isfinite(value):
+            raise ValueError("perceptual ambiguity must be finite")
+        return max(0.0, min(1.0, value))
+    encoder_outputs = evidence.get("encoder_outputs")
+    if not isinstance(encoder_outputs, dict) or not encoder_outputs:
+        return 0.0
+    confidences: list[float] = []
+    for payload in encoder_outputs.values():
+        if not isinstance(payload, dict):
+            continue
+        raw = payload.get("confidence")
+        if raw is None:
+            continue
+        conf = float(raw)
+        if not math.isfinite(conf):
+            raise ValueError("encoder confidence must be finite")
+        confidences.append(max(0.0, min(1.0, conf)))
+    if not confidences:
+        return 0.0
+    return 1.0 - min(confidences)
+
+
+def _trajectory_signature(features: Sequence[torch.Tensor]) -> torch.Tensor:
+    if not features:
+        raise ValueError("_trajectory_signature requires at least one feature vector")
+    return F.normalize(torch.cat([F.normalize(f.float().flatten(), dim=0) for f in features], dim=0), dim=0)
+
+
+def _macro_name_for_feature_centroid(feature_vector: torch.Tensor) -> str:
+    arr = feature_vector.detach().cpu().float().numpy().astype(np.float32, copy=False)
+    digest = hashlib.sha256(np.ascontiguousarray(arr).tobytes()).hexdigest()[:16]
+    return f"macro_multimodal_{digest}"
 
 
 @dataclass
@@ -461,6 +542,108 @@ def find_salience_forced_motifs(
     return best
 
 
+def find_multimodal_trajectory_motifs(
+    rows: list[dict],
+    mind: Any,
+    cfg: ChunkingDetectionConfig,
+    *,
+    text_encoder=None,
+) -> list[tuple[list[int], torch.Tensor, float, list[tuple[str, ...]]]]:
+    """Cluster repeated continuous state trajectories independent of exact intent tuples."""
+
+    out: list[tuple[list[int], torch.Tensor, float, list[tuple[str, ...]]]] = []
+    n = len(rows)
+    for L in range(cfg.max_motif_length, cfg.min_motif_length - 1, -1):
+        if L > n:
+            continue
+        windows: list[tuple[int, tuple[str, ...], torch.Tensor, torch.Tensor]] = []
+        for s in range(n - L + 1):
+            features = [
+                _row_multimodal_features(rows[s + offset], text_encoder=text_encoder)
+                for offset in range(L)
+            ]
+            signature = _trajectory_signature(features)
+            mean_feat = torch.stack(features, dim=0).mean(dim=0)
+            pattern = tuple(str(rows[s + offset].get("intent", "") or "unknown") for offset in range(L))
+            windows.append((s, pattern, signature, mean_feat))
+        if len(windows) < cfg.min_repetitions:
+            continue
+        threshold = _derived_cluster_threshold([w[2] for w in windows], cfg)
+        clusters: list[dict[str, Any]] = []
+        for start, pattern, signature, mean_feat in windows:
+            best_ix = -1
+            best_score = -1.0
+            for ix, cluster in enumerate(clusters):
+                score = float(torch.dot(signature, cluster["centroid"]).item())
+                if score > best_score:
+                    best_score = score
+                    best_ix = ix
+            if best_ix >= 0 and best_score >= threshold:
+                cluster = clusters[best_ix]
+                cluster["starts"].append(start)
+                cluster["patterns"].append(pattern)
+                cluster["features"].append(mean_feat)
+                stacked = torch.stack(cluster["signatures"] + [signature], dim=0)
+                cluster["centroid"] = F.normalize(stacked.mean(dim=0), dim=0)
+                cluster["signatures"].append(signature)
+                continue
+            clusters.append(
+                {
+                    "starts": [start],
+                    "patterns": [pattern],
+                    "signatures": [signature],
+                    "features": [mean_feat],
+                    "centroid": signature,
+                }
+            )
+        for cluster in clusters:
+            starts = _non_overlapping_starts(cluster["starts"], L)
+            if len(starts) < cfg.min_repetitions:
+                continue
+            selected = [
+                cluster["features"][cluster["starts"].index(start)]
+                for start in starts
+            ]
+            centroid_feature = torch.stack(selected, dim=0).mean(dim=0)
+            if not _hopfield_concentration_ok(mind, centroid_feature, cfg):
+                continue
+            out.append(
+                (
+                    starts,
+                    centroid_feature,
+                    float(len(starts)),
+                    list(cluster["patterns"]),
+                )
+            )
+    out.sort(key=lambda item: (-item[2], -len(item[0])))
+    return out
+
+
+def _derived_cluster_threshold(signatures: Sequence[torch.Tensor], cfg: ChunkingDetectionConfig) -> float:
+    if len(signatures) < 2:
+        return 1.0
+    sims: list[float] = []
+    for i in range(len(signatures)):
+        for j in range(i + 1, len(signatures)):
+            sims.append(float(torch.dot(signatures[i], signatures[j]).item()))
+    if not sims:
+        return 1.0
+    mu = sum(sims) / len(sims)
+    var = sum((x - mu) ** 2 for x in sims) / len(sims)
+    return max(float(cfg.hopfield_weight_min_for_oneshot), min(0.999, mu + math.sqrt(var)))
+
+
+def _non_overlapping_starts(starts: Sequence[int], length: int) -> list[int]:
+    out: list[int] = []
+    last_end = -1
+    for start in sorted(int(s) for s in starts):
+        if start < last_end:
+            continue
+        out.append(start)
+        last_end = start + int(length)
+    return out
+
+
 class DMNChunkingCompiler:
     """Detects repeated intent motifs in the workspace journal and compiles them into macros.
 
@@ -570,21 +753,30 @@ class DMNChunkingCompiler:
             min_motif_length=cfg.min_motif_length,
             max_motif_length=cfg.max_motif_length,
         )
+        text_encoder = getattr(self.mind, "text_encoder", None)
+        multimodal_motifs = find_multimodal_trajectory_motifs(
+            rows,
+            self.mind,
+            cfg,
+            text_encoder=text_encoder,
+        )
         freq_patterns = {pat for pat, _ in motifs_freq}
-        work: list[tuple[tuple[str, ...], list[int], str, float]] = [
-            (pat, starts, "frequency", float(len(starts))) for pat, starts in motifs_freq
+        work: list[tuple[tuple[str, ...], list[int], str, float, torch.Tensor | None, list[tuple[str, ...]]]] = [
+            (pat, starts, "frequency", float(len(starts)), None, []) for pat, starts in motifs_freq
         ]
         for pat, (sal, s) in salience_best.items():
             if pat in freq_patterns:
                 continue
-            work.append((pat, [s], "salience", float(sal)))
+            work.append((pat, [s], "salience", float(sal), None, []))
+        for starts, centroid_feature, score, member_patterns in multimodal_motifs:
+            length = len(member_patterns[0]) if member_patterns else cfg.min_motif_length
+            pat = tuple(f"multimodal_{i}" for i in range(length))
+            work.append((pat, starts, "multimodal_trajectory", float(score), centroid_feature, member_patterns))
         work.sort(key=lambda item: (-item[3], item[2] == "salience"))
-
-        text_encoder = getattr(self.mind, "text_encoder", None)
 
         compiled: list[CompiledMacro] = []
         reflections: list[dict] = []
-        for pat, starts, compile_via, priority_score in work[: cfg.max_macros_per_tick]:
+        for pat, starts, compile_via, priority_score, centroid_feature, member_patterns in work[: cfg.max_macros_per_tick]:
             # Compute the mean feature vector across all instances of the motif.
             instance_feats: list[torch.Tensor] = []
             instance_ids: list[int] = []
@@ -614,14 +806,17 @@ class DMNChunkingCompiler:
                             "DMNChunkingCompiler: feature pack failed for episode %s",
                             row.get("id"),
                         )
-            if not instance_feats:
+            if not instance_feats and centroid_feature is None:
                 continue
-            stacked = torch.stack(instance_feats, dim=0)
-            mean_feat = stacked.mean(dim=0)
+            mean_feat = centroid_feature if centroid_feature is not None else torch.stack(instance_feats, dim=0).mean(dim=0)
             avg_conf = sum(confs) / max(1, len(confs))
             obs_count = len(starts) if compile_via == "frequency" else min(1000, max(1, int(round(priority_score))))
             macro = CompiledMacro(
-                name=_macro_name_for_pattern(pat),
+                name=(
+                    _macro_name_for_feature_centroid(mean_feat)
+                    if compile_via == "multimodal_trajectory"
+                    else _macro_name_for_pattern(pat)
+                ),
                 pattern=tuple(pat),
                 observation_count=obs_count,
                 avg_confidence=float(avg_conf),
@@ -641,6 +836,7 @@ class DMNChunkingCompiler:
                     "avg_confidence": float(macro.avg_confidence),
                     "member_episodes": list(macro.member_episodes),
                     "salience_score": float(priority_score),
+                    "member_patterns": [list(p) for p in member_patterns],
                 }
             )
             logger.info(
@@ -656,7 +852,7 @@ class DMNChunkingCompiler:
         self.iterations += 1
         return {
             "scanned": len(intents),
-            "candidates": len(motifs_freq) + len(salience_best),
+            "candidates": len(motifs_freq) + len(salience_best) + len(multimodal_motifs),
             "compiled": len(compiled),
             "reflections": reflections,
         }

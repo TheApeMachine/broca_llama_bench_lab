@@ -48,6 +48,16 @@ def test_intensity_vector_returns_all_channels():
     assert intensities["london"] > proc.baseline
 
 
+def test_trace_serializes_intensity_and_excitation_vectors():
+    proc = MultivariateHawkesProcess(beta=0.5, baseline=0.05)
+    proc.observe("meal", t=0.0)
+    trace = proc.trace(t=0.5)
+    assert trace["channels"] == ["meal"]
+    assert trace["intensity"]["meal"] > proc.baseline
+    assert trace["excitation"]["meal"] > 0.0
+    assert trace["beta"] == proc.beta
+
+
 def test_persistent_hawkes_round_trip(tmp_path: Path):
     proc = MultivariateHawkesProcess(beta=0.4, baseline=0.07)
     proc.couple("a", "b", weight=0.5)

@@ -7,6 +7,7 @@ import pytest
 
 from core.calibration.conformal import (
     ConformalPredictor,
+    OnlineConformalMartingale,
     PersistentConformalCalibration,
     empirical_coverage,
 )
@@ -135,3 +136,12 @@ def test_threshold_monotonic_in_alpha():
     t_strict = predictor.threshold()
     # Higher alpha => tighter threshold (smaller score allowed).
     assert t_strict <= t_relaxed + 1e-9
+
+
+def test_online_conformal_martingale_flags_low_p_value_drift():
+    monitor = OnlineConformalMartingale([0.0 for _ in range(9)], alpha=0.1)
+    stable = monitor.update(0.0)
+    assert stable["drifted"] is False
+    shifted = monitor.update(1.0)
+    assert shifted["p_value"] == pytest.approx(0.1)
+    assert shifted["drifted"] is True

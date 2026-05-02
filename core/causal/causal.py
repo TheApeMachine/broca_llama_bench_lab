@@ -192,6 +192,24 @@ class FiniteSCM:
 
         self.equations[name] = EndogenousEquation(name=name, parents=new_parents, fn=fn)
 
+    def detach_endogenous_as_exogenous(self, name: str) -> None:
+        """Remove an endogenous equation and expose its domain as root uncertainty."""
+
+        if name not in self.equations:
+            raise ValueError(
+                f"FiniteSCM.detach_endogenous_as_exogenous: unknown endogenous variable {name!r}"
+            )
+        domain = tuple(self.domains.get(name, ()))
+        if not domain:
+            raise ValueError(
+                f"FiniteSCM.detach_endogenous_as_exogenous: endogenous {name!r} has empty domain"
+            )
+        del self.equations[name]
+        self.order = [v for v in self.order if v != name]
+        self.exogenous[name] = {value: 1.0 / len(domain) for value in domain}
+        self.domains[name] = domain
+        self.labels[name] = "unobserved_exogenous"
+
     @property
     def endogenous_names(self) -> tuple[str, ...]:
         return tuple(self.order)

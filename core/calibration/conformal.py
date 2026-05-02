@@ -233,6 +233,45 @@ class ConformalPredictor:
         return result
 
 
+@dataclass
+class OnlineConformalMartingale:
+    """Power-martingale drift monitor over conformal nonconformity scores."""
+
+    calibration_scores: list[float]
+    alpha: float
+    martingale: float = 1.0
+    updates: int = 0
+
+    def __post_init__(self) -> None:
+        self.calibration_scores = [float(s) for s in self.calibration_scores]
+        self.alpha = max(1e-6, min(1.0 - 1e-6, float(self.alpha)))
+
+    def p_value(self, score: float) -> float:
+        """Conformal p-value for one nonconformity score against calibration."""
+
+        if not self.calibration_scores:
+            raise ValueError("OnlineConformalMartingale requires calibration scores")
+        s = float(score)
+        ge = sum(1 for c in self.calibration_scores if float(c) >= s)
+        return float((ge + 1.0) / (len(self.calibration_scores) + 1.0))
+
+    def update(self, score: float) -> dict[str, float | bool | int]:
+        """Advance the martingale and report whether exchangeability drifted."""
+
+        p = max(1e-12, min(1.0, self.p_value(float(score))))
+        eps = self.alpha
+        self.martingale *= eps * (p ** (eps - 1.0))
+        self.updates += 1
+        drifted = bool(p <= self.alpha or self.martingale >= (1.0 / self.alpha))
+        return {
+            "p_value": float(p),
+            "martingale": float(self.martingale),
+            "updates": int(self.updates),
+            "drifted": drifted,
+            "alpha": float(self.alpha),
+        }
+
+
 class PersistentConformalCalibration:
     """SQLite-backed nonconformity-score store.
 
