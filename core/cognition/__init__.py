@@ -1,8 +1,7 @@
-"""Cognitive substrate package: constants and the stacked implementation in :mod:`core.cognition.substrate`.
+"""Cognition — intent routing, semantics, perception observations, and related constants.
 
-Import the controller with::
-
-    from core.cognition.substrate import SubstrateController
+Import :class:`~core.substrate.controller.SubstrateController` from :mod:`core.substrate.controller`
+(or the compatibility alias :mod:`core.cognition.substrate`).
 """
 
 from __future__ import annotations

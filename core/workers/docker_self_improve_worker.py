@@ -42,8 +42,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from ..cognition.substrate import CognitiveFrame, SubstrateController
-from ..frame import SubwordProjector
+from ..frame import CognitiveFrame, SubwordProjector
+from ..substrate.controller import SubstrateController
 
 _SUBWORD = SubwordProjector()
 

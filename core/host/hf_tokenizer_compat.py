@@ -13,10 +13,13 @@ from .tokenizer import Batch
 def _fallback_pad_id(tok: Any) -> int:
     eos = getattr(tok, "eos_token_id", None)
     pad = getattr(tok, "pad_token_id", None)
+
     if pad is None and eos is not None:
         return int(eos)
+    
     if pad is None:
         return 0
+    
     return int(pad)
 
 
@@ -31,8 +34,10 @@ class HuggingFaceBrocaTokenizer:
     def __init__(self, pretrained: Any, *, ensure_pad_token: bool = True) -> None:
         inner = copy.copy(pretrained)
         self.inner = inner
+
         if ensure_pad_token and getattr(inner, "pad_token_id", None) is None:
             eos = getattr(inner, "eos_token_id", None)
+        
             if eos is not None:
                 inner.pad_token = inner.eos_token
                 inner.pad_token_id = int(eos)
@@ -48,14 +53,19 @@ class HuggingFaceBrocaTokenizer:
 
     def encode(self, text: str, *, add_special_tokens: bool = False, add_bos: bool = False, add_eos: bool = False) -> list[int]:
         ids = list(self.inner.encode(text, add_special_tokens=add_special_tokens))
+        
         if add_bos and getattr(self.inner, "bos_token_id", None) is not None:
             bos = int(self.inner.bos_token_id)
+        
             if not ids or ids[0] != bos:
                 ids = [bos] + ids
+        
         if add_eos and getattr(self.inner, "eos_token_id", None) is not None:
             eos = int(self.inner.eos_token_id)
+        
             if not ids or ids[-1] != eos:
                 ids = ids + [eos]
+        
         return ids
 
     def decode_id(self, idx: int) -> str:
@@ -86,23 +96,29 @@ class HuggingFaceBrocaTokenizer:
             z = torch.zeros(0, 0, dtype=torch.long)
             zb = torch.zeros(0, 0, dtype=torch.bool)
             zl = torch.zeros(0, dtype=torch.long)
+        
             if device is not None:
                 z = z.to(device)
                 zb = zb.to(device)
                 zl = zl.to(device)
+        
             return Batch(ids=z, attention_mask=zb, lengths=zl)
+        
         encoded = [self.encode(t, add_special_tokens=False) for t in texts]
         max_len = max(len(row) for row in encoded)
         pad = self.pad_id
         ids = torch.full((len(encoded), max_len), pad, dtype=torch.long)
         mask = torch.zeros((len(encoded), max_len), dtype=torch.bool)
         lengths = torch.tensor([len(row) for row in encoded], dtype=torch.long)
+        
         for i, row in enumerate(encoded):
             if row:
                 ids[i, : len(row)] = torch.tensor(row, dtype=torch.long)
                 mask[i, : len(row)] = True
+        
         if device is not None:
             ids = ids.to(device)
             mask = mask.to(device)
             lengths = lengths.to(device)
+        
         return Batch(ids=ids, attention_mask=mask, lengths=lengths)

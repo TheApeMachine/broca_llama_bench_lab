@@ -9,7 +9,7 @@ import pytest
 
 import core.cognition.substrate as substrate_mod
 from core.cli import build_substrate_controller
-from core.cognition.affect_trace import PersistentAffectTrace
+from core.affect.trace import PersistentAffectTrace
 from core.encoders.affect import AffectEncoder, AffectState, EmotionScore
 
 from conftest import FakeHost, FakeTokenizer, make_stub_llm_pair, stub_substrate_encoders
@@ -169,7 +169,7 @@ def test_chat_reply_records_user_and_assistant_affect_alignment(
         confidences=[("anger", 0.05), ("annoyance", 0.1), ("neutral", 0.85)],
     )
     mind.affect_encoder = SequenceAffectEncoder([user, assistant])  # type: ignore[assignment]
-    from core.cognition.chat_orchestrator import ChatOrchestrator
+    from core.chat.orchestrator import ChatOrchestrator
 
     monkeypatch.setattr(
         ChatOrchestrator,
@@ -185,5 +185,5 @@ def test_chat_reply_records_user_and_assistant_affect_alignment(
     assert summary["user_count"] == 1
     assert summary["assistant_count"] == 1
     assert summary["paired_count"] == 1
-    assert "affect_alignment" in mind._last_chat_meta
-    assert mind._last_chat_meta["assistant_affect"]["confidences"][0]["label"] == "neutral"
+    assert "affect_alignment" in mind.session.last_chat_meta
+    assert mind.session.last_chat_meta["assistant_affect"]["confidences"][0]["label"] == "neutral"

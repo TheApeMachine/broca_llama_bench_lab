@@ -13,17 +13,14 @@ from __future__ import annotations
 
 import logging
 import sqlite3
-from typing import TYPE_CHECKING, Sequence
+from typing import Any, Sequence
 
 import torch
 import torch.nn.functional as F
 
 from ..frame import FrameDimensions, ParsedClaim, SubwordProjector
 from ..symbolic.vsa import bundle, cosine as vsa_cosine
-
-
-if TYPE_CHECKING:
-    from .substrate import SubstrateController
+from ..memory.algebraic_adapter import AlgebraicMemoryAdapter
 
 
 logger = logging.getLogger(__name__)
@@ -33,15 +30,22 @@ _SUBWORD = SubwordProjector()
 class ClaimRefiner:
     """Stateless contextual cleanup of LLM/encoder-parsed triples."""
 
-    def __init__(self, mind: "SubstrateController") -> None:
-        self._mind = mind
+    def __init__(
+        self,
+        *,
+        vsa: Any,
+        memory: Any,
+        hopfield_memory: Any,
+        algebra: AlgebraicMemoryAdapter,
+    ) -> None:
+        self._vsa = vsa
+        self._memory = memory
+        self._hopfield = hopfield_memory
+        self._algebra = algebra
 
     def refine(
         self, utterance: str, toks: Sequence[str], claim: ParsedClaim
     ) -> ParsedClaim:
-        from .comprehension_pipeline import _SUBWORD as _CP_SUBWORD  # noqa: F401  (parity)
-
-        mind = self._mind
         words = [
             w.lower() for w in (t for t in toks if any(ch.isalnum() for ch in t))
         ]
@@ -49,18 +53,18 @@ class ClaimRefiner:
         if len(ctx_words) < 2:
             return claim
         try:
-            ctx_bundle = bundle([mind.vsa.atom(w) for w in ctx_words])
+            ctx_bundle = bundle([self._vsa.atom(w) for w in ctx_words])
         except (RuntimeError, ValueError, TypeError):
             return claim
 
         pred = claim.predicate.lower()
         candidates_obj: set[str] = {claim.obj.lower()}
         try:
-            candidates_obj |= set(mind.memory.distinct_objects_for_predicate(pred))
+            candidates_obj |= set(self._memory.distinct_objects_for_predicate(pred))
         except (sqlite3.Error, OSError, TypeError):
             pass
         try:
-            for _s, _p, o, _c, _e in mind.memory.all_facts():
+            for _s, _p, o, _c, _e in self._memory.all_facts():
                 ol = str(o).lower()
                 if claim.obj.lower() in ol or ol in claim.obj.lower() or ol in words:
                     candidates_obj.add(ol)
@@ -70,7 +74,7 @@ class ClaimRefiner:
         candidates_obj = {c for c in candidates_obj if c}
         best_obj = claim.obj.lower()
         try:
-            base_trip = mind.vsa.encode_triple(claim.subject.lower(), pred, best_obj)
+            base_trip = self._vsa.encode_triple(claim.subject.lower(), pred, best_obj)
             base_sim = vsa_cosine(ctx_bundle, base_trip)
         except (RuntimeError, ValueError, TypeError):
             return claim
@@ -79,7 +83,7 @@ class ClaimRefiner:
             if cand == best_obj:
                 continue
             try:
-                trip = mind.vsa.encode_triple(claim.subject.lower(), pred, cand)
+                trip = self._vsa.encode_triple(claim.subject.lower(), pred, cand)
                 sc = vsa_cosine(ctx_bundle, trip)
                 if sc > base_sim + 0.03:
                     base_sim = sc
@@ -88,9 +92,9 @@ class ClaimRefiner:
                 continue
 
         try:
-            q = mind._padded_hopfield_sketch(_SUBWORD.encode(utterance[:512]))
-            if len(mind.hopfield_memory) > 0:
-                ret, w = mind.hopfield_memory.retrieve(q)
+            q = self._algebra.padded_hopfield_sketch(_SUBWORD.encode(utterance[:512]))
+            if len(self._hopfield) > 0:
+                ret, w = self._hopfield.retrieve(q)
                 if w.numel() and float(w.max().item()) > 0.2:
                     hf_best: str | None = None
                     hf_score = -1.0
@@ -106,7 +110,7 @@ class ClaimRefiner:
                             hf_score = cc
                             hf_best = cand
                     if hf_best is not None and hf_score > 0.38 and hf_best != best_obj:
-                        trip_h = mind.vsa.encode_triple(
+                        trip_h = self._vsa.encode_triple(
                             claim.subject.lower(), pred, hf_best
                         )
                         if vsa_cosine(ctx_bundle, trip_h) >= base_sim - 0.02:

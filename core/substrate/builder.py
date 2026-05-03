@@ -16,8 +16,6 @@ to a single ``SubstrateBuilder.populate(self, …)`` call.
 from __future__ import annotations
 
 import logging
-import threading
-from collections import deque
 from pathlib import Path
 from typing import Any
 
@@ -29,20 +27,19 @@ from ..agent.active_inference import (
     build_tiger_pomdp,
 )
 from ..calibration.conformal import ConformalPredictor, PersistentConformalCalibration
+from ..affect.trace import PersistentAffectTrace
 from ..causal import build_simpson_scm
-from ..cognition.affect_trace import PersistentAffectTrace
+from ..cognition.encoder_relation_extractor import EncoderRelationExtractor
 from ..cognition.intent_gate import IntentGate
 from ..cognition.semantic_cascade import SemanticCascade
-from ..cognition.encoder_relation_extractor import EncoderRelationExtractor
-from ..cognition.multimodal_perception import MultimodalPerceptionPipeline
-from ..comprehension import CognitiveRouter, DeferredRelationIngest
-from ..dmn import CognitiveBackgroundWorker
+from ..comprehension import CognitiveRouter
+from ..cognition.constants import DEFAULT_CHAT_MODEL_ID
 from ..encoders.affect import AffectEncoder
 from ..encoders.classification import SemanticClassificationEncoder
 from ..encoders.extraction import ExtractionEncoder
 from ..frame import EmbeddingProjector, FrameDimensions, FramePacker
 from ..grafting.dynamic_grafts import DynamicGraftSynthesizer
-from ..grafts import LexicalPlanGraft, SubstrateLogitBiasGraft, TrainableFeatureGraft
+from ..grafts.builder import HostGraftsBuilder
 from ..host.llama_broca_host import LlamaBrocaHost
 from ..host.hf_tokenizer_compat import HuggingFaceBrocaTokenizer
 from ..idletime.chunking import DMNChunkingCompiler, MacroChunkRegistry
@@ -56,13 +53,17 @@ from ..memory import (
     WorkspaceJournal,
 )
 from ..natives.native_tools import NativeTool, NativeToolRegistry
-from ..substrate.graph import EpisodeAssociationGraph
-from ..substrate.runtime import default_substrate_sqlite_path, ensure_parent_dir
+from ..natives.tool_foraging_slot import ToolForagingSlot
+from ..perception.multimodal_pipeline import MultimodalPerceptionPipeline
+from .facades import SubstrateRuntime
+from .graph import EpisodeAssociationGraph
+from .orchestration_linker import OrchestrationLinker
+from .runtime import default_substrate_sqlite_path, ensure_parent_dir
+from .session_state import SubstrateSessionState
 from ..symbolic.vsa import VSACodebook
 from ..system.device import pick_torch_device
 from ..temporal.hawkes import MultivariateHawkesProcess, PersistentHawkes
 from ..workspace import BaseWorkspace, GlobalWorkspace, WorkspaceBuilder
-from .constants import DEFAULT_CHAT_MODEL_ID
 
 
 logger = logging.getLogger(__name__)
@@ -85,8 +86,6 @@ class SubstrateBuilder:
         lexical_target_snr: float | None = None,
         preload_host_tokenizer: tuple[LlamaBrocaHost, HuggingFaceBrocaTokenizer] | None = None,
     ) -> None:
-        from ..grafts.lexical_plan import LexicalPlanGraft  # noqa: F811  (avoid circular at import time)
-
         mind.seed = seed
         rp = Path(db_path) if db_path is not None else default_substrate_sqlite_path()
         ensure_parent_dir(rp)
@@ -105,6 +104,8 @@ class SubstrateBuilder:
         cls._build_dynamic_grafts(mind, rp, namespace)
         cls._build_tool_foraging(mind)
         cls._build_workspace_handle(mind)
+        OrchestrationLinker.wire(mind)
+        mind.runtime = SubstrateRuntime(mind)
 
     # -- per-concern construction helpers -------------------------------------
 
@@ -126,7 +127,7 @@ class SubstrateBuilder:
         if preload is None:
             import torch
 
-            from . import substrate as substrate_mod
+            from . import controller as substrate_mod
 
             resolved_device = (
                 device if isinstance(device, torch.device) else pick_torch_device(device)
@@ -141,26 +142,7 @@ class SubstrateBuilder:
 
     @classmethod
     def _build_grafts(cls, mind: Any, lexical_target_snr: float | None) -> None:
-        from ..grafting.grafts import DEFAULT_GRAFT_TARGET_SNR
-
-        snr = lexical_target_snr if lexical_target_snr is not None else DEFAULT_GRAFT_TARGET_SNR
-        mind.lexical_graft = LexicalPlanGraft(target_snr=snr)
-        mind.host.add_graft("final_hidden", mind.lexical_graft)
-        mind.feature_graft = TrainableFeatureGraft(
-            FrameDimensions.broca_feature_dim(),
-            int(getattr(mind.host.cfg, "d_model", 96)),
-            target_snr=snr,
-        )
-        host_param = None
-        params = getattr(mind.host, "parameters", None)
-        if callable(params):
-            host_param = next(iter(params()), None)
-            if host_param is not None:
-                mind.feature_graft.to(host_param.device)
-        mind.host.add_graft("final_hidden", mind.feature_graft)
-        mind.logit_bias_graft = SubstrateLogitBiasGraft()
-        mind.host.add_graft("logits", mind.logit_bias_graft)
-        mind._host_param = host_param
+        HostGraftsBuilder.populate(mind, lexical_target_snr=lexical_target_snr)
 
     @classmethod
     def _build_perception(cls, mind: Any, device: Any) -> None:
@@ -226,7 +208,6 @@ class SubstrateBuilder:
             initial_C=list(mind.causal_pomdp.C),
             prior_strength=4.0,
         )
-        mind._sync_preference_to_pomdp()
         mind.ontology_persistence = PersistentOntologicalRegistry(
             rp, namespace=f"{namespace}__ontology"
         )
@@ -248,14 +229,6 @@ class SubstrateBuilder:
     @classmethod
     def _build_native_tools(cls, mind: Any, rp: Path, namespace: str) -> None:
         mind.tool_registry = NativeToolRegistry(rp, namespace=f"{namespace}__tools")
-        try:
-            mind.tool_registry.attach_to_scm(
-                mind.scm,
-                topology_lock=mind._cognitive_state_lock,
-                on_tool_drift=mind._handle_native_tool_drift,
-            )
-        except Exception:
-            logger.exception("SubstrateBuilder: initial tool attachment failed")
 
     @classmethod
     def _build_dynamic_grafts(cls, mind: Any, rp: Path, namespace: str) -> None:
@@ -268,9 +241,11 @@ class SubstrateBuilder:
 
     @classmethod
     def _build_tool_foraging(cls, mind: Any) -> None:
-        mind.tool_foraging_agent = ToolForagingAgent.build(
-            n_existing_tools=mind.tool_registry.count(),
-            insufficient_prior=0.5,
+        mind.tool_foraging = ToolForagingSlot(
+            ToolForagingAgent.build(
+                n_existing_tools=mind.tool_registry.count(),
+                insufficient_prior=0.5,
+            )
         )
 
     @classmethod
@@ -279,16 +254,7 @@ class SubstrateBuilder:
 
     @classmethod
     def _init_state(cls, mind: Any, rp: Path, namespace: str, model_id: str) -> None:
-        mind._last_intent = None
-        mind._last_affect = None
-        mind._last_user_affect_trace_id = None
-        mind._last_journal_id = None
-        mind._background_worker: CognitiveBackgroundWorker | None = None
-        mind._self_improve_worker: Any | None = None
-        mind._cognitive_state_lock = threading.RLock()
-        mind._deferred_relation_jobs: deque[DeferredRelationIngest] = deque()
-        mind._next_deferred_relation_job_id = 1
-        mind._last_chat_meta = {}
+        mind.session = SubstrateSessionState()
         mind._db_path = rp
         mind._namespace = namespace
         mind._llama_model_id = model_id

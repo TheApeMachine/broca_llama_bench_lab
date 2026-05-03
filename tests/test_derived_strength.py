@@ -13,7 +13,7 @@ import math
 
 import pytest
 
-from core.cognition.derived_strength import DerivedStrength, StrengthInputs
+from core.chat.derived_strength import DerivedStrength, StrengthInputs
 
 
 class TestStrengthCollapsesWhenSubstrateIsEmpty:

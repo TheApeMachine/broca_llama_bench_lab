@@ -130,7 +130,7 @@ def bench_rule_shift(
     ``seed + trial_index * 1_000_003`` and micro-jitter on challenger prediction
     gaps so finite-sample variability can be summarized (mean, variance, CI).
     """
-    from core.cognition.substrate import SymbolicMemory
+    from core.memory import SymbolicMemory
 
     start = time.time()
     trial_scores: list[float] = []
@@ -403,7 +403,7 @@ def bench_causal_reasoning() -> SubstrateBenchmarkResult:
 
 def bench_memory_fidelity(*, n_triples: int = 100, seed: int = 0) -> SubstrateBenchmarkResult:
     """Write N random triples to semantic memory, recall each, measure accuracy."""
-    from core.cognition.substrate import SymbolicMemory
+    from core.memory import SymbolicMemory
 
     start = time.time()
     rng = random.Random(seed)

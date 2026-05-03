@@ -21,7 +21,7 @@ from ..frame import ParsedClaim
 
 
 if TYPE_CHECKING:
-    from ..cognition.substrate import SubstrateController
+    from ..substrate.controller import SubstrateController
 
 
 logger = logging.getLogger(__name__)

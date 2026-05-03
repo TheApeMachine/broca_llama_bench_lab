@@ -178,7 +178,7 @@ class CognitiveBackgroundWorker:
         # Reactive belief consolidation runs after the autonomous phases so
         # any DMN-promoted edges or boosted confidences are visible to it.
         try:
-            with self.mind._cognitive_state_lock:
+            with self.mind.session.cognitive_state_lock:
                 claim_reflections = self.mind.consolidate_once()
         except Exception:
             logger.exception("DMN claim consolidation failed")
@@ -268,7 +268,7 @@ class CognitiveBackgroundWorker:
     # ------------------------------------------------------------------ Phase 1
 
     def _phase1_consolidation(self) -> tuple[list[dict], dict[str, Any]]:
-        with self.mind._cognitive_state_lock:
+        with self.mind.session.cognitive_state_lock:
             cfg = self.config
             graph = self.mind.episode_graph
             memory = self.mind.memory
@@ -388,7 +388,7 @@ class CognitiveBackgroundWorker:
                 urgency,
             )
 
-        with self.mind._cognitive_state_lock:
+        with self.mind.session.cognitive_state_lock:
             ws.intrinsic_cues = [
                 c for c in ws.intrinsic_cues if not (c.faculty == "entity_ambiguity" and getattr(c, "source", None) == "dmn")
             ]
@@ -421,7 +421,7 @@ class CognitiveBackgroundWorker:
         return reflections, summary
 
     def _causal_dreaming(self) -> dict[str, Any]:
-        with self.mind._cognitive_state_lock:
+        with self.mind.session.cognitive_state_lock:
             cfg = self.config
             scm = getattr(self.mind, "scm", None)
             if scm is None:
@@ -613,7 +613,8 @@ class CognitiveBackgroundWorker:
         knows to act.
         """
 
-        agent = getattr(self.mind, "tool_foraging_agent", None)
+        slot = self.mind.tool_foraging
+        agent = slot.agent
         unified = getattr(self.mind, "unified_agent", None)
         registry = getattr(self.mind, "tool_registry", None)
         if agent is None or unified is None or registry is None:
@@ -703,14 +704,8 @@ class CognitiveBackgroundWorker:
         if self.motor_trainer is None:
             summary["motor"] = motor
         else:
-            replay_buf = getattr(self.mind, "motor_replay", None)
-            if replay_buf is None:
-                raise RuntimeError("REM motor learning requires mind.motor_replay on the substrate")
-            lock = getattr(self.mind, "_cognitive_state_lock", None)
-            if lock is None:
-                raise RuntimeError(
-                    "REM motor learning requires mind._cognitive_state_lock for thread-safe replay access"
-                )
+            replay_buf = self.mind.motor_replay
+            lock = self.mind.session.cognitive_state_lock
             with lock:
                 replay = list(replay_buf)[-cfg.sleep_max_replay :]
             try:
@@ -744,7 +739,7 @@ class CognitiveBackgroundWorker:
                 logger.exception("REM.hawkes: EM fit failed")
                 mu, alpha = None, None
             if mu is not None and alpha is not None:
-                with self.mind._cognitive_state_lock:
+                with self.mind.session.cognitive_state_lock:
                     self.mind.hawkes.refit(channels, mu, alpha)
                     try:
                         self.mind.hawkes_persistence.save(self.mind.hawkes)

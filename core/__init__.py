@@ -17,7 +17,7 @@ from .agent.active_inference import (
     derived_listen_channel_reliability,
     extend_pomdp_with_synthesize_tool,
 )
-from .cognition.substrate import SubstrateController
+from .substrate.controller import SubstrateController
 from .dmn import CognitiveBackgroundWorker, DMNConfig
 from .grafts import TrainableFeatureGraft
 from .memory import SymbolicMemory, WorkspaceJournal

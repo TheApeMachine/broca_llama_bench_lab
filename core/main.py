@@ -2,7 +2,7 @@
 
 Every subcommand uses the same documented runtime (environment variables,
 substrate DB path, model id resolution) via :mod:`core.cli` where a
-:class:`core.cognition.substrate.SubstrateController` is involved.
+:class:`core.substrate.controller.SubstrateController` is involved.
 
 ``demo`` and ``paper`` forward trailing arguments unchanged (so e.g.
 ``python -m core.main demo --mode broca`` works). Nested subparsers do not;

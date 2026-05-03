@@ -7,7 +7,8 @@ import pytest
 
 import core.cognition.substrate as substrate_mod
 from core.cli import build_substrate_controller
-from core.cognition.substrate import CognitiveFrame, SubstrateController
+from core.cognition.substrate import SubstrateController
+from core.frame import CognitiveFrame
 from core.workspace.event_bus import EventBus
 
 from conftest import make_stub_llm_pair
@@ -108,7 +109,7 @@ def test_consolidate_once_publishes_event(tmp_path: Path, fake_host_loader):
 def test_snapshot_includes_last_chat_meta_when_set(tmp_path: Path, fake_host_loader):
     _host, mind = fake_host_loader(tmp_path)
     del _host
-    mind._last_chat_meta = {
+    mind.session.last_chat_meta = {
         "intent": "memory_lookup",
         "confidence": 0.9,
         "eff_temperature": 0.4,

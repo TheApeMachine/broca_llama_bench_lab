@@ -1,41 +1,27 @@
-"""ChatOrchestrator — substrate-biased free-form chat reply.
+"""Chat orchestrator — substrate-biased decode (frame → grafts → host).
 
-The largest single block of behavior the substrate controller used to hold:
-the user's last message routes through :meth:`SubstrateController.comprehend`
-to obtain a cognitive frame, the frame's continuous features feed
-:class:`TrainableFeatureGraft`, a derived logit-bias dict over the answer's
-content subwords feeds :class:`SubstrateLogitBiasGraft`, and the LLM then
-decodes a free-form reply through its own chat template — surface form,
-fluency, and ordering are entirely the LLM's choice.
-
-This file owns the orchestration. The controller's ``chat_reply`` becomes
-a one-liner: ``return ChatOrchestrator(self).run(messages, ...)``.
+Runs against :class:`core.substrate.controller.SubstrateController`; token/content
+bias derivation lives in :mod:`core.grafts.feature`.
 """
 
 from __future__ import annotations
 
-import logging
 import math
 import time
-from typing import TYPE_CHECKING, Any, Callable, Sequence
+from typing import Any, Callable, Sequence
 
 import torch
 
 from ..agent.active_inference import entropy as belief_entropy
+from ..affect.evidence import AffectEvidence
+from .derived_strength import DerivedStrength, StrengthInputs
 from ..dmn import DMNConfig
 from ..frame import CognitiveFrame
-from .derived_strength import DerivedStrength, StrengthInputs
-
-
-if TYPE_CHECKING:
-    from .substrate import SubstrateController
-
-
-logger = logging.getLogger(__name__)
+from ..grafts.feature import FrameGraftProjection
 
 
 class ChatOrchestrator:
-    """Run a substrate-biased chat turn against the controller's faculties."""
+    """One substrate-biased chat turn (frame → grafts → host decode)."""
 
     def __init__(self, mind: "SubstrateController") -> None:
         self._mind = mind
@@ -73,7 +59,7 @@ class ChatOrchestrator:
         )
         bias_top: list[dict[str, Any]] = self._bias_preview(logit_bias)
 
-        mind._last_chat_meta = {
+        mind.session.last_chat_meta = {
             "intent": frame.intent,
             "subject": frame.subject,
             "answer": frame.answer,
@@ -85,10 +71,7 @@ class ChatOrchestrator:
             "derived_target_snr_scale": float(derived_scale),
             "ts": time.time(),
         }
-        try:
-            mind.event_bus.publish("chat.start", dict(mind._last_chat_meta))
-        except Exception:
-            logger.exception("ChatOrchestrator.run: chat.start publish failed")
+        mind.event_bus.publish("chat.start", dict(mind.session.last_chat_meta))
 
         text, gen_ids, sub_inertia = self._stream(
             msgs,
@@ -112,28 +95,19 @@ class ChatOrchestrator:
         self._record_assistant_affect(text, frame, confidence)
         return frame, text
 
-    # -- private helpers ------------------------------------------------------
-
     def _bias_preview(self, logit_bias: dict[int, float]) -> list[dict[str, Any]]:
+        hf_tok = getattr(self._mind.tokenizer, "inner", None)
+        if hf_tok is None:
+            raise RuntimeError("ChatOrchestrator._bias_preview requires tokenizer.inner")
         preview: list[dict[str, Any]] = []
-        try:
-            hf_tok = getattr(self._mind.tokenizer, "inner", None)
-            if hf_tok is not None and logit_bias:
-                ranked = sorted(logit_bias.items(), key=lambda kv: kv[1], reverse=True)[:8]
-                for tid, val in ranked:
-                    try:
-                        piece = hf_tok.decode(
-                            [int(tid)],
-                            skip_special_tokens=True,
-                            clean_up_tokenization_spaces=False,
-                        )
-                    except Exception:
-                        piece = f"<{tid}>"
-                    preview.append(
-                        {"token_id": int(tid), "token": piece, "bias": float(val)}
-                    )
-        except Exception:
-            logger.exception("ChatOrchestrator: bias preview extraction failed")
+        ranked = sorted(logit_bias.items(), key=lambda kv: kv[1], reverse=True)[:8]
+        for tid, val in ranked:
+            piece = hf_tok.decode(
+                [int(tid)],
+                skip_special_tokens=True,
+                clean_up_tokenization_spaces=False,
+            )
+            preview.append({"token_id": int(tid), "token": piece, "bias": float(val)})
         return preview
 
     def _record_assistant_affect(
@@ -141,50 +115,41 @@ class ChatOrchestrator:
     ) -> None:
         mind = self._mind
         assistant_affect = mind.affect_encoder.detect(text)
-        if mind._last_affect is None:
+        if mind.session.last_affect is None:
             raise RuntimeError(
                 "ChatOrchestrator: cannot align affect before user affect has been recorded"
             )
-        affect_alignment = mind.affect_trace.alignment(mind._last_affect, assistant_affect)
+        affect_alignment = mind.affect_trace.alignment(mind.session.last_affect, assistant_affect)
         assistant_affect_trace_id = mind.affect_trace.record(
             role="assistant",
             text=text,
             affect=assistant_affect,
-            response_to_id=mind._last_user_affect_trace_id,
+            response_to_id=mind.session.last_user_affect_trace_id,
             alignment=affect_alignment,
         )
-        from .affect_evidence import AffectEvidence
 
-        mind._last_chat_meta = {
-            **mind._last_chat_meta,
+        mind.session.last_chat_meta = {
+            **mind.session.last_chat_meta,
             "assistant_affect": AffectEvidence.as_dict(assistant_affect),
             "affect_alignment": affect_alignment,
             "assistant_affect_trace_id": int(assistant_affect_trace_id),
-            "user_affect_trace_id": mind._last_user_affect_trace_id,
+            "user_affect_trace_id": mind.session.last_user_affect_trace_id,
         }
-        try:
-            mind.event_bus.publish(
-                "chat.complete",
-                {
-                    "intent": frame.intent,
-                    "confidence": float(confidence),
-                    "affect_alignment": float(affect_alignment["alignment"]),
-                    "reply_chars": len(text),
-                    "reply_preview": text[:200],
-                },
-            )
-        except Exception:
-            logger.exception("ChatOrchestrator: chat.complete publish failed")
+        mind.event_bus.publish(
+            "chat.complete",
+            {
+                "intent": frame.intent,
+                "confidence": float(confidence),
+                "affect_alignment": float(affect_alignment["alignment"]),
+                "reply_chars": len(text),
+                "reply_preview": text[:200],
+            },
+        )
 
     def _substrate_temperature_scale(self, frame: CognitiveFrame, confidence: float) -> float:
-        """Sampling temperature multiplier derived from substrate posterior entropy."""
-
         if frame.intent == "unknown":
             return 1.0
-        try:
-            coupled = self._mind.unified_agent.decide()
-        except (RuntimeError, ValueError, IndexError):
-            return max(1e-3, 1.0 - 0.6 * float(confidence))
+        coupled = self._mind.unified_agent.decide()
         if coupled.faculty == "spatial":
             posterior = list(coupled.spatial_decision.posterior_over_policies)
         else:
@@ -200,53 +165,15 @@ class ChatOrchestrator:
         return max(1e-3, normalized_uncertainty * (1.0 - 0.6 * float(confidence)))
 
     def _content_logit_bias(self, frame: CognitiveFrame) -> dict[int, float]:
-        """Map substrate content (subject / predicate / answer) to subword token ids."""
-
-        if frame.intent == "unknown":
-            return {}
-        targets: list[str] = []
-        if frame.subject:
-            targets.append(str(frame.subject))
-        if frame.answer and frame.answer.lower() != "unknown":
-            targets.append(str(frame.answer))
-        pred = (frame.evidence or {}).get("predicate") or (frame.evidence or {}).get(
-            "predicate_surface"
-        )
-        if isinstance(pred, str) and pred:
-            targets.append(pred)
-        if not targets:
-            return {}
-        hf_tok = getattr(self._mind.tokenizer, "inner", None)
-        bias: dict[int, float] = {}
-        for surface in targets:
-            surface = surface.strip()
-            if not surface:
-                continue
-            ids: list[int] = []
-            if hf_tok is not None and callable(getattr(hf_tok, "encode", None)):
-                ids.extend(int(t) for t in hf_tok.encode(surface, add_special_tokens=False))
-                ids.extend(
-                    int(t) for t in hf_tok.encode(" " + surface, add_special_tokens=False)
-                )
-            else:
-                ids.extend(int(t) for t in self._mind.tokenizer.encode(surface))
-            for tid in set(ids):
-                if tid < 0:
-                    continue
-                bias[tid] = max(bias.get(tid, 0.0), 1.0)
-        return bias
+        return FrameGraftProjection(self._mind).content_logit_bias(frame)
 
     def _derived_target_snr_scale(self, frame: CognitiveFrame) -> float:
-        """Compose intent / memory / conformal / affect into a graft-strength scale in ``[0, 1]``."""
-
-        from .affect_evidence import AffectEvidence
-
         evidence = frame.evidence or {}
         is_actionable = bool(evidence.get("is_actionable", frame.intent != "unknown"))
         actionability = 1.0 if is_actionable else 0.0
         memory_confidence = max(0.0, min(1.0, float(frame.confidence)))
         conformal_set_size = int(evidence.get("conformal_set_size", 0) or 0)
-        certainty = AffectEvidence.certainty(self._mind._last_affect)
+        certainty = AffectEvidence.certainty(self._mind.session.last_affect)
         return float(
             DerivedStrength.compute(
                 StrengthInputs(
@@ -267,8 +194,6 @@ class ChatOrchestrator:
         substrate_confidence: float,
         substrate_inertia: float,
     ) -> None:
-        """Append one training target for REM-time :class:`GraftMotorTrainer`."""
-
         if len(generated_token_ids) == 0:
             return
         mind = self._mind
@@ -284,7 +209,7 @@ class ChatOrchestrator:
         }
         if snap is not None:
             item["broca_features"] = snap
-        with mind._cognitive_state_lock:
+        with mind.session.cognitive_state_lock:
             mind.motor_replay.append(item)
             if len(mind.motor_replay) > cap:
                 mind.motor_replay[:] = mind.motor_replay[-cap:]

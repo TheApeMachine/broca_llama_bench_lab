@@ -1,6 +1,6 @@
 """Shared runtime setup for every Mosaic CLI (one consistent substrate stack).
 
-Interactive paths build :class:`core.cognition.substrate.SubstrateController` through
+Interactive paths build :class:`core.substrate.controller.SubstrateController` through
 this module so device resolution, SQLite paths, Hugging Face token handling,
 tokenizers env, and background/self-improve services match everywhere.
 """
@@ -13,7 +13,7 @@ import warnings
 from pathlib import Path
 from typing import Any
 
-from .cognition.substrate import SubstrateController
+from .substrate.controller import SubstrateController
 from .system.device import pick_torch_device
 from .workspace import BaseWorkspace, WorkspaceBuilder
 from .workspace.log_handler import LogToBusHandler

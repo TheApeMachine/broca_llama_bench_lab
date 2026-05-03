@@ -19,15 +19,16 @@ The pipeline:
   the utterance and emits a scored :class:`FacultyCandidate`; the highest-
   precision candidate above the relevance floor wins, otherwise the
   workspace receives an ``unknown`` frame with the candidate trace.
-
-Public surface: the classes named in :data:`__all__`.
 """
 
 from __future__ import annotations
 
 from .claim_prediction_gap import ClaimPredictionGap
+from .claim_refiner import ClaimRefiner
+from .deferred_queue import DeferredRelationQueue
 from .deferred_relation_ingest import DeferredRelationIngest
 from .memory_query_parser import MemoryQueryParser
+from .pipeline import ComprehensionPipeline
 from .router import CognitiveRouter
 from .scm_target_picker import SCMTargetPicker
 from .text_relevance import TextRelevance
@@ -35,8 +36,11 @@ from .tokens import LexicalTokens
 
 __all__ = [
     "ClaimPredictionGap",
+    "ClaimRefiner",
     "CognitiveRouter",
+    "ComprehensionPipeline",
     "DeferredRelationIngest",
+    "DeferredRelationQueue",
     "LexicalTokens",
     "MemoryQueryParser",
     "SCMTargetPicker",

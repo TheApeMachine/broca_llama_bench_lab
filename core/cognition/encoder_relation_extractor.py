@@ -51,7 +51,7 @@ class EncoderRelationExtractor:
         *,
         utterance_intent: UtteranceIntent | None = None,
     ) -> Any:
-        from .substrate import ParsedClaim
+        from ..frame import ParsedClaim
 
         text = (utterance or "").strip()
         if not text:

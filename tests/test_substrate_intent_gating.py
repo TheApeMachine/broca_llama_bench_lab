@@ -311,7 +311,7 @@ class TestStatementsStillFlowThrough:
             },
         )
         worker = StubBackgroundWorker()
-        mind._background_worker = worker  # type: ignore[assignment]
+        mind.session.background_worker = worker  # type: ignore[assignment]
 
         frame = mind.comprehend("Ada lives in Rome")
 

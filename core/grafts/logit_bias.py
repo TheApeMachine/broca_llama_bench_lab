@@ -54,17 +54,24 @@ class SubstrateLogitBiasGraft(BaseGraft):
     def forward(self, x: torch.Tensor, state: dict) -> torch.Tensor:
         if not self.enabled:
             return x
+
         bias = state.get("broca_logit_bias")
+        
         if not bias:
             return x
+        
         substrate_scale = state_target_snr_scale(state)
+        
         if substrate_scale <= 0.0:
             return x
+        
         decay_raw = state.get("broca_logit_bias_decay", 1.0)
+        
         try:
             decay = float(decay_raw)
         except (TypeError, ValueError):
             decay = 1.0
+        
         if decay <= 0.0:
             return x
 
@@ -72,10 +79,12 @@ class SubstrateLogitBiasGraft(BaseGraft):
         inertia = max(float(state_inertia(state)), 1e-6)
 
         last_raw = state.get("last_indices")
+        
         if last_raw is None:
             raise ValueError(
                 "SubstrateLogitBiasGraft.forward: missing required state key 'last_indices'"
             )
+        
         last = last_raw.to(x.device)
         rows = torch.arange(x.shape[0], device=x.device)
 
@@ -86,18 +95,24 @@ class SubstrateLogitBiasGraft(BaseGraft):
         probs = log_probs.exp()
         entropy_val = -(probs * log_probs).sum(dim=-1)
         log_vocab = math.log(max(2, last_logits.shape[-1]))
+        
         # peakedness ∈ [0, 1]: 1.0 when distribution is a delta, ~0 when uniform
         stubbornness = (1.0 - entropy_val / log_vocab).clamp(0.0, 1.0).unsqueeze(-1)
 
         for token_id, bonus in bias.items():
             tid = int(token_id)
+        
             if tid < 0 or tid >= out.shape[-1]:
                 continue
+        
             cur = last_logits[:, tid : tid + 1]
             target_boost = (max_logit - cur).clamp_min(0.0) * confidence
             stubborn_push = stubbornness * float(bonus)
+        
             delta = (
                 (target_boost + stubborn_push) * decay * inertia * substrate_scale
             ).to(out.dtype)
+        
             out[rows, last, tid] = out[rows, last, tid] + delta.squeeze(-1)
+        
         return out

@@ -13,7 +13,7 @@ from typing import TYPE_CHECKING, Any
 
 
 if TYPE_CHECKING:
-    from .substrate import SubstrateController
+    from .controller import SubstrateController
 
 
 logger = logging.getLogger(__name__)
@@ -130,7 +130,7 @@ class SubstrateInspector:
     def _add_workers(self, snap: dict[str, Any]) -> None:
         mind = self._mind
         try:
-            bg = mind._background_worker
+            bg = mind.session.background_worker
             snap["background"] = (
                 bg.state_snapshot() if bg is not None else {"running": False}
             )
@@ -139,7 +139,7 @@ class SubstrateInspector:
             snap["background"] = {"error": True}
 
         try:
-            sw = mind._self_improve_worker
+            sw = mind.session.self_improve_worker
             if sw is None:
                 snap["self_improve"] = {"running": False, "enabled": False}
             else:
@@ -199,7 +199,7 @@ class SubstrateInspector:
 
         try:
             snap["last_chat"] = (
-                dict(mind._last_chat_meta) if mind._last_chat_meta else None
+                dict(mind.session.last_chat_meta) if mind.session.last_chat_meta else None
             )
         except Exception:
             snap["last_chat"] = None

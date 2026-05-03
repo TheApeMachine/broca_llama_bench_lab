@@ -15,6 +15,7 @@ from concurrent.futures import ThreadPoolExecutor
 from typing import TYPE_CHECKING, Any, Sequence
 
 from ..agent.active_inference import entropy as belief_entropy
+from ..affect.evidence import AffectEvidence
 from ..cognition.constants import SEMANTIC_CONFIDENCE_FLOOR
 from ..cognition.intent_gate import UtteranceIntent
 from ..cognition.observation import CognitiveObservation
@@ -25,7 +26,7 @@ from ..workspace import IntrinsicCue
 
 
 if TYPE_CHECKING:
-    from .substrate import SubstrateController
+    from ..substrate.controller import SubstrateController
 
 
 logger = logging.getLogger(__name__)
@@ -44,10 +45,10 @@ class ComprehensionPipeline:
         mind = self._mind
         toks = utterance_words(utterance)
         intent, affect = self.perceive_utterance(utterance)
-        with mind._cognitive_state_lock:
+        with mind.session.cognitive_state_lock:
             self.intrinsic_scan(toks)
-            mind._last_intent = intent
-            mind._last_affect = affect
+            mind.session.last_intent = intent
+            mind.session.last_affect = affect
             if not intent.is_actionable:
                 frame = self.non_actionable_frame(intent, affect)
             else:
@@ -60,13 +61,13 @@ class ComprehensionPipeline:
                     raise RuntimeError(
                         "deferred relation ingest frame is missing journal_id"
                     )
-                mind._enqueue_deferred_relation_ingest(
+                mind.deferred_relations.enqueue(
                     utterance,
                     toks,
                     intent,
                     journal_id=int(journal_id),
                 )
-            mind._last_user_affect_trace_id = mind.affect_trace.record(
+            mind.session.last_user_affect_trace_id = mind.affect_trace.record(
                 role="user",
                 text=utterance,
                 affect=affect,
@@ -97,9 +98,9 @@ class ComprehensionPipeline:
         frame.evidence = {**dict(frame.evidence or {}), "hawkes_trace": trace}
         jid = mind.journal.append(utterance, frame, ts=commit_ts)
         frame.evidence = {**frame.evidence, "journal_id": jid}
-        if mind._last_journal_id is not None:
-            mind.episode_graph.bump(mind._last_journal_id, jid)
-        mind._last_journal_id = jid
+        if mind.session.last_journal_id is not None:
+            mind.episode_graph.bump(mind.session.last_journal_id, jid)
+        mind.session.last_journal_id = jid
         out = mind.workspace.post_frame(frame)
         predicate = str((out.evidence or {}).get("predicate", ""))
         if out.intent == "memory_write" and out.subject and predicate:
@@ -127,8 +128,8 @@ class ComprehensionPipeline:
         except Exception:
             logger.exception("ComprehensionPipeline.after_frame_commit: hawkes observe failed")
 
-        if mind._background_worker is not None:
-            mind._background_worker.mark_user_active()
+        if mind.session.background_worker is not None:
+            mind.session.background_worker.mark_user_active()
 
         self.observe_frame_concepts(out)
         self.remember_declarative_binding(out, utterance)
@@ -192,7 +193,7 @@ class ComprehensionPipeline:
         mind = self._mind
         source_text = f"[{observation.modality}:{observation.source}] {observation.answer}"
         frame = self.frame_from_observation(observation)
-        with mind._cognitive_state_lock:
+        with mind.session.cognitive_state_lock:
             out = self.commit_frame(source_text, utterance_words(source_text), frame)
             mind.vsa.encode_triple(
                 observation.modality, "observed_as", observation.answer
@@ -330,8 +331,6 @@ class ComprehensionPipeline:
     def non_actionable_frame(
         intent: UtteranceIntent, affect: AffectState
     ) -> CognitiveFrame:
-        from .affect_evidence import AffectEvidence
-
         evidence = {
             "route": "intent_gate",
             "intent_label": intent.label,
@@ -352,8 +351,6 @@ class ComprehensionPipeline:
     def attach_perception(
         frame: CognitiveFrame, intent: UtteranceIntent, affect: AffectState
     ) -> None:
-        from .affect_evidence import AffectEvidence
-
         frame.evidence = {
             **dict(frame.evidence or {}),
             "intent_label": intent.label,

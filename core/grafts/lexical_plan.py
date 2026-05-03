@@ -44,36 +44,48 @@ class LexicalPlanGraft(BaseGraft):
     def forward(self, x: torch.Tensor, state: dict) -> torch.Tensor:
         if not self.enabled or "broca_plan_token_ids" not in state:
             return x
+
         plan = state["broca_plan_token_ids"]
+        
         if not isinstance(plan, torch.Tensor):
             plan = torch.tensor(plan, device=x.device, dtype=torch.long)
+        
         plan = plan.to(x.device)
+        
         if plan.ndim == 1:
             plan = plan.view(1, -1).expand(x.shape[0], -1)
+        
         step = state.get("broca_step", 0)
+        
         if not isinstance(step, torch.Tensor):
             step = torch.full((x.shape[0],), int(step), device=x.device, dtype=torch.long)
+        
         step = step.to(x.device).long().view(-1)
         step = step.clamp_min(0).clamp_max(plan.shape[1] - 1)
         target_ids = plan[torch.arange(x.shape[0], device=x.device), step]
         host_model = state.get("model")
         last_raw = state.get("last_indices")
+        
         if host_model is None or last_raw is None:
             missing = [
                 k
                 for k, v in (("model", host_model), ("last_indices", last_raw))
                 if v is None
             ]
+        
             raise ValueError(
                 f"LexicalPlanGraft.forward: missing required state key(s): {', '.join(missing)}"
             )
+        
         directions = F.normalize(
             host_model.lm_head.weight[target_ids].detach().to(x.device, x.dtype),
             dim=-1,
         )
+        
         last = last_raw.to(x.device)
         rows = torch.arange(x.shape[0], device=x.device)
         host_at_last = x[rows, last]
+        
         magnitude = snr_magnitude(
             host_at_last,
             target_snr=self.target_snr,
@@ -81,9 +93,11 @@ class LexicalPlanGraft(BaseGraft):
             inertia=state_inertia(state),
             substrate_scale=state_target_snr_scale(state),
         )
+        
         out = x.clone()
         out[rows, last] += directions * magnitude
         self.last_token_id = int(target_ids[0].item())
         tok = getattr(state.get("tokenizer", None), "decode_id", None)
         self.last_token = tok(self.last_token_id) if callable(tok) else None
+        
         return out

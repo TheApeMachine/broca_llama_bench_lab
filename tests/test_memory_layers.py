@@ -134,14 +134,14 @@ def test_runtime_mind_stores_observed_location_while_background_worker_running(t
 
     mind = build_substrate_controller(seed=0, db_path=db, namespace="runtime", device="cpu", hf_token=False)
     stub_substrate_encoders(mind)
-    mind._background_worker = RunningBackgroundWorker()
+    mind.session.background_worker = RunningBackgroundWorker()
 
     learned = mind.comprehend(f"{subject} is in {obj} .")
 
     assert learned.intent == "memory_ingest_pending"
     assert learned.evidence.get("deferred_relation_ingest") is True
     assert mind.memory.count() == 0
-    assert mind._background_worker.notified is True
+    assert mind.session.background_worker.notified is True
     reflection = _process_deferred(mind)
     assert reflection["status"] == "memory_write"
     assert reflection["answer"] == obj

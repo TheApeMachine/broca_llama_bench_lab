@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import random
 import sqlite3
-import threading
 import types
 from pathlib import Path
 
@@ -23,6 +22,7 @@ from core.temporal.hawkes import MultivariateHawkesProcess, PersistentHawkes
 from core.idletime.ontological_expansion import OntologicalRegistry, PersistentOntologicalRegistry
 from core.learning.preference_learning import DirichletPreference, PersistentPreference
 from core.substrate.graph import EpisodeAssociationGraph
+from core.substrate.session_state import SubstrateSessionState
 from core.frame import FrameDimensions
 
 SKETCH_DIM = FrameDimensions.SKETCH_DIM
@@ -78,7 +78,9 @@ def _build_synthetic_mind(tmp: Path) -> types.SimpleNamespace:
         discovered_scm=None,
         process_deferred_relation_ingest=lambda: [],
         deferred_relation_ingest_count=lambda: 0,
-        _cognitive_state_lock=threading.Lock(),
+        session=SubstrateSessionState(),
+        tool_foraging=types.SimpleNamespace(agent=None),
+        tool_registry=types.SimpleNamespace(count=lambda: 0),
         event_bus=types.SimpleNamespace(publish=lambda *args, **kwargs: None),
     )
     return mind

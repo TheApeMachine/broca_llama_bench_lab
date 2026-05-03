@@ -20,7 +20,7 @@ from ..dmn import CognitiveBackgroundWorker, DMNConfig
 
 
 if TYPE_CHECKING:
-    from .substrate import SubstrateController
+    from ..substrate.controller import SubstrateController
 
 
 logger = logging.getLogger(__name__)
@@ -39,23 +39,25 @@ class WorkerSupervisor:
         config: DMNConfig | None = None,
     ) -> CognitiveBackgroundWorker:
         mind = self._mind
-        if mind._background_worker is None:
-            mind._background_worker = CognitiveBackgroundWorker(
+        sess = mind.session
+        if sess.background_worker is None:
+            sess.background_worker = CognitiveBackgroundWorker(
                 mind,
                 interval_s=interval_s,
                 config=config,
                 motor_trainer=mind.motor_trainer,
             )
         else:
-            mind._background_worker.interval_s = max(0.1, float(interval_s))
+            sess.background_worker.interval_s = max(0.1, float(interval_s))
             if config is not None:
-                mind._background_worker.config = config
-        mind._background_worker.start()
-        return mind._background_worker
+                sess.background_worker.config = config
+        sess.background_worker.start()
+        return sess.background_worker
 
     def stop_background(self) -> None:
-        if self._mind._background_worker is not None:
-            self._mind._background_worker.stop()
+        sess = self._mind.session
+        if sess.background_worker is not None:
+            sess.background_worker.stop()
 
     def start_self_improve(
         self,
@@ -82,18 +84,20 @@ class WorkerSupervisor:
             ) from exc
 
         mind = self._mind
+        sess = mind.session
         cfg = SelfImproveConfig()
         if enabled is not None:
             cfg.enabled = bool(enabled)
         if interval_s is not None:
             cfg.interval_s = max(60.0, float(interval_s))
-        if mind._self_improve_worker is None:
-            mind._self_improve_worker = SelfImproveDockerWorker(mind, config=cfg)
+        if sess.self_improve_worker is None:
+            sess.self_improve_worker = SelfImproveDockerWorker(mind, config=cfg)
         else:
-            mind._self_improve_worker.config = cfg
-        mind._self_improve_worker.start()
-        return mind._self_improve_worker
+            sess.self_improve_worker.config = cfg
+        sess.self_improve_worker.start()
+        return sess.self_improve_worker
 
     def stop_self_improve(self, timeout: float = 5.0) -> None:
-        if self._mind._self_improve_worker is not None:
-            self._mind._self_improve_worker.stop(timeout=timeout)
+        sw = self._mind.session.self_improve_worker
+        if sw is not None:
+            sw.stop(timeout=timeout)

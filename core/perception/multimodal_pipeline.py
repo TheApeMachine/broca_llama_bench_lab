@@ -9,7 +9,7 @@ import torch
 import torch.nn.functional as F
 
 from ..encoders.base import BaseEncoder, EncoderOutput, EncoderRegistry
-from .observation import CognitiveObservation
+from ..cognition.observation import CognitiveObservation
 
 
 class MultimodalPerceptionPipeline:
