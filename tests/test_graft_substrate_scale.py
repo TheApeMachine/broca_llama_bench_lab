@@ -31,7 +31,7 @@ from core.grafting.grafts import (
     snr_magnitude,
     state_target_snr_scale,
 )
-from core.cognition.substrate import SubstrateLogitBiasGraft
+from core.grafts import SubstrateLogitBiasGraft
 
 
 class TestSnrMagnitudeRespectsSubstrateScale:

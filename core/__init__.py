@@ -17,15 +17,11 @@ from .agent.active_inference import (
     derived_listen_channel_reliability,
     extend_pomdp_with_synthesize_tool,
 )
-from .cognition.substrate import (
-    SubstrateController,
-    CognitiveBackgroundWorker,
-    DMNConfig,
-    IntrinsicCue,
-    TrainableFeatureGraft,
-    WorkspaceJournal,
-)
-from .memory import SymbolicMemory
+from .cognition.substrate import SubstrateController
+from .dmn import CognitiveBackgroundWorker, DMNConfig
+from .grafts import TrainableFeatureGraft
+from .memory import SymbolicMemory, WorkspaceJournal
+from .workspace import IntrinsicCue
 from .frame import CognitiveFrame
 from .causal import FiniteSCM, build_frontdoor_scm, build_simpson_scm
 from .system.device import pick_torch_device

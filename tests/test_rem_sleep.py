@@ -13,13 +13,10 @@ import threading
 import types
 from pathlib import Path
 
-from core.cognition.substrate import (
-    CognitiveBackgroundWorker,
-    DMNConfig,
-    SymbolicMemory,
-    WorkspaceJournal,
-    CognitiveFrame,
-)
+from core.cognition.substrate import SubstrateController  # noqa: F401  (keeps import-time wiring active)
+from core.dmn import CognitiveBackgroundWorker, DMNConfig
+from core.frame import CognitiveFrame
+from core.memory import SymbolicMemory, WorkspaceJournal
 from core.causal import build_simpson_scm
 from core.calibration.conformal import ConformalPredictor, PersistentConformalCalibration
 from core.temporal.hawkes import MultivariateHawkesProcess, PersistentHawkes

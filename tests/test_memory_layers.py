@@ -7,12 +7,10 @@ import torch
 import pytest
 
 from core.cli import build_substrate_controller
-from core.cognition.substrate import (
-    GlobalWorkspace,
-    TrainableFeatureGraft,
-    WorkspaceJournal,
-)
 from core.frame import CognitiveFrame
+from core.grafts import TrainableFeatureGraft
+from core.memory import WorkspaceJournal
+from core.workspace import GlobalWorkspace
 import core.cognition.substrate as substrate_mod
 from core.memory import SQLiteActivationMemory
 from core.substrate.graph import EpisodeAssociationGraph, merge_epistemic_evidence_dict
@@ -221,10 +219,12 @@ def test_background_worker_start_stop(tmp_path: Path, fake_host_loader):
 def test_speak_records_motor_replay(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, fake_host_loader) -> None:
     fake_host_loader(track_grafts=False)
 
+    from core.generation import PlanForcedGenerator
+
     monkeypatch.setattr(
-        substrate_mod,
-        "generate_from_plan",
-        lambda *a, **k: ("surfaced", [9, 11, 13], 2.25),
+        PlanForcedGenerator,
+        "generate",
+        classmethod(lambda cls, *a, **k: ("surfaced", [9, 11, 13], 2.25)),
     )
     mind = build_substrate_controller(seed=0, db_path=tmp_path / "speak_replay.sqlite", namespace="runtime", device="cpu", hf_token=False)
     stub_substrate_encoders(mind)
