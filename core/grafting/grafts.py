@@ -56,7 +56,7 @@ def snr_magnitude(
       over an LLM that has built up autoregressive momentum.
     * ``substrate_scale`` — derived strength in ``[0, 1]`` composed from
       intent, memory, conformal, and affect signals (see
-      :class:`core.chat.derived_strength.DerivedStrength`). When the
+      :class:`core.grafts.strength.DerivedStrength`). When the
       substrate has nothing legitimate to say this collapses to ``0`` and
       the graft injects no bias regardless of the cap.
     """

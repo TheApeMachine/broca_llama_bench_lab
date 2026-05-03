@@ -10,11 +10,14 @@ from ..comprehension.claim_refiner import ClaimRefiner
 from ..comprehension.deferred_queue import DeferredRelationQueue
 from ..comprehension.pipeline import ComprehensionPipeline
 from ..dmn.worker_supervisor import WorkerSupervisor
+from ..generation import ChatDecoder
 from ..grafts.feature import FrameGraftProjection
 from ..idletime.macro_adapter import MacroAdapter
+from ..learning import MotorReplayRecorder
 from ..learning.preference_adapter import PreferenceAdapter
 from ..memory.algebraic_adapter import AlgebraicMemoryAdapter
 from ..natives.native_tool_manager import NativeToolManager
+from .chat_turn import SubstrateChatTurn
 from .inspector import SubstrateInspector
 
 
@@ -77,6 +80,13 @@ class OrchestrationLinker:
         mind.comprehension = ComprehensionPipeline(mind)
         mind.deferred_relations.bind_comprehension(mind.comprehension)
 
+        mind.motor_replay_recorder = MotorReplayRecorder(mind)
+        mind.chat_turn = SubstrateChatTurn(
+            substrate=mind,
+            grafts=mind.graft_frame,
+            decoder=ChatDecoder(host=mind.host, tokenizer=mind.tokenizer),
+            replay=mind.motor_replay_recorder,
+        )
         mind.chat = ChatOrchestrator(mind)
         mind.speaker = PlanSpeaker(mind)
         mind.inspector = SubstrateInspector(mind)

@@ -1,7 +1,7 @@
 """WorkspacePublisher — single canonical wrapper that publishes to the process-wide workspace.
 
 Replaces the nine duplicated module-level ``_publish`` helpers that used to
-live in :mod:`core.chat.derived_strength`, ``encoder_relation_extractor``,
+live in :mod:`core.grafts.strength`, ``encoder_relation_extractor``,
 ``intent_gate``, ``predictive_coding``, ``top_down_control``, and four
 ``core.encoders`` modules.  Every concern that needs to emit a workspace
 event imports this class instead of writing its own.

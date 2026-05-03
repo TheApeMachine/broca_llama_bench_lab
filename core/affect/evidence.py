@@ -6,7 +6,7 @@ Two stateless transformations the controller used to inline:
   stored on every frame so derived graft strength, preference learning, and
   intrinsic cues all consume the same numbers.
 * :meth:`certainty` — affect-driven certainty in ``[0, 1]`` derived from the
-  GoEmotions distribution's peakedness; feeds :class:`DerivedStrength`.
+  GoEmotions distribution's peakedness; feeds graft strength derivation.
 """
 
 from __future__ import annotations
@@ -14,10 +14,13 @@ from __future__ import annotations
 from typing import Any
 
 from ..encoders.affect import AffectState
+from ..numeric import Probability
 
 
 class AffectEvidence:
     """Stateless wrapper that turns an :class:`AffectState` into evidence shapes."""
+
+    probability = Probability()
 
     @classmethod
     def as_dict(cls, affect: AffectState) -> dict[str, Any]:
@@ -42,5 +45,5 @@ class AffectEvidence:
         if affect is None:
             return 1.0
         if affect.confidences:
-            return max(0.0, min(1.0, float(affect.certainty)))
-        return max(0.0, min(1.0, float(affect.dominant_score)))
+            return cls.probability.unit_interval(affect.certainty)
+        return cls.probability.unit_interval(affect.dominant_score)

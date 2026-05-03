@@ -8,9 +8,9 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Sequence
 
-from .orchestrator import ChatOrchestrator
 from ..frame import CognitiveFrame
 from ..generation import PlanForcedGenerator
+from ..numeric import Probability
 
 
 if TYPE_CHECKING:
@@ -22,6 +22,7 @@ class PlanSpeaker:
 
     def __init__(self, mind: "SubstrateController") -> None:
         self._mind = mind
+        self.probability = Probability()
 
     @staticmethod
     def motor_replay_messages_plan_forced(
@@ -45,9 +46,9 @@ class PlanSpeaker:
             plan_words,
             broca_features=broca_features,
         )
-        confidence = max(0.0, min(1.0, float(frame.confidence)))
+        confidence = self.probability.unit_interval(frame.confidence)
         msgs = self.motor_replay_messages_plan_forced(frame, plan_words)
-        ChatOrchestrator(mind)._record_motor_replay(
+        mind.motor_replay_recorder.record(
             msgs,
             generated_token_ids=token_ids,
             broca_features=broca_features,

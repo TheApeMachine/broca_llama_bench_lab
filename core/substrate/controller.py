@@ -310,15 +310,3 @@ class SubstrateController:
             top_p=top_p,
             on_token=on_token,
         )
-
-    def _derived_target_snr_scale(self, frame: CognitiveFrame) -> float:
-        return self.runtime.chat._derived_target_snr_scale(frame)
-
-    def _substrate_temperature_scale(self, frame: CognitiveFrame, confidence: float) -> float:
-        return self.runtime.chat._substrate_temperature_scale(frame, confidence)
-
-    def _content_logit_bias(self, frame: CognitiveFrame) -> dict[int, float]:
-        return self.runtime.chat._content_logit_bias(frame)
-
-    def _record_motor_replay(self, *args: Any, **kwargs: Any) -> None:
-        return self.runtime.chat._record_motor_replay(*args, **kwargs)

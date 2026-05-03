@@ -12,12 +12,12 @@ here — it is a benchmark concern and lives in
 
 from __future__ import annotations
 
-import math
 from typing import Any, Sequence
 
 import torch
 
 from ..host.tokenizer import speech_seed_ids
+from ..numeric import SequenceGrowth
 
 
 class TokenBatch:
@@ -35,15 +35,19 @@ class TokenBatch:
         ids = torch.full((len(rows), max_len), pad_id, dtype=torch.long)
         mask = torch.zeros((len(rows), max_len), dtype=torch.bool)
         lengths = torch.tensor([len(r) for r in rows], dtype=torch.long)
+
         for i, row in enumerate(rows):
             if not row:
                 continue
+
             ids[i, : len(row)] = torch.tensor(row, dtype=torch.long)
             mask[i, : len(row)] = True
+
         if device is not None:
             ids = ids.to(device)
             mask = mask.to(device)
             lengths = lengths.to(device)
+
         return ids, mask, lengths
 
 
@@ -68,6 +72,8 @@ class PlanForcedGenerator:
     where ``inertia_tail`` is ``log1p(prefix_len + generated_len)``.
     """
 
+    sequence = SequenceGrowth()
+
     @classmethod
     def generate(
         cls,
@@ -84,27 +90,36 @@ class PlanForcedGenerator:
         ids = speech_seed_ids(tokenizer, prefix)
         generated: list[int] = []
         params_fn = getattr(model, "parameters", None)
+
         if not callable(params_fn):
             raise RuntimeError(
                 "PlanForcedGenerator.generate requires model.parameters() for device placement"
             )
+
         device = next(params_fn()).device
         steps = range(min(max_new_tokens, len(plan_ids)))
+
         for step in steps:
             row = ids + generated
+
             batch_ids, mask, _ = TokenBatch.from_id_rows(
                 [row], tokenizer.pad_id, device=device
             )
+
             extra: dict[str, Any] = {
                 "broca_plan_token_ids": torch.tensor([plan_ids], device=device),
                 "broca_step": torch.tensor([step], device=device),
                 "tokenizer": tokenizer,
             }
+
             if broca_features is not None:
                 extra["broca_features"] = broca_features.to(device)
+
             logits = model(batch_ids, mask, extra_state=extra)
             pred = int(logits[0, mask.long().sum().item() - 1].argmax().item())
             generated.append(pred)
+
         text_out = TokenDecoder.decode(tokenizer, generated)
-        inertia_tail = math.log1p(float(max(1, len(ids) + len(generated))))
+        inertia_tail = cls.sequence.inertia(len(ids) + len(generated))
+
         return text_out, generated, inertia_tail

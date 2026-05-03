@@ -15,6 +15,14 @@ Public surface:
 
 from __future__ import annotations
 
+from .chat_decoder import ChatDecoder
 from .decoder import PlanForcedGenerator, TokenBatch, TokenDecoder
+from .decode_state import DecodeState
 
-__all__ = ["PlanForcedGenerator", "TokenBatch", "TokenDecoder"]
+__all__ = [
+    "ChatDecoder",
+    "DecodeState",
+    "PlanForcedGenerator",
+    "TokenBatch",
+    "TokenDecoder",
+]

@@ -11,7 +11,7 @@ This test asserts the new behavior, end to end:
 
   User says "Tell me a joke" → :class:`IntentGate` classifies as ``request``
   (non-actionable) → ``comprehend`` short-circuits to ``unknown`` →
-  :func:`SubstrateController._derived_target_snr_scale` returns 0.0 →
+  :func:`FrameGraftProjection.derived_target_snr_scale` returns 0.0 →
   no broca features, no logit bias, the LLM speaks freely.
 
 We stub the actual encoder weights so the test stays fast — the *wiring* is
@@ -223,7 +223,7 @@ class TestRequestProducesNoGraftActivation:
             intent_responses={"tell me a joke": [("request", 0.95)]},
         )
         frame = mind.comprehend("Tell me a joke")
-        scale = mind._derived_target_snr_scale(frame)
+        scale = mind.graft_frame.derived_target_snr_scale(frame)
         assert scale == 0.0
 
     def test_tell_me_a_joke_writes_nothing_to_memory(self, tmp_path: Path, fake_host_loader):
@@ -252,7 +252,7 @@ class TestRequestProducesNoGraftActivation:
         )
         frame = mind.comprehend("Hi")
         assert frame.intent == "unknown"
-        assert mind._derived_target_snr_scale(frame) == 0.0
+        assert mind.graft_frame.derived_target_snr_scale(frame) == 0.0
 
 
 class TestStatementsStillFlowThrough:

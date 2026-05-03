@@ -598,7 +598,7 @@ class BenchApp(App):
                 f"[cyan]{ts_s}[/cyan] intent [b]{label}[/b]"
                 f"  conf={_fmt_float(payload.get('confidence'))}  actionable={actionable}"
             )
-        elif topic == "cog.derived_strength":
+        elif topic == "graft.derived_strength":
             self._last_derived_strength = dict(payload)
             activity.write(
                 f"[cyan]{ts_s}[/cyan] strength={_fmt_float(payload.get('strength'))}"

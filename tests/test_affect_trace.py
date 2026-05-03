@@ -169,11 +169,11 @@ def test_chat_reply_records_user_and_assistant_affect_alignment(
         confidences=[("anger", 0.05), ("annoyance", 0.1), ("neutral", 0.85)],
     )
     mind.affect_encoder = SequenceAffectEncoder([user, assistant])  # type: ignore[assignment]
-    from core.chat.orchestrator import ChatOrchestrator
+    from core.generation import ChatDecoder
 
     monkeypatch.setattr(
-        ChatOrchestrator,
-        "_stream",
+        ChatDecoder,
+        "stream",
         lambda self, *args, **kwargs: ("I understand and will help.", [1], 1.0),
     )
 
