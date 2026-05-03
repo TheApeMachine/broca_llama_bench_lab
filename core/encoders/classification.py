@@ -1,9 +1,16 @@
-"""GLiClass-backed hierarchical zero-shot text classification."""
+"""GLiClass-backed hierarchical zero-shot text classification.
+
+A forward hook on the underlying DeBERTa encoder captures
+``last_hidden_state`` for substrate working-memory publication. The hook is
+read-only — it never mutates the encoder output.
+"""
 
 from __future__ import annotations
 
 import time
 from typing import Any, Sequence
+
+import torch
 
 from ..workspace import WorkspacePublisher
 from .base import BaseEncoder, EncoderOutput
@@ -42,6 +49,96 @@ class SemanticClassificationEncoder(BaseEncoder):
             device=str(self.device),
             progress_bar=False,
         )
+
+        self._last_hidden: torch.Tensor | None = None
+        self._install_hidden_state_hook()
+
+    def _install_hidden_state_hook(self) -> None:
+        encoder = self._locate_underlying_encoder()
+
+        if not callable(getattr(encoder, "register_forward_hook", None)):
+            raise RuntimeError(
+                "SemanticClassificationEncoder requires an encoder module that supports "
+                f"register_forward_hook; loaded model {self._model_id!r} does not."
+            )
+
+        def _hook(_module: Any, _input: Any, output: Any) -> None:
+            tensor = self._extract_hidden_tensor(output)
+            self._last_hidden = tensor.detach()
+
+        encoder.register_forward_hook(_hook)
+
+    def _locate_underlying_encoder(self) -> Any:
+        for path in ("encoder", "model", "backbone", "transformer"):
+            candidate = getattr(self._model, path, None)
+
+            if candidate is not None and callable(getattr(candidate, "register_forward_hook", None)):
+                return candidate
+
+        raise RuntimeError(
+            f"SemanticClassificationEncoder: cannot locate underlying transformer on {self._model_id!r}"
+        )
+
+    @staticmethod
+    def _extract_hidden_tensor(output: Any) -> torch.Tensor:
+        if isinstance(output, torch.Tensor):
+            return output
+
+        for attr in ("last_hidden_state", "hidden_states", "logits"):
+            t = getattr(output, attr, None)
+
+            if isinstance(t, torch.Tensor):
+                return t
+
+        if isinstance(output, (list, tuple)) and output and isinstance(output[0], torch.Tensor):
+            return output[0]
+
+        raise RuntimeError(
+            f"SemanticClassificationEncoder hidden-state hook: unrecognised output type {type(output).__name__}"
+        )
+
+    @property
+    def last_hidden(self) -> torch.Tensor:
+        if self._model is None:
+            raise RuntimeError("SemanticClassificationEncoder.last_hidden: model not loaded")
+
+        if self._last_hidden is None:
+            raise RuntimeError(
+                "SemanticClassificationEncoder.last_hidden: no hidden state captured yet — call classify_axes first"
+            )
+
+        return self._last_hidden
+
+    @property
+    def has_captured_hidden(self) -> bool:
+        return self._model is not None and self._last_hidden is not None
+
+    @property
+    def input_embedding_matrix(self) -> torch.Tensor:
+        if self._model is None:
+            raise RuntimeError("SemanticClassificationEncoder.input_embedding_matrix: model not loaded")
+
+        encoder = self._locate_underlying_encoder()
+        embeddings = getattr(encoder, "embeddings", None)
+        word_embeddings = getattr(embeddings, "word_embeddings", None) if embeddings is not None else None
+
+        if word_embeddings is None:
+            raise RuntimeError(
+                f"SemanticClassificationEncoder.input_embedding_matrix: cannot locate word_embeddings on {self._model_id!r}"
+            )
+
+        weight = getattr(word_embeddings, "weight", None)
+
+        if not isinstance(weight, torch.Tensor):
+            raise RuntimeError(
+                "SemanticClassificationEncoder.input_embedding_matrix: word_embeddings.weight is not a tensor"
+            )
+
+        return weight.detach()
+
+    @property
+    def hidden_dim(self) -> int:
+        return int(self.input_embedding_matrix.shape[-1])
 
     def classify_axes(
         self,

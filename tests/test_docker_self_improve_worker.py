@@ -33,6 +33,14 @@ def fake_host_loader(monkeypatch: pytest.MonkeyPatch):
         def __init__(self):
             self.llm, self._stub = make_stub_llm_pair()
 
+        @property
+        def lm_head(self):
+            return self.llm.lm_head
+
+        def latent_forward(self, *, inputs_embeds, attention_mask=None, extra_state=None, past_key_values=None):
+            _ = attention_mask, extra_state
+            return inputs_embeds, (past_key_values or 0) + 1
+
         def add_graft(self, *a, **k):
             pass
 

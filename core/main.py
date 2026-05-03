@@ -38,6 +38,12 @@ def _cmd_chat_tui(argv: list[str]) -> None:
     run_chat_tui(argv)
 
 
+def _cmd_mrs(argv: list[str]) -> None:
+    from .tui.mrs import run_mrs_tui
+
+    run_mrs_tui(argv)
+
+
 def _research_lab_or_exit(name: str):
     try:
         import research_lab  # noqa: F401
@@ -82,6 +88,8 @@ _COMMANDS: dict[str, tuple[str, Handler]] = {
     "chat": ("Streaming terminal chat (full stack; same substrate as chat-tui).", _cmd_chat),
     "chat-tui": ("Textual chat dashboard.", _cmd_chat_tui),
     "tui": ("Alias for chat-tui.", _cmd_chat_tui),
+    "mrs": ("MRS debug TUI: detailed real-time view of the recursive substrate.", _cmd_mrs),
+    "mrs-tui": ("Alias for mrs.", _cmd_mrs),
     "bench": ("Unified benchmark harness (fixed configuration).", _cmd_bench),
     "bench-tui": ("Textual benchmark dashboard (wraps research_lab.benchmarks).", _cmd_bench_tui),
     "demo": ("Faculty experiments and Broca architecture benchmark.", _cmd_demo),

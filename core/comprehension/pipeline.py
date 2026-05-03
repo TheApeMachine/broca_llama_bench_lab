@@ -22,6 +22,7 @@ from ..cognition.observation import CognitiveObservation
 from ..encoders.affect import AffectState
 from ..frame import CognitiveFrame, SubwordProjector
 from ..host.tokenizer import utterance_words
+from ..swm import SWMSource
 from ..workspace import IntrinsicCue
 
 
@@ -55,6 +56,7 @@ class ComprehensionPipeline:
                 frame = mind.router.route(mind, utterance, toks, utterance_intent=intent)
                 self.attach_perception(frame, intent, affect)
             out = self.commit_frame(utterance, toks, frame)
+            self.publish_to_swm(intent=intent, frame=out)
             if bool((out.evidence or {}).get("deferred_relation_ingest")):
                 journal_id = (out.evidence or {}).get("journal_id")
                 if journal_id is None:
@@ -346,6 +348,61 @@ class ComprehensionPipeline:
             confidence=0.0,
             evidence=evidence,
         )
+
+    # -- SWM publication ------------------------------------------------------
+
+    def publish_to_swm(self, *, intent: UtteranceIntent, frame: CognitiveFrame) -> None:
+        """Publish encoder outputs (structured + hidden) into the substrate working memory.
+
+        Hidden-state slots come from the captured ``last_hidden`` on each
+        encoder (only published if the encoder has been called and exposes a
+        captured tensor). Structured slots come from the comprehension frame
+        and the intent classification.
+        """
+
+        mind = self._mind
+        publisher = mind.swm_publisher
+
+        self._publish_encoder_hidden(publisher, mind.extraction_encoder, SWMSource.GLINER2)
+        self._publish_encoder_hidden(publisher, mind.classification_encoder, SWMSource.GLICLASS)
+
+        publisher.publish_classifications(
+            source=SWMSource.GLICLASS,
+            labels=[intent.label] if intent.label else [],
+        )
+
+        evidence = dict(frame.evidence or {})
+        alternatives = evidence.get("alternative_relations") or []
+        triples = [
+            (rel.get("subject", ""), rel.get("predicate", ""), rel.get("object", ""))
+            for rel in alternatives
+            if isinstance(rel, dict)
+        ]
+
+        primary_predicate = str(evidence.get("predicate", "")).strip()
+        primary_subject = str(getattr(frame, "subject", "")).strip()
+        primary_answer = str(getattr(frame, "answer", "")).strip()
+
+        if primary_subject and primary_predicate and primary_answer:
+            triples.append((primary_subject, primary_predicate, primary_answer))
+
+        publisher.publish_relations(source=SWMSource.GLINER2, triples=triples)
+
+        if primary_subject:
+            publisher.publish_entities(
+                source=SWMSource.GLINER2,
+                entities=[("subject", primary_subject)],
+            )
+
+    @staticmethod
+    def _publish_encoder_hidden(publisher: Any, encoder: Any, source: SWMSource) -> None:
+        if encoder is None or not getattr(encoder, "has_captured_hidden", False):
+            return
+
+        # Encoders with no native confidence reporting are treated as unit
+        # confidence; the recorded prediction error therefore collapses to 0
+        # and the joint EFE leaves them out of the active organ-error budget.
+        publisher.publish_hidden(source=source, hidden=encoder.last_hidden, confidence=1.0)
 
     @staticmethod
     def attach_perception(

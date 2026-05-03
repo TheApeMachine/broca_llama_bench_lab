@@ -290,6 +290,87 @@ class LlamaBrocaHost(nn.Module):
             cache[f"{slot}.post"] = x.detach().clone()
         return x
 
+    def latent_forward(
+        self,
+        *,
+        inputs_embeds: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+        extra_state: Optional[dict] = None,
+        past_key_values: Any = None,
+    ) -> tuple[torch.Tensor, Any]:
+        """Inner-loop latent step: feed embeddings, return ``(last_hidden, past_kv)``.
+
+        Used by the LatentMAS / Coconut latent rollout decoder. The caller
+        passes a continuous embedding (typically the previous step's hidden
+        state projected through the closed-form Wₐ) instead of token IDs.
+        Layer-post grafts still fire — they operate on residual-stream
+        tensors, not token IDs — so the substrate's algebraic contributions
+        keep flowing in latent rollout exactly as in token-level forward.
+
+        ``final_hidden`` and ``logits`` slot grafts are *not* applied here
+        because there is no LM-head step; this method returns the raw
+        post-decoder hidden state for the caller to project back via Wₐ.
+        """
+
+        if inputs_embeds.ndim != 3:
+            raise ValueError(
+                f"latent_forward requires inputs_embeds of shape [batch, seq, d_model], got {tuple(inputs_embeds.shape)}"
+            )
+
+        bsz, seq_len, d_model = inputs_embeds.shape
+
+        if d_model != int(self.cfg.d_model):
+            raise ValueError(
+                f"latent_forward inputs_embeds last dim {d_model} != host d_model {int(self.cfg.d_model)}"
+            )
+
+        if attention_mask is None:
+            mask = torch.ones((bsz, seq_len), dtype=torch.bool, device=inputs_embeds.device)
+        else:
+            mask = attention_mask.bool()
+
+        attn = mask.long()
+
+        if past_key_values is None:
+            last_indices = mask.long().sum(dim=1).clamp_min(1) - 1
+        else:
+            last_indices = torch.full((bsz,), max(0, seq_len - 1), device=inputs_embeds.device, dtype=torch.long)
+
+        state: dict[str, Any] = {
+            "model": self,
+            "tokenizer": (extra_state or {}).get("tokenizer"),
+            "attention_mask": mask,
+            "token_ids": None,
+            "last_indices": last_indices,
+            "is_latent_rollout": True,
+        }
+
+        if extra_state:
+            for _k, _v in extra_state.items():
+                if _k in ("tokenizer",):
+                    continue
+                state[_k] = _v
+
+        self._active_state = state
+        self._active_cache = None
+        try:
+            kwargs: dict[str, Any] = {
+                "inputs_embeds": inputs_embeds,
+                "attention_mask": attn,
+                "return_dict": True,
+                "use_cache": True,
+            }
+
+            if past_key_values is not None:
+                kwargs["past_key_values"] = past_key_values
+
+            out = self.llm.model(**kwargs)
+        finally:
+            self._active_state = None
+            self._active_cache = None
+
+        return out.last_hidden_state, out.past_key_values
+
     def forward(
         self,
         idx: torch.Tensor,

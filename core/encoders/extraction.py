@@ -12,6 +12,11 @@ loaded via the ``gliner2`` package — *not* ``gliner``. The two libraries
 share a name family but expose different APIs; gliner2's surface is
 ``extract_entities(text, [labels])``, ``classify_text(text, schema)``, and
 ``extract_json(text, schema)``.
+
+A forward hook captures the underlying DeBERTa encoder's ``last_hidden_state``
+on every model call so the substrate's working memory can publish that hidden
+state into the SWM via a closed-form Johnson-Lindenstrauss projection. The
+hook never modifies the encoder output; it only stores the activation.
 """
 
 from __future__ import annotations
@@ -20,6 +25,8 @@ import logging
 import time
 from dataclasses import dataclass, field
 from typing import Any, Sequence
+
+import torch
 
 from ..workspace import WorkspacePublisher
 from .base import BaseEncoder, EncoderOutput
@@ -117,7 +124,95 @@ class ExtractionEncoder(BaseEncoder):
                     f"ExtractionEncoder requires GLiNER2 with `{required}`; "
                     f"loaded model {self._model_id!r} does not expose it."
                 )
+
+        self._last_hidden = None
+        self._install_hidden_state_hook()
+
         logger.info("ExtractionEncoder: loaded %s", self._model_id)
+
+    def _install_hidden_state_hook(self) -> None:
+        encoder = getattr(self._model, "encoder", None)
+
+        if encoder is None or not callable(getattr(encoder, "register_forward_hook", None)):
+            raise RuntimeError(
+                "ExtractionEncoder requires `model.encoder` exposing register_forward_hook; "
+                f"loaded model {self._model_id!r} does not."
+            )
+
+        def _hook(_module: Any, _input: Any, output: Any) -> None:
+            tensor = self._extract_hidden_tensor(output)
+            self._last_hidden = tensor.detach()
+
+        encoder.register_forward_hook(_hook)
+
+    @staticmethod
+    def _extract_hidden_tensor(output: Any) -> torch.Tensor:
+        if isinstance(output, torch.Tensor):
+            return output
+
+        for attr in ("last_hidden_state", "hidden_states", "logits"):
+            t = getattr(output, attr, None)
+
+            if isinstance(t, torch.Tensor):
+                return t
+
+        if isinstance(output, (list, tuple)) and output and isinstance(output[0], torch.Tensor):
+            return output[0]
+
+        raise RuntimeError(
+            f"ExtractionEncoder hidden-state hook: unrecognised encoder output type {type(output).__name__}"
+        )
+
+    @property
+    def last_hidden(self) -> torch.Tensor:
+        if self._model is None:
+            raise RuntimeError("ExtractionEncoder.last_hidden: model not loaded")
+
+        if self._last_hidden is None:
+            raise RuntimeError(
+                "ExtractionEncoder.last_hidden: no hidden state captured yet — call an extraction method first"
+            )
+
+        return self._last_hidden
+
+    @property
+    def has_captured_hidden(self) -> bool:
+        return self._model is not None and self._last_hidden is not None
+
+    @property
+    def input_embedding_matrix(self) -> torch.Tensor:
+        """The underlying transformer's input embedding weight matrix ``[V, d]``."""
+
+        if self._model is None:
+            raise RuntimeError("ExtractionEncoder.input_embedding_matrix: model not loaded")
+
+        encoder = getattr(self._model, "encoder", None)
+
+        if encoder is None:
+            raise RuntimeError(
+                f"ExtractionEncoder.input_embedding_matrix: no `encoder` on {self._model_id!r}"
+            )
+
+        embeddings = getattr(encoder, "embeddings", None)
+        word_embeddings = getattr(embeddings, "word_embeddings", None) if embeddings is not None else None
+
+        if word_embeddings is None:
+            raise RuntimeError(
+                f"ExtractionEncoder.input_embedding_matrix: cannot locate word_embeddings on {self._model_id!r}"
+            )
+
+        weight = getattr(word_embeddings, "weight", None)
+
+        if not isinstance(weight, torch.Tensor):
+            raise RuntimeError(
+                "ExtractionEncoder.input_embedding_matrix: word_embeddings.weight is not a tensor"
+            )
+
+        return weight.detach()
+
+    @property
+    def hidden_dim(self) -> int:
+        return int(self.input_embedding_matrix.shape[-1])
 
     def extract_entities(
         self,

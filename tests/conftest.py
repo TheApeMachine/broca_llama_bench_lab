@@ -151,11 +151,26 @@ class StubGenerationTokenizer:
 
 
 class _StubInputEmbedding:
-    """Minimal stand-in for nn.Embedding exposing only the ``weight`` attribute."""
+    """Minimal stand-in for ``nn.Embedding``: exposes ``.weight`` and is callable.
+
+    ``__call__`` performs the same lookup as ``nn.Embedding.forward`` so the
+    LatentDecoder's ``host.llm.get_input_embeddings()(ids)`` path behaves
+    identically against the stub.
+    """
 
     def __init__(self, n_vocab: int = 64, dim: int = 8) -> None:
         g = torch.Generator().manual_seed(0)
         self.weight = torch.empty(n_vocab, dim).normal_(0.0, 0.02, generator=g)
+
+    def __call__(self, ids: torch.Tensor) -> torch.Tensor:
+        return torch.nn.functional.embedding(ids, self.weight)
+
+
+class _StubLMHead:
+    """Minimal stand-in for ``nn.Linear`` exposing a ``.weight`` tensor tied to ``W_in``."""
+
+    def __init__(self, input_embedding: "_StubInputEmbedding") -> None:
+        self.weight = input_embedding.weight
 
 
 class StubGenerationLLM:
@@ -164,13 +179,17 @@ class StubGenerationLLM:
     Exposes a tiny ``get_input_embeddings()`` so :class:`EmbeddingProjector.from_host`
     can produce a valid frame projector against the stub host the same way it
     does against a real Llama checkpoint — no fallback path needed in the
-    production code.
+    production code. Also exposes ``lm_head`` (tied to the input embedding,
+    matching Llama-3.2's tied-embeddings configuration) so substrate
+    construction that derives the closed-form LatentMAS Wₐ from
+    ``W_in / W_out`` finds a valid pair on the stub.
     """
 
     def __init__(self, device: str = "cpu"):
         self.device = torch.device(device)
         self._next_response: str = ""
         self._input_embedding = _StubInputEmbedding()
+        self.lm_head = _StubLMHead(self._input_embedding)
 
     def parameters(self):
         yield torch.zeros(1, device=self.device)
@@ -219,6 +238,30 @@ class FakeHost:
     def __init__(self, *, track_grafts: bool = True) -> None:
         self.grafts: list[tuple[str, object]] | None = [] if track_grafts else None
         self.llm, self._stub_tokenizer = make_stub_llm_pair()
+
+    @property
+    def lm_head(self):
+        return self.llm.lm_head
+
+    def latent_forward(
+        self,
+        *,
+        inputs_embeds,
+        attention_mask=None,
+        extra_state=None,
+        past_key_values=None,
+    ):
+        """Stub latent rollout: pass embeddings straight through, return them.
+
+        The real :class:`LlamaBrocaHost.latent_forward` runs the wrapped HF
+        model and applies layer-post grafts. The fake just echoes the input
+        embeddings as the "hidden state" and increments a small counter so
+        the recursion controller can run end-to-end against this stub.
+        """
+
+        _ = attention_mask, extra_state
+        new_past = (past_key_values or 0) + 1
+        return inputs_embeds, new_past
 
     def add_graft(self, slot: str, graft: object) -> None:
         if self.grafts is not None:

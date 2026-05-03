@@ -8,7 +8,7 @@ PYTHON ?= python3
 RUN_PYTHON := $(if $(wildcard .venv/bin/python),.venv/bin/python,$(PYTHON))
 UV ?= uv
 
-.PHONY: help install install-benchmark test chat tui bench bench-cli bench-tui paper paper-bench paper-pdf
+.PHONY: help install install-benchmark test chat tui mrs bench bench-cli bench-tui paper paper-bench paper-pdf
 
 help:
 	@echo "Targets:"
@@ -17,6 +17,7 @@ help:
 	@echo "  make install-benchmark   add/refresh benchmark extra: uv pip install -e \".[benchmark]\""
 	@echo "  make test                pytest (isolated DBs via MOSAIC_TEST_DB; see help text below)"
 	@echo "  make chat                streaming terminal chat (full Broca substrate; fixed runtime)"
+	@echo "  make mrs                 MRS debug TUI (recursive substrate visualisation; compact chat)"
 	@echo "  make bench               live benchmark TUI (native HF + lm-eval + Broca probes)"
 	@echo "  make bench-cli           same harness without the TUI (plain stdout)"
 	@echo "  make bench-tui           alias for 'make bench'"
@@ -49,6 +50,9 @@ chat:
 
 tui:
 	$(RUN_PYTHON) -m core chat-tui
+
+mrs:
+	$(RUN_PYTHON) -m core mrs
 
 # Native (standard task preset) + Eleuther lm-eval (standard preset limits) + architecture eval.
 # `make bench` launches the Textual dashboard. Use `make bench-cli` for plain stdout.

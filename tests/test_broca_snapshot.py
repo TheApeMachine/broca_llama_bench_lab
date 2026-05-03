@@ -21,8 +21,16 @@ class _FakeHost:
         self.grafts: list = []
         self.llm, self._stub_tokenizer = make_stub_llm_pair()
 
+    @property
+    def lm_head(self):
+        return self.llm.lm_head
+
     def add_graft(self, slot, graft):
         self.grafts.append((slot, graft))
+
+    def latent_forward(self, *, inputs_embeds, attention_mask=None, extra_state=None, past_key_values=None):
+        _ = attention_mask, extra_state
+        return inputs_embeds, (past_key_values or 0) + 1
 
     def parameters(self):
         import torch

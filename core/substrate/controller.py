@@ -12,6 +12,12 @@ from typing import Any, Callable, Mapping, Optional, Sequence
 
 import torch
 
+from core.encoders.affect import AffectState
+from core.frame import CognitiveFrame, ParsedClaim
+from core.host.hf_tokenizer_compat import HuggingFaceBrocaTokenizer
+from core.host.llama_broca_host import LlamaBrocaHost
+from core.idletime.chunking import CompiledMacro
+
 from ..numeric import Probability
 
 

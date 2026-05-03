@@ -60,6 +60,13 @@ from .graph import EpisodeAssociationGraph
 from .orchestration_linker import OrchestrationLinker
 from .runtime import default_substrate_sqlite_path, ensure_parent_dir
 from .session_state import SubstrateSessionState
+from ..calibration.recursion_halt import RecursionHalt
+from ..grafting.alignment import AlignmentRegistry, SWMToInputProjection
+from ..grafts.swm_residual_graft import SWMResidualGraft
+from ..host.latent_decoder import LatentDecoder
+from ..swm import EncoderSWMPublisher, SubstrateWorkingMemory
+from .prediction_error import PredictionErrorVector
+from .recursion_controller import RecursionController
 from ..symbolic.vsa import VSACodebook
 from ..system.device import pick_torch_device
 from ..temporal.hawkes import MultivariateHawkesProcess, PersistentHawkes
@@ -98,6 +105,7 @@ class SubstrateBuilder:
         cls._build_perception(mind, device)
         cls._build_comprehension(mind)
         cls._build_reasoning(mind, rp, namespace, seed)
+        cls._build_swm(mind, seed)
         cls._build_motor(mind)
         cls._build_chunking(mind, rp, namespace)
         cls._build_native_tools(mind, rp, namespace)
@@ -216,6 +224,54 @@ class SubstrateBuilder:
         )
         mind.discovered_scm = None
         mind.motor_replay = []
+
+    @classmethod
+    def _build_swm(cls, mind: Any, seed: int) -> None:
+        mind.swm = SubstrateWorkingMemory()
+        mind.prediction_errors = PredictionErrorVector()
+        mind.swm_publisher = EncoderSWMPublisher(
+            swm=mind.swm,
+            codebook=mind.vsa,
+            prediction_errors=mind.prediction_errors,
+            seed=int(seed),
+        )
+        mind.alignment_registry = AlignmentRegistry()
+
+        host_embed = mind.host.llm.get_input_embeddings().weight.detach()
+        mind.swm_to_llama = SWMToInputProjection(
+            name="swm_to_llama",
+            d_swm=mind.swm.dim,
+            w_in_target=host_embed,
+            seed=int(seed) ^ 0x10ADC0DE,
+        )
+        mind.alignment_registry.register(mind.swm_to_llama)
+
+        from ..grafts.swm_residual_graft import ACTIVE_THOUGHT_SLOT
+
+        mind.swm_residual_graft = SWMResidualGraft(
+            swm=mind.swm,
+            projection=mind.swm_to_llama,
+            default_slot=ACTIVE_THOUGHT_SLOT,
+        )
+        mind.host.add_graft("final_hidden", mind.swm_residual_graft)
+
+        # Chat-time recursion uses a single latent step and a single round
+        # so per-turn latency stays bounded. The LatentMAS-validated optima
+        # (``DEFAULT_M_LATENT_STEPS = 40`` / ``DEFAULT_MAX_ROUNDS = 3``) are
+        # preserved as constants; deeper rollouts are obtained by
+        # constructing a separate :class:`LatentDecoder` /
+        # :class:`RecursionHalt` against the same host and SWM.
+        mind.latent_decoder = LatentDecoder(host=mind.host, m_latent_steps=1)
+        mind.alignment_registry.register(mind.latent_decoder.alignment)
+
+        mind.recursion_halt = RecursionHalt(swm=mind.swm, max_rounds=1)
+        mind.recursion_controller = RecursionController(
+            swm=mind.swm,
+            publisher=mind.swm_publisher,
+            latent_decoder=mind.latent_decoder,
+            residual_graft=mind.swm_residual_graft,
+            halt=mind.recursion_halt,
+        )
 
     @classmethod
     def _build_motor(cls, mind: Any) -> None:
