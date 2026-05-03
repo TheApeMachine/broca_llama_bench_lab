@@ -13,7 +13,6 @@ from .lexical_plan import LexicalPlanGraft
 from .logit_bias import SubstrateLogitBiasGraft
 from .strength import DerivedStrength, StrengthInputs
 from .trainable_feature import TrainableFeatureGraft
-from .token_bias import TokenBias
 
 __all__ = [
     "DerivedStrength",
@@ -23,6 +22,5 @@ __all__ = [
     "LexicalPlanGraft",
     "StrengthInputs",
     "SubstrateLogitBiasGraft",
-    "TokenBias",
     "TrainableFeatureGraft",
 ]

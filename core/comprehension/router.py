@@ -16,7 +16,6 @@ from ..cognition.constants import SEMANTIC_CONFIDENCE_FLOOR
 from ..cognition.intent_gate import UtteranceIntent
 from ..cognition.predictive_coding import lexical_surprise_gap
 from ..frame import CognitiveFrame, FacultyCandidate, ParsedClaim, ParsedQuery
-from .claim_prediction_gap import ClaimPredictionGap
 from .memory_query_parser import MemoryQueryParser
 from .scm_target_picker import SCMTargetPicker
 from .text_relevance import TextRelevance
@@ -153,7 +152,7 @@ class CognitiveRouter:
         }
         existing = mind.memory.get(claim.subject, claim.predicate)
         if existing is not None and existing[0] != claim.obj:
-            gap = ClaimPredictionGap.measure(mind, utterance, claim)
+            gap = self._claim_prediction_gap(mind, utterance, claim)
             if gap is not None:
                 ev["prediction_gap"] = float(gap)
         observed = mind.memory.observe_claim(
@@ -195,6 +194,46 @@ class CognitiveRouter:
                 "instruments": ["runtime_observation"],
             },
         )
+
+    def _claim_prediction_gap(
+        self,
+        mind: "SubstrateController",
+        utterance: str,
+        claim: ParsedClaim,
+    ) -> float | None:
+        try:
+            broca_features = mind.frame_packer.broca(
+                "memory_write",
+                claim.subject,
+                claim.obj,
+                float(claim.confidence),
+                claim.evidence,
+                vsa_bundle=mind.encode_triple_vsa(
+                    claim.subject, claim.predicate, claim.obj
+                ),
+                vsa_projection_seed=int(mind.seed),
+            )
+            _ce_g, _ce_p, gap = lexical_surprise_gap(
+                mind.host,
+                mind.tokenizer,
+                utterance=utterance,
+                plan_words=[claim.subject, claim.predicate, claim.obj, "."],
+                broca_features=broca_features,
+            )
+            return float(gap)
+        except (
+            AttributeError,
+            RuntimeError,
+            TypeError,
+            ValueError,
+            StopIteration,
+            IndexError,
+        ):
+            logger.debug(
+                "CognitiveRouter._claim_prediction_gap: unavailable host path utterance=%r",
+                utterance[:200],
+            )
+            return None
 
     def _memory_query(
         self,

@@ -21,7 +21,6 @@ class SubstrateRuntime:
             "claims",
             "deferred_relations",
             "inspector",
-            "speaker",
         ):
             if not hasattr(mind, name):
                 raise RuntimeError(

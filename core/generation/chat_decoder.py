@@ -8,7 +8,6 @@ import torch
 
 from ..grafts.chat_plan import ChatGraftPlan
 from ..numeric import Sampling, SequenceGrowth
-from .decode_state import DecodeState
 
 
 class ChatDecoder:
@@ -59,18 +58,23 @@ class ChatDecoder:
         past_key_values = None
         with torch.no_grad():
             for _step in range(max(1, int(max_new_tokens))):
-                state = DecodeState(
-                    tokenizer=self._tokenizer,
-                    substrate_confidence=float(plan.confidence),
-                    substrate_inertia=self.sequence.inertia(len(current)),
-                    substrate_target_snr_scale=float(plan.derived_target_snr_scale),
-                    broca_features=feature_tensor,
-                    broca_logit_bias=plan.logit_bias if bias_active else None,
-                    broca_logit_bias_decay=(
-                        (0.15 if target_emitted else 1.0) if bias_active else None
-                    ),
-                    past_key_values=past_key_values,
-                )
+                extra_state: dict[str, Any] = {
+                    "tokenizer": self._tokenizer,
+                    "substrate_confidence": float(plan.confidence),
+                    "substrate_inertia": self.sequence.inertia(len(current)),
+                    "substrate_target_snr_scale": float(plan.derived_target_snr_scale),
+                    "return_past_key_values": True,
+                }
+                if feature_tensor is not None:
+                    extra_state["broca_features"] = feature_tensor
+                if bias_active:
+                    extra_state["broca_logit_bias"] = plan.logit_bias
+                    extra_state["broca_logit_bias_decay"] = (
+                        0.15 if target_emitted else 1.0
+                    )
+                if past_key_values is not None:
+                    extra_state["past_key_values"] = past_key_values
+
                 if past_key_values is not None:
                     row_t = torch.tensor([[current[-1]]], device=device, dtype=torch.long)
                     mask_t = torch.ones((1, len(current)), dtype=torch.bool, device=device)
@@ -78,7 +82,7 @@ class ChatDecoder:
                     row_t = torch.tensor([current], device=device, dtype=torch.long)
                     mask_t = torch.ones_like(row_t, dtype=torch.bool)
 
-                out = self._host(row_t, mask_t, extra_state=state.to_extra_state())
+                out = self._host(row_t, mask_t, extra_state=extra_state)
                 if not isinstance(out, tuple):
                     raise RuntimeError(
                         "LlamaBrocaHost.forward expected (logits, past_key_values) when return_past_key_values is set"

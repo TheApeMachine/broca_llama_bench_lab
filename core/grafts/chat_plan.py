@@ -6,7 +6,6 @@ import torch
 from pydantic import BaseModel, ConfigDict
 
 from ..frame import CognitiveFrame
-from .token_bias import TokenBias
 
 
 class ChatGraftPlan(BaseModel):
@@ -19,7 +18,7 @@ class ChatGraftPlan(BaseModel):
     effective_temperature: float
     broca_features: torch.Tensor | None
     logit_bias: dict[int, float]
-    bias_top: list[TokenBias]
+    bias_top: list[dict[str, int | str | float]]
     derived_target_snr_scale: float
 
     @property
@@ -34,7 +33,7 @@ class ChatGraftPlan(BaseModel):
             "confidence": float(self.confidence),
             "eff_temperature": float(self.effective_temperature),
             "bias_token_count": len(self.logit_bias),
-            "bias_top": [item.model_dump() for item in self.bias_top],
+            "bias_top": [dict(item) for item in self.bias_top],
             "has_broca_features": self.has_broca_features,
             "derived_target_snr_scale": float(self.derived_target_snr_scale),
             "ts": float(timestamp),

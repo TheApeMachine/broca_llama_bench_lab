@@ -9,7 +9,7 @@ from ..frame import CognitiveFrame
 from ..generation import ChatDecoder
 from ..grafts import ChatGraftPlan, FrameGraftProjection
 from ..learning import MotorReplayRecorder
-from .chat_completion import ChatCompletion
+from ..affect.evidence import AffectEvidence
 
 if TYPE_CHECKING:
     from .controller import SubstrateController
@@ -93,17 +93,21 @@ class SubstrateChatTurn:
             alignment=affect_alignment,
         )
 
-        completion = ChatCompletion(
-            plan=plan,
-            text=text,
-            assistant_affect=assistant_affect,
-            affect_alignment=dict(affect_alignment),
-            assistant_affect_trace_id=int(assistant_affect_trace_id),
-            user_affect_trace_id=int(substrate.session.last_user_affect_trace_id),
-        )
         substrate.session.last_chat_meta = {
             **substrate.session.last_chat_meta,
-            **completion.meta_patch(),
+            "assistant_affect": AffectEvidence.as_dict(assistant_affect),
+            "affect_alignment": dict(affect_alignment),
+            "assistant_affect_trace_id": int(assistant_affect_trace_id),
+            "user_affect_trace_id": int(substrate.session.last_user_affect_trace_id),
         }
 
-        substrate.event_bus.publish("chat.complete", completion.event_payload())
+        substrate.event_bus.publish(
+            "chat.complete",
+            {
+                "intent": plan.frame.intent,
+                "confidence": float(plan.confidence),
+                "affect_alignment": float(affect_alignment["alignment"]),
+                "reply_chars": len(text),
+                "reply_preview": text[:200],
+            },
+        )

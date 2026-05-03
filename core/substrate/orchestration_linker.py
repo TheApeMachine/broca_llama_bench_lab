@@ -5,7 +5,6 @@ from __future__ import annotations
 from typing import Any
 
 from ..chat.orchestrator import ChatOrchestrator
-from ..chat.plan_speaker import PlanSpeaker
 from ..comprehension.claim_refiner import ClaimRefiner
 from ..comprehension.deferred_queue import DeferredRelationQueue
 from ..comprehension.pipeline import ComprehensionPipeline
@@ -78,7 +77,6 @@ class OrchestrationLinker:
             session=mind.session,
         )
         mind.comprehension = ComprehensionPipeline(mind)
-        mind.deferred_relations.bind_comprehension(mind.comprehension)
 
         mind.motor_replay_recorder = MotorReplayRecorder(mind)
         mind.chat_turn = SubstrateChatTurn(
@@ -88,6 +86,5 @@ class OrchestrationLinker:
             replay=mind.motor_replay_recorder,
         )
         mind.chat = ChatOrchestrator(mind)
-        mind.speaker = PlanSpeaker(mind)
         mind.inspector = SubstrateInspector(mind)
         mind.workers = WorkerSupervisor(mind)

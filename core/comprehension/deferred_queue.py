@@ -10,15 +10,11 @@ from __future__ import annotations
 
 import logging
 import time
-from typing import TYPE_CHECKING, Any, Sequence
+from typing import Any, Sequence
 
 from ..cognition.intent_gate import UtteranceIntent
-from .deferred_relation_ingest import DeferredRelationIngest
-
-if TYPE_CHECKING:
-    from .pipeline import ComprehensionPipeline
-
 from .claim_refiner import ClaimRefiner
+from .deferred_relation_ingest import DeferredRelationIngest
 
 
 logger = logging.getLogger(__name__)
@@ -43,10 +39,6 @@ class DeferredRelationQueue:
         self._claims = claims
         self._substrate = substrate
         self._session = session
-        self._comprehension: ComprehensionPipeline | None = None
-
-    def bind_comprehension(self, pipe: ComprehensionPipeline) -> None:
-        self._comprehension = pipe
 
     def is_online(self) -> bool:
         worker = self._session.background_worker
@@ -132,7 +124,13 @@ class DeferredRelationQueue:
             "processed_at": time.time(),
         }
         self._substrate.workspace.post_frame(frame)
-        self._after_commit(frame, job)
+        try:
+            self._hawkes.observe(str(frame.intent or "unknown"))
+        except Exception:
+            logger.exception("DeferredRelationQueue._process: hawkes observe failed")
+        pipe = self._substrate.comprehension
+        pipe.observe_frame_concepts(frame)
+        pipe.remember_declarative_binding(frame, job.utterance)
 
         reflection = {
             "kind": "deferred_relation_ingest",
@@ -147,18 +145,3 @@ class DeferredRelationQueue:
         }
         self._event_bus.publish("deferred_relation_ingest.processed", reflection)
         return reflection
-
-    def _after_commit(self, frame: Any, job: DeferredRelationIngest) -> None:
-        try:
-            self._hawkes.observe(str(frame.intent or "unknown"))
-        except Exception:
-            logger.exception(
-                "DeferredRelationQueue._after_commit: hawkes observe failed"
-            )
-        pipe = self._comprehension
-        if pipe is None:
-            raise RuntimeError(
-                "DeferredRelationQueue: comprehension pipeline must be bound before processing jobs"
-            )
-        pipe.observe_frame_concepts(frame)
-        pipe.remember_declarative_binding(frame, job.utterance)

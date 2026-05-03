@@ -6,12 +6,10 @@ from typing import Any
 
 import torch
 
-from ..affect.evidence import AffectEvidence
 from ..frame import CognitiveFrame
 from ..numeric import Probability
 from .chat_plan import ChatGraftPlan
-from .strength import DerivedStrength, StrengthEvidence, StrengthInputs
-from .token_bias import TokenBias
+from .strength import DerivedStrength, StrengthInputs
 
 
 class FrameGraftProjection:
@@ -103,7 +101,7 @@ class FrameGraftProjection:
             derived_target_snr_scale=derived_scale,
         )
 
-    def bias_preview(self, logit_bias: dict[int, float]) -> list[TokenBias]:
+    def bias_preview(self, logit_bias: dict[int, float]) -> list[dict[str, int | str | float]]:
         if not logit_bias:
             return []
 
@@ -111,7 +109,7 @@ class FrameGraftProjection:
         if hf_tok is None:
             raise RuntimeError("FrameGraftProjection.bias_preview requires tokenizer.inner")
 
-        preview: list[TokenBias] = []
+        preview: list[dict[str, int | str | float]] = []
         ranked = sorted(logit_bias.items(), key=lambda kv: kv[1], reverse=True)[:8]
         for token_id, bias in ranked:
             piece = hf_tok.decode(
@@ -119,23 +117,13 @@ class FrameGraftProjection:
                 skip_special_tokens=True,
                 clean_up_tokenization_spaces=False,
             )
-            preview.append(
-                TokenBias(token_id=int(token_id), token=piece, bias=float(bias))
-            )
+            preview.append({"token_id": int(token_id), "token": piece, "bias": float(bias)})
         return preview
 
     def derived_target_snr_scale(self, frame: CognitiveFrame) -> float:
-        evidence = StrengthEvidence.from_frame(frame)
-        memory_confidence = self.probability.unit_interval(frame.confidence)
-        certainty = AffectEvidence.certainty(self._mind.session.last_affect)
         return float(
             DerivedStrength.compute(
-                StrengthInputs(
-                    intent_actionability=evidence.actionability,
-                    memory_confidence=memory_confidence,
-                    conformal_set_size=evidence.conformal_set_size,
-                    affect_certainty=certainty,
-                )
+                StrengthInputs.from_frame(frame, self._mind.session.last_affect)
             )
         )
 

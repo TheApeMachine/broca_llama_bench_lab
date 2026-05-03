@@ -7,7 +7,6 @@ from typing import TYPE_CHECKING, Sequence
 import torch
 
 from ..dmn import DMNConfig
-from .motor_replay_item import MotorReplayItem
 
 if TYPE_CHECKING:
     from ..substrate.controller import SubstrateController
@@ -33,15 +32,19 @@ class MotorReplayRecorder:
 
         substrate = self._substrate
         cap = DMNConfig().sleep_max_replay
-        item = MotorReplayItem(
-            messages=[dict(message) for message in messages],
-            generated_token_ids=[int(token_id) for token_id in generated_token_ids],
-            broca_features=broca_features,
-            substrate_confidence=float(substrate_confidence),
-            substrate_inertia=float(substrate_inertia),
-        )
+        item = {
+            "messages": [dict(message) for message in messages],
+            "speech_plan_tokens": torch.tensor(
+                [int(token_id) for token_id in generated_token_ids],
+                dtype=torch.long,
+            ),
+            "substrate_confidence": float(substrate_confidence),
+            "substrate_inertia": float(substrate_inertia),
+        }
+        if broca_features is not None:
+            item["broca_features"] = broca_features.detach().cpu().clone()
 
         with substrate.session.cognitive_state_lock:
-            substrate.motor_replay.append(item.to_replay_dict())
+            substrate.motor_replay.append(item)
             if len(substrate.motor_replay) > cap:
                 substrate.motor_replay[:] = substrate.motor_replay[-cap:]

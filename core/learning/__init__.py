@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from .motor_replay_item import MotorReplayItem
 from .motor_replay_recorder import MotorReplayRecorder
 
-__all__ = ["MotorReplayItem", "MotorReplayRecorder"]
+__all__ = ["MotorReplayRecorder"]

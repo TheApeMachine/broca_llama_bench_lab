@@ -19,12 +19,14 @@ from ..cognition.observation import CognitiveObservation
 from ..dmn import CognitiveBackgroundWorker, DMNConfig
 from ..encoders.affect import AffectState
 from ..frame import CognitiveFrame, ParsedClaim
+from ..generation import PlanForcedGenerator
 from ..grafting.dynamic_grafts import CapturedActivationMode
 from ..host.hf_tokenizer_compat import HuggingFaceBrocaTokenizer
 from ..host.llama_broca_host import LlamaBrocaHost, load_llama_broca_host
 from ..idletime.chunking import CompiledMacro
 from ..idletime.macro_adapter import MacroAdapter
 from ..natives.native_tools import NativeTool
+from ..numeric import Probability
 from .facades import SubstrateRuntime
 
 
@@ -37,6 +39,7 @@ class SubstrateController:
     host: LlamaBrocaHost
     tokenizer: HuggingFaceBrocaTokenizer
     runtime: SubstrateRuntime
+    probability = Probability()
 
     def __init__(
         self,
@@ -281,7 +284,30 @@ class SubstrateController:
         return replay
 
     def speak(self, frame: CognitiveFrame) -> str:
-        return self.runtime.speaker.speak(frame)
+        plan_words = frame.speech_plan()
+        broca_features = self.broca_features_from_frame(frame)
+        text, token_ids, inertia = PlanForcedGenerator.generate(
+            self.host,
+            self.tokenizer,
+            plan_words,
+            broca_features=broca_features,
+        )
+        self.motor_replay_recorder.record(
+            [
+                {
+                    "role": "user",
+                    "content": (
+                        f"intent={frame.intent} | subject={frame.subject or ''} | "
+                        f"answer={frame.answer or ''} | plan={' '.join(plan_words)}"
+                    ),
+                }
+            ],
+            generated_token_ids=token_ids,
+            broca_features=broca_features,
+            substrate_confidence=self.probability.unit_interval(frame.confidence),
+            substrate_inertia=inertia,
+        )
+        return text
 
     def answer(self, utterance: str, *, max_new_tokens: int | None = None) -> tuple[CognitiveFrame, str]:
         """One-shot natural-language reply driven by substrate-biased decoding."""

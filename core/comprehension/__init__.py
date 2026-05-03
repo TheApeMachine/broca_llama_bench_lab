@@ -11,8 +11,6 @@ The pipeline:
   against the substrate's known subjects.
 * :class:`TextRelevance` scores a candidate frame's descriptor tokens
   against the user's utterance for routing.
-* :class:`ClaimPredictionGap` runs the host's lexical surprise gap on a
-  contradicting claim so consolidation can attenuate trust.
 * :class:`SCMTargetPicker` discovers ``(treatment, outcome)`` from a SCM's
   endogenous labels.
 * :class:`CognitiveRouter` ties everything together: every faculty receives
@@ -23,7 +21,6 @@ The pipeline:
 
 from __future__ import annotations
 
-from .claim_prediction_gap import ClaimPredictionGap
 from .claim_refiner import ClaimRefiner
 from .deferred_queue import DeferredRelationQueue
 from .deferred_relation_ingest import DeferredRelationIngest
@@ -35,7 +32,6 @@ from .text_relevance import TextRelevance
 from .tokens import LexicalTokens
 
 __all__ = [
-    "ClaimPredictionGap",
     "ClaimRefiner",
     "CognitiveRouter",
     "ComprehensionPipeline",
