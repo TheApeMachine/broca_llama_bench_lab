@@ -28,28 +28,6 @@ from .substrate.runtime import (
 )
 
 
-def parse_device_env() -> str | None:
-    """``M_DEVICE`` override, with deprecated ``ASI_DEVICE`` fallback."""
-
-    raw_m = os.environ.get("M_DEVICE")
-
-    if raw_m is not None and raw_m.strip() != "":
-        return raw_m.strip()
-
-    legacy = os.environ.get("ASI_DEVICE")
-
-    if legacy is not None and legacy.strip() != "":
-        warnings.warn(
-            "ASI_DEVICE is deprecated; set M_DEVICE for the default torch device override.",
-            DeprecationWarning,
-            stacklevel=2,
-        )
-
-        return legacy.strip()
-
-    return None
-
-
 def configure_lab_session(*, silent_stderr_default: bool = False) -> None:
     """Apply logging defaults, then :func:`configure_lab_logging`.
 
@@ -125,7 +103,7 @@ def build_substrate_controller(
     ensure_parent_dir(rp)
     ns = namespace if namespace is not None else CHAT_NAMESPACE
     mid = llama_model_id if llama_model_id is not None else default_model_id()
-    resolved_device = pick_torch_device(parse_device_env()) if device is None else device
+    resolved_device = pick_torch_device(device)
 
     if hf_token is _DEFAULT_HF_TOKEN:
         token_kw: str | bool | None = resolve_hf_hub_token(None)
