@@ -32,7 +32,7 @@ from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Sequence
+from typing import Mapping, Sequence
 
 logger = logging.getLogger(__name__)
 
@@ -212,6 +212,60 @@ class DirichletPreference:
         p = self.mean
         u = 1.0 / self.n_observations
         return float(sum(pi * math.log(pi / u) for pi in p if pi > 0))
+
+    def update_from_peer_signal(
+        self,
+        observation_index: int,
+        payload: Mapping[str, object],
+        *,
+        polarity: float = 1.0,
+        base_weight: float = 1.0,
+        reason: str = "",
+    ) -> None:
+        """Apply :meth:`update` with weight scaled by the peer's posterior reliability.
+
+        The swarm quarantine tags every peer payload with ``_peer_reliability``
+        ∈ (0, 1). A peer that consistently broadcasts frames contradicting
+        local high-confidence beliefs converges toward zero reliability and
+        therefore stops shifting the local concentration vector — the conjugate
+        prior never crosses into negative bounds.
+        """
+
+        if not isinstance(payload, Mapping):
+            raise TypeError(
+                "DirichletPreference.update_from_peer_signal: payload must be a mapping"
+            )
+
+        if "_peer_reliability" not in payload:
+            raise ValueError(
+                "DirichletPreference.update_from_peer_signal: payload missing _peer_reliability "
+                "tag — only quarantined peer payloads are valid here"
+            )
+
+        rel = float(payload["_peer_reliability"])
+
+        if not 0.0 <= rel <= 1.0:
+            raise ValueError(
+                f"DirichletPreference.update_from_peer_signal: _peer_reliability {rel} outside [0, 1]"
+            )
+
+        scaled_weight = float(base_weight) * rel
+
+        if scaled_weight <= 0.0:
+            logger.debug(
+                "DirichletPreference.update_from_peer_signal: peer=%s reliability=%.4f → zero weight, skipping idx=%d",
+                payload.get("_peer_id"),
+                rel,
+                observation_index,
+            )
+            return
+
+        self.update(
+            observation_index,
+            polarity=polarity,
+            weight=scaled_weight,
+            reason=f"{reason} peer={payload.get('_peer_id', '?')} reliability={rel:.3f}".strip(),
+        )
 
 
 _NEGATIVE_SENTIMENT = re.compile(

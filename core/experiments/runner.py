@@ -123,8 +123,6 @@ def run_causal_experiment(verbose: bool = True) -> dict:
         {"Y": 1},
         evidence={"S": 1, "T": 1, "Y": 1},
         interventions={"T": 0},
-        n_samples=4_000,
-        seed=0,
     )
 
     front = build_frontdoor_scm()

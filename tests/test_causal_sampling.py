@@ -8,16 +8,13 @@ from core.causal import FiniteSCM, build_simpson_scm
 
 def test_gibbs_counterfactual_matches_exact_on_small_scm():
     scm = build_simpson_scm()
-    exact = scm.counterfactual_probability_exact({"Y": 1}, evidence={"S": 1, "T": 1, "Y": 1}, interventions={"T": 0})
-    sampled = scm.counterfactual_probability(
-        {"Y": 1},
-        evidence={"S": 1, "T": 1, "Y": 1},
-        interventions={"T": 0},
-        n_samples=4_000,
-        seed=4,
-    )
+    evidence = {"S": 1, "T": 1, "Y": 1}
+    interventions = {"T": 0}
+    exact = scm._counterfactual_probability_exact({"Y": 1}, evidence, interventions)
+    sampled = scm._counterfactual_probability_monte_carlo({"Y": 1}, evidence, interventions)
 
     assert math.isclose(sampled, exact, abs_tol=0.05)
+    assert sampled.lo <= exact <= sampled.hi or abs(sampled - exact) <= 0.05
 
 
 def test_large_counterfactual_uses_sampling_without_exhaustive_worlds():
@@ -27,7 +24,8 @@ def test_large_counterfactual_uses_sampling_without_exhaustive_worlds():
     scm.add_endogenous("X", [0, 1], ["U_X"], lambda v: 1 if v["U_X"] < 900 else 0)
     scm.add_endogenous("Y", [0, 1], ["X", "U_Y"], lambda v: 1 if (v["X"] == 1 and v["U_Y"] < 800) else 0)
 
-    # The Gibbs sampler must not call exhaustive enumeration; assert it never does.
+    # World volume is 10^6, well above MC_SAMPLE_BUDGET, so the dispatch must
+    # pick the sampling path. Assert exhaustive enumeration is never touched.
     def fail_enumeration():
         raise AssertionError("exact exogenous enumeration should not run")
 
@@ -36,11 +34,11 @@ def test_large_counterfactual_uses_sampling_without_exhaustive_worlds():
         {"Y": 1},
         evidence={"X": 1},
         interventions={"X": 1},
-        n_samples=2_000,
-        seed=1,
     )
 
     assert 0.75 <= got <= 0.85
+    assert got.exact is False
+    assert got.lo <= got <= got.hi
 
 
 def test_gibbs_counterfactual_handles_rare_evidence_via_local_search():
@@ -67,8 +65,6 @@ def test_gibbs_counterfactual_handles_rare_evidence_via_local_search():
         {"Y": 1},
         evidence={"A": 1, "B": 1, "Y": 1},
         interventions={"A": 1, "B": 1},
-        n_samples=2_000,
-        seed=7,
     )
 
     # do(A=1, B=1) is consistent with the factual world; Y must remain 1.

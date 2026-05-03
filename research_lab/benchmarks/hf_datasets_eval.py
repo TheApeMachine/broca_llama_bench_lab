@@ -642,7 +642,8 @@ class HFLocalSubstrateBench:
         context = self.format_prompt(prompt, chat_template=chat_template)
         frame = self.mind.comprehend(context)
         feats = self.mind.broca_features_from_frame(frame).to(self.device)
-        bias = self.mind.content_logit_bias_from_frame(frame)
+        attract_tokens = self.mind.concept_token_ids_from_frame(frame)
+        repel_tokens = self.mind.repulsion_token_ids_from_frame(frame)
         substrate_confidence = float(max(0.0, min(1.0, float(frame.confidence))))
         encoded = [self._encode_context_choice(context, c) for c in choices]
         max_len = max(len(ids) for ids, _, _ in encoded)
@@ -661,9 +662,10 @@ class HFLocalSubstrateBench:
             "substrate_confidence": substrate_confidence,
             "substrate_inertia": float(substrate_inertia),
         }
-        if bias:
-            extra_state["broca_logit_bias"] = bias
-            extra_state["broca_logit_bias_decay"] = 1.0
+        if attract_tokens:
+            extra_state["broca_concept_token_ids"] = attract_tokens
+        if repel_tokens:
+            extra_state["broca_repulsion_token_ids"] = repel_tokens
         logits = self.mind.host(input_ids, attention_mask=attn, extra_state=extra_state).float()
         logprobs = F.log_softmax(logits, dim=-1)
         raw_scores: list[float] = []

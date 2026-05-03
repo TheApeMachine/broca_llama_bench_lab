@@ -176,8 +176,11 @@ class SubstrateController:
     def broca_features_from_frame(self, frame: CognitiveFrame) -> torch.Tensor:
         return self.runtime.graft_frame.broca_features(frame)
 
-    def content_logit_bias_from_frame(self, frame: CognitiveFrame) -> dict[int, float]:
-        return self.runtime.graft_frame.content_logit_bias(frame)
+    def concept_token_ids_from_frame(self, frame: CognitiveFrame) -> dict[str, list[int]]:
+        return self.runtime.graft_frame.concept_token_ids(frame)
+
+    def repulsion_token_ids_from_frame(self, frame: CognitiveFrame) -> dict[str, list[int]]:
+        return self.runtime.graft_frame.repulsion_token_ids(frame)
 
     def refine_extracted_claim(
         self, utterance: str, toks: Sequence[str], claim: ParsedClaim

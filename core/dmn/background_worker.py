@@ -38,6 +38,7 @@ from typing import Any, Mapping, Sequence
 import torch
 import torch.nn.functional as F
 
+from ..agent.active_inference import entropy as belief_entropy
 from ..causal.causal_discovery import (
     build_scm_from_skeleton,
     local_predicate_cluster,

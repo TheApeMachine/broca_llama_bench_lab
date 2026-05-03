@@ -1,8 +1,14 @@
-"""The swarm node: UDP multicast wired into the EventBus.
+"""The swarm node: UDP multicast wired into the EventBus through a quarantine.
 
-Every local event goes to the network. Every network event comes to the
-local bus. Peers discover each other via heartbeat. No filters, no options.
-Errors are raised, not swallowed.
+Every local event goes to the network. Every network event passes through the
+:class:`PeerQuarantine` membrane before it touches the local bus: native-tool
+source code is validated by the local conformal sandbox; all other payloads
+are tagged with per-peer posterior reliability so downstream Dirichlet /
+expected-free-energy machinery can scale a hallucinating peer's influence
+toward zero without crossing into negative bounds.
+
+Errors are raised, not swallowed; quarantine rejections are logged at warning
+and the receive loop continues.
 """
 
 from __future__ import annotations
@@ -19,6 +25,8 @@ from typing import Any
 import msgpack
 
 from .peer import PeerInfo, PEER_TIMEOUT_S
+from .peer_reliability import PeerReliabilityRegistry
+from .quarantine import PeerQuarantine, PeerRejected
 
 logger = logging.getLogger(__name__)
 
@@ -36,10 +44,17 @@ class Swarm:
     Every EventBus event is broadcast. Every received event is published locally.
     """
 
-    def __init__(self, event_bus: Any, *, capabilities: list[str]):
+    def __init__(
+        self,
+        event_bus: Any,
+        *,
+        capabilities: list[str],
+        quarantine: PeerQuarantine,
+    ):
         self._bus = event_bus
         self.node_id = f"mosaic-{uuid.uuid4().hex[:8]}"
         self.capabilities = capabilities
+        self._quarantine = quarantine
 
         self._peers: dict[str, PeerInfo] = {}
         self._peers_lock = threading.Lock()
@@ -49,6 +64,7 @@ class Swarm:
         self._running = threading.Event()
         self._total_sent = 0
         self._total_received = 0
+        self._total_quarantined = 0
 
         self._tx = self._create_sender()
         self._rx = self._create_receiver()
@@ -198,12 +214,24 @@ class Swarm:
     def _handle_event(self, msg: dict) -> None:
         topic = msg.get("topic", "")
         payload = msg.get("payload", {})
+        peer_id = str(msg.get("src", ""))
 
-        if isinstance(payload, dict):
-            payload["_from_swarm"] = True
-            payload["_from_node"] = msg.get("src", "")
+        try:
+            tagged = self._quarantine.intercept(topic, payload, peer_id)
+        except PeerRejected as exc:
+            self._total_quarantined += 1
+            logger.warning(
+                "Swarm._handle_event: dropped peer=%s topic=%s reason=%s",
+                peer_id,
+                topic,
+                exc,
+            )
+            return
 
-        self._bus.publish(topic, payload)
+        tagged["_from_swarm"] = True
+        tagged["_from_node"] = peer_id
+
+        self._bus.publish(topic, tagged)
 
     def _handle_bye(self, src: str) -> None:
         with self._peers_lock:

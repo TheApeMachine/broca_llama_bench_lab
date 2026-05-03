@@ -8,9 +8,9 @@ from __future__ import annotations
 
 from .builder import HostGraftsBuilder
 from .chat_plan import ChatGraftPlan
+from .concept_graft import SubstrateConceptGraft
 from .feature import FrameGraftProjection
 from .lexical_plan import LexicalPlanGraft
-from .logit_bias import SubstrateLogitBiasGraft
 from .strength import DerivedStrength, StrengthInputs
 from .trainable_feature import TrainableFeatureGraft
 
@@ -21,6 +21,6 @@ __all__ = [
     "HostGraftsBuilder",
     "LexicalPlanGraft",
     "StrengthInputs",
-    "SubstrateLogitBiasGraft",
+    "SubstrateConceptGraft",
     "TrainableFeatureGraft",
 ]

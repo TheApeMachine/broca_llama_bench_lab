@@ -48,12 +48,17 @@ class ChatDecoder:
         eos_id = getattr(hf_tok, "eos_token_id", None)
         current = prompt[0].tolist()
         generated: list[int] = []
-        bias_active = bool(plan.logit_bias)
         feature_tensor = (
             plan.broca_features.to(device) if plan.broca_features is not None else None
         )
-        target_token_set = {int(t) for t in plan.logit_bias.keys()} if bias_active else set()
-        target_emitted = False
+        attract_tokens = {
+            str(name): [int(t) for t in tids]
+            for name, tids in (plan.concept_token_ids or {}).items()
+        }
+        repel_tokens = {
+            str(name): [int(t) for t in tids]
+            for name, tids in (plan.repulsion_token_ids or {}).items()
+        }
 
         past_key_values = None
         with torch.no_grad():
@@ -67,11 +72,10 @@ class ChatDecoder:
                 }
                 if feature_tensor is not None:
                     extra_state["broca_features"] = feature_tensor
-                if bias_active:
-                    extra_state["broca_logit_bias"] = plan.logit_bias
-                    extra_state["broca_logit_bias_decay"] = (
-                        0.15 if target_emitted else 1.0
-                    )
+                if attract_tokens:
+                    extra_state["broca_concept_token_ids"] = attract_tokens
+                if repel_tokens:
+                    extra_state["broca_repulsion_token_ids"] = repel_tokens
                 if past_key_values is not None:
                     extra_state["past_key_values"] = past_key_values
 
@@ -100,8 +104,6 @@ class ChatDecoder:
 
                 generated.append(pred)
                 current.append(pred)
-                if bias_active and not target_emitted and pred in target_token_set:
-                    target_emitted = True
                 if on_token is not None:
                     piece = hf_tok.decode(
                         [pred],

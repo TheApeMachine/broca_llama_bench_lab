@@ -50,7 +50,13 @@ def _bar(value: float, *, width: int = 12, vmax: float = 1.0) -> str:
 
 
 class _BasePanel(Static):
-    """Common base: bordered, titled, set_lines."""
+    """Common base: bordered, titled, set_lines.
+
+    Uses :meth:`Static.update` so Textual's auto-height layout pass picks up
+    the new content size — overriding ``render()`` and calling ``refresh()``
+    redraws but does not re-measure, which silently clipped the panels to
+    their initial single-line content.
+    """
 
     DEFAULT_CSS = f"""
     _BasePanel {{
@@ -58,19 +64,21 @@ class _BasePanel(Static):
     """
 
     def __init__(self, title: str, **kwargs: Any) -> None:
-        super().__init__(**kwargs)
+        super().__init__("", **kwargs)
         self._title = title
         self._lines: list[str] = []
-
-    def render(self) -> str:
-        head = _rich_section_title(self._title)
-        if not self._lines:
-            return _titled_placeholder(head)
-        return head + "\n" + "\n".join(self._lines)
+        self._render_now()
 
     def set_lines(self, lines: Iterable[str]) -> None:
         self._lines = list(lines)
-        self.refresh()
+        self._render_now()
+
+    def _render_now(self) -> None:
+        head = _rich_section_title(self._title)
+        if not self._lines:
+            self.update(_titled_placeholder(head))
+            return
+        self.update(head + "\n" + "\n".join(self._lines))
 
 
 class SWMSlotsPanel(_BasePanel):
@@ -78,12 +86,15 @@ class SWMSlotsPanel(_BasePanel):
 
     DEFAULT_CSS = f"""
     SWMSlotsPanel {{
-{_CSS_BRAND_PANEL_BODY}    }}
+{_CSS_BRAND_PANEL_BODY}        min-height: 14;
+    }}
     """
 
-    def update_from_swm(self, swm: Any, *, max_rows: int = 20) -> None:
+    def update_from_swm(self, swm: Any, *, max_rows: int = 30) -> None:
         slots = sorted(list(swm), key=lambda s: -int(s.written_at_tick))
-        lines = [f"[dim]dim={swm.dim}  total={len(swm)}[/dim]"]
+        lines = [
+            f"[dim]dim={swm.dim}  slots={len(swm)}  showing {min(len(slots), max_rows)}[/dim]",
+        ]
 
         if not slots:
             lines.append(_DIM_EM_DASH)
@@ -92,9 +103,9 @@ class SWMSlotsPanel(_BasePanel):
                 norm = float(slot.vector.norm().item())
                 lines.append(
                     f"[{BRAND_SOFT}]#{slot.written_at_tick:>4}[/{BRAND_SOFT}] "
-                    f"{slot.name[:24]:<24} "
-                    f"[dim]{slot.source.value[:10]:<10}[/dim] "
-                    f"|{_fmt_float(norm, 2)}|"
+                    f"{slot.name[:30]:<30} "
+                    f"[dim]{slot.source.value[:18]:<18}[/dim] "
+                    f"|v|={_fmt_float(norm, 2)}"
                 )
             if len(slots) > max_rows:
                 lines.append(f"[dim]… {len(slots) - max_rows} more slots[/dim]")
@@ -107,7 +118,8 @@ class RecursionPanel(_BasePanel):
 
     DEFAULT_CSS = f"""
     RecursionPanel {{
-{_CSS_BRAND_PANEL_BODY}    }}
+{_CSS_BRAND_PANEL_BODY}        min-height: 12;
+    }}
     """
 
     def __init__(self, **kwargs: Any) -> None:
@@ -163,7 +175,8 @@ class PredictionErrorPanel(_BasePanel):
 
     DEFAULT_CSS = f"""
     PredictionErrorPanel {{
-{_CSS_BRAND_PANEL_BODY}    }}
+{_CSS_BRAND_PANEL_BODY}        min-height: 10;
+    }}
     """
 
     def __init__(self, **kwargs: Any) -> None:
@@ -196,7 +209,8 @@ class AlignmentPanel(_BasePanel):
 
     DEFAULT_CSS = f"""
     AlignmentPanel {{
-{_CSS_BRAND_PANEL_BODY}    }}
+{_CSS_BRAND_PANEL_BODY}        min-height: 8;
+    }}
     """
 
     def __init__(self, **kwargs: Any) -> None:
@@ -223,7 +237,8 @@ class LatentDecoderPanel(_BasePanel):
 
     DEFAULT_CSS = f"""
     LatentDecoderPanel {{
-{_CSS_BRAND_PANEL_BODY}    }}
+{_CSS_BRAND_PANEL_BODY}        min-height: 10;
+    }}
     """
 
     def __init__(self, **kwargs: Any) -> None:
@@ -281,7 +296,8 @@ class ActiveThoughtPanel(_BasePanel):
 
     DEFAULT_CSS = f"""
     ActiveThoughtPanel {{
-{_CSS_BRAND_PANEL_BODY}    }}
+{_CSS_BRAND_PANEL_BODY}        min-height: 12;
+    }}
     """
 
     def __init__(self, **kwargs: Any) -> None:
@@ -341,15 +357,23 @@ class MRSActivityPanel(_BasePanel):
 
     DEFAULT_CSS = f"""
     MRSActivityPanel {{
-{_CSS_BRAND_PANEL_BODY}    }}
+{_CSS_BRAND_PANEL_BODY}        min-height: 20;
+    }}
     """
+
+    _MAX_EVENTS = 200
 
     def __init__(self, **kwargs: Any) -> None:
         super().__init__(title="MRS event stream", **kwargs)
         self._events: list[str] = []
+        self._counter: int = 0
 
     def append_event(self, line: str) -> None:
+        self._counter += 1
         self._events.append(line)
-        if len(self._events) > 14:
-            self._events = self._events[-14:]
-        self.set_lines(reversed(self._events))
+        if len(self._events) > self._MAX_EVENTS:
+            self._events = self._events[-self._MAX_EVENTS:]
+        # Most-recent first; cap displayed lines so the panel stays readable.
+        head = [f"[dim]events seen: {self._counter}  buffered: {len(self._events)}[/dim]"]
+        body = list(reversed(self._events[-50:]))
+        self.set_lines(head + body)

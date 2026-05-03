@@ -1,4 +1,4 @@
-"""Attach lexical, continuous-feature, and logit grafts to the Broca host."""
+"""Attach lexical, continuous-feature, and concept-direction grafts to the Broca host."""
 
 from __future__ import annotations
 
@@ -6,13 +6,19 @@ from typing import Any
 
 from ..frame import FrameDimensions
 from ..grafting.grafts import DEFAULT_GRAFT_TARGET_SNR
+from .concept_graft import SubstrateConceptGraft
 from .lexical_plan import LexicalPlanGraft
-from .logit_bias import SubstrateLogitBiasGraft
 from .trainable_feature import TrainableFeatureGraft
 
 
 class HostGraftsBuilder:
-    """Constructs substrate-owned grafts and registers them on ``mind.host``."""
+    """Constructs substrate-owned grafts and registers them on ``mind.host``.
+
+    All three grafts attach at the ``final_hidden`` slot — concepts cross the
+    frozen-LLM boundary as continuous directions in the residual stream rather
+    than as final-layer logit edits, so the host's auto-regressive composition
+    mediates expression and suppression of substrate-named concepts.
+    """
 
     @classmethod
     def populate(cls, mind: Any, *, lexical_target_snr: float | None) -> None:
@@ -31,6 +37,6 @@ class HostGraftsBuilder:
             if host_param is not None:
                 mind.feature_graft.to(host_param.device)
         mind.host.add_graft("final_hidden", mind.feature_graft)
-        mind.logit_bias_graft = SubstrateLogitBiasGraft()
-        mind.host.add_graft("logits", mind.logit_bias_graft)
+        mind.concept_graft = SubstrateConceptGraft(target_snr=snr)
+        mind.host.add_graft("final_hidden", mind.concept_graft)
         mind._host_param = host_param

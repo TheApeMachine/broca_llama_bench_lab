@@ -40,10 +40,23 @@ class JLProjection:
         m.normal_(mean=0.0, std=1.0 / math.sqrt(float(self.d_out)), generator=g)
 
         self._matrix = m.contiguous()
+        self._device_cache: dict[tuple[str, torch.dtype], torch.Tensor] = {}
 
     @property
     def matrix(self) -> torch.Tensor:
         return self._matrix
+
+    def matrix_on(self, *, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+        """Cache the matrix per ``(device, dtype)`` so hot-path calls don't re-transfer."""
+
+        key = (str(device), dtype)
+        cached = self._device_cache.get(key)
+
+        if cached is None:
+            cached = self._matrix.detach().to(device=device, dtype=dtype).contiguous()
+            self._device_cache[key] = cached
+
+        return cached
 
     def apply(self, x: torch.Tensor) -> torch.Tensor:
         if x.shape[-1] != self.d_in:
@@ -51,7 +64,7 @@ class JLProjection:
                 f"JLProjection.apply: expected last dim {self.d_in}, got {x.shape[-1]}"
             )
 
-        m = self._matrix.to(device=x.device, dtype=x.dtype)
+        m = self.matrix_on(device=x.device, dtype=x.dtype)
         return x @ m
 
     def __repr__(self) -> str:

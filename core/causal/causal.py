@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import hashlib
 import itertools
 import logging
+import math
 import random
+import statistics
 from dataclasses import dataclass, field
 from typing import Callable, Mapping, Sequence
 
@@ -18,7 +21,83 @@ _INIT_REJECTION_EXO_DIVISOR_FALLBACK = 4  # Lower bound for dividing cap by exo_
 _INIT_RESTART_SLS_DIVISOR_BASE = 16  # WalkSAT restart cadence scales as sls_budget / max(this, exo_n * scale).
 _INIT_RESTART_EXO_SCALE = 2  # Per-exogenous factor in restart denominator so more roots restart slightly more often.
 
+# Finite-sample coverage spec for Monte-Carlo probability estimates.
+# Wilson-score interval gives 1 - MC_COVERAGE_ALPHA marginal coverage of the true
+# probability under the SCM. The sample budget is *derived* from the worst-case
+# (p=0.5) half-width target so the budget is a function of the spec, not a knob.
+MC_COVERAGE_ALPHA = 0.01  # 99% coverage of the true probability.
+_MC_TARGET_HALF_WIDTH = 0.01  # Worst-case Wilson half-width at p = 0.5.
+_MC_Z = statistics.NormalDist().inv_cdf(1.0 - MC_COVERAGE_ALPHA / 2.0)
+MC_SAMPLE_BUDGET = int(math.ceil((_MC_Z * _MC_Z) * 0.25 / (_MC_TARGET_HALF_WIDTH * _MC_TARGET_HALF_WIDTH)))
+
 logger = logging.getLogger(__name__)
+
+
+def wilson_interval(num: int, den: int) -> tuple[float, float]:
+    """Wilson-score binomial confidence interval at MC_COVERAGE_ALPHA.
+
+    Closed-form, finite-sample, and self-consistent at boundaries (num=0, num=den).
+    Returns the (lower, upper) bounds clipped to [0, 1].
+    """
+
+    if den <= 0:
+        raise ValueError("wilson_interval: den must be positive")
+
+    n = float(den)
+    z = _MC_Z
+    z2 = z * z
+    p_hat = float(num) / n
+    denom = 1.0 + z2 / n
+    center = (p_hat + z2 / (2.0 * n)) / denom
+    spread = z * math.sqrt(p_hat * (1.0 - p_hat) / n + z2 / (4.0 * n * n)) / denom
+
+    return max(0.0, center - spread), min(1.0, center + spread)
+
+
+class ProbabilityEstimate(float):
+    """Probability with Wilson-coverage interval and provenance.
+
+    Subclasses ``float`` so existing arithmetic still produces plain floats — the
+    bound semantics are local to a single estimate; a difference of two estimates
+    has no closed-form Wilson interval and so is returned as a regular ``float``.
+    Consumers that need bounds inspect ``lo``/``hi`` on the original estimate.
+    """
+
+    def __new__(cls, point: float, *, lo: float, hi: float, n_samples: int, exact: bool):
+        if lo > point + 1e-9 or hi + 1e-9 < point:
+            raise ValueError(f"ProbabilityEstimate: point={point} outside [{lo}, {hi}]")
+
+        instance = float.__new__(cls, point)
+        instance.lo = float(lo)
+        instance.hi = float(hi)
+        instance.n_samples = int(n_samples)
+        instance.exact = bool(exact)
+
+        return instance
+
+    @property
+    def width(self) -> float:
+        return self.hi - self.lo
+
+    @property
+    def confident_singleton(self) -> bool:
+        """True when the coverage interval has collapsed (exact, or a near-zero MC width)."""
+
+        return self.exact or self.width <= 2.0 * _MC_TARGET_HALF_WIDTH
+
+    def __repr__(self) -> str:
+        mode = "exact" if self.exact else "mc"
+        return f"ProbabilityEstimate({float(self):.4f}, ci=[{self.lo:.4f}, {self.hi:.4f}], n={self.n_samples}, {mode})"
+
+    def __reduce__(self):
+        return (
+            _rebuild_probability_estimate,
+            (float(self), self.lo, self.hi, self.n_samples, self.exact),
+        )
+
+
+def _rebuild_probability_estimate(point: float, lo: float, hi: float, n_samples: int, exact: bool) -> "ProbabilityEstimate":
+    return ProbabilityEstimate(point, lo=lo, hi=hi, n_samples=n_samples, exact=exact)
 
 
 @dataclass
@@ -293,13 +372,34 @@ class FiniteSCM:
         *,
         given: Mapping[str, object],
         interventions: Mapping[str, object],
-    ) -> float:
+    ) -> ProbabilityEstimate:
+        """Interventional probability with Wilson-coverage interval.
+
+        Exactness is determined by world volume: when the exogenous Cartesian
+        product fits inside ``MC_SAMPLE_BUDGET`` we enumerate (zero-width interval),
+        otherwise we Monte-Carlo with a deterministic per-query seed and return a
+        Wilson-score interval covering the true probability with 1 - MC_COVERAGE_ALPHA.
+        """
+
         given_d = dict(given)
+        interventions_d = dict(interventions)
+
+        if self.exogenous_world_volume <= MC_SAMPLE_BUDGET:
+            return self._probability_exact(event, given_d, interventions_d)
+
+        return self._probability_monte_carlo(event, given_d, interventions_d)
+
+    def _probability_exact(
+        self,
+        event: Mapping[str, object],
+        given_d: dict[str, object],
+        interventions_d: dict[str, object],
+    ) -> ProbabilityEstimate:
         num = 0.0
         den = 0.0
 
         for exo, p in self._exogenous_worlds():
-            vals = self.evaluate_world(exo, interventions)
+            vals = self.evaluate_world(exo, interventions_d)
 
             if self._valuation_matches(vals, given_d):
                 den += p
@@ -310,21 +410,62 @@ class FiniteSCM:
         if den <= _EPS:
             raise ValueError(
                 "FiniteSCM.probability: conditioning event has zero probability under this model "
-                f"(given={given_d}, interventions={dict(interventions)})",
+                f"(given={given_d}, interventions={interventions_d})",
             )
 
-        prob = num / den
-
+        point = num / den
         logger.debug(
-            "FiniteSCM.probability: p=%.8f event=%s given=%s do=%s worlds=%d",
-            prob,
+            "FiniteSCM.probability: p=%.8f event=%s given=%s do=%s mode=exact worlds=%d",
+            point,
             dict(event),
             given_d,
-            dict(interventions),
+            interventions_d,
             self.exogenous_world_volume,
         )
 
-        return prob
+        return ProbabilityEstimate(point, lo=point, hi=point, n_samples=self.exogenous_world_volume, exact=True)
+
+    def _probability_monte_carlo(
+        self,
+        event: Mapping[str, object],
+        given_d: dict[str, object],
+        interventions_d: dict[str, object],
+    ) -> ProbabilityEstimate:
+        rng = random.Random(self._query_seed("probability", event, given_d, interventions_d))
+        num = 0
+        den = 0
+
+        for _ in range(MC_SAMPLE_BUDGET):
+            world = self._sample_exogenous_world(rng)
+            vals = self.evaluate_world(world, interventions_d)
+
+            if self._valuation_matches(vals, given_d):
+                den += 1
+
+                if self._valuation_matches(vals, event):
+                    num += 1
+
+        if den <= 0:
+            raise ValueError(
+                "FiniteSCM.probability: conditioning event never matched in "
+                f"{MC_SAMPLE_BUDGET} sampled worlds (given={given_d}, interventions={interventions_d}); "
+                "event has near-zero structural probability under this SCM",
+            )
+
+        point = num / den
+        lo, hi = wilson_interval(num, den)
+        logger.debug(
+            "FiniteSCM.probability: p=%.4f ci=[%.4f, %.4f] event=%s given=%s do=%s mode=monte_carlo n=%d",
+            point,
+            lo,
+            hi,
+            dict(event),
+            given_d,
+            interventions_d,
+            den,
+        )
+
+        return ProbabilityEstimate(point, lo=lo, hi=hi, n_samples=den, exact=False)
 
     @property
     def exogenous_world_volume(self) -> int:
@@ -335,40 +476,25 @@ class FiniteSCM:
 
         return vol
 
-    def probability_monte_carlo(
-        self,
-        event: Mapping[str, object],
-        *,
-        given: Mapping[str, object],
-        interventions: Mapping[str, object],
-        n_samples: int,
-        seed: int,
-    ) -> float:
-        rng = random.Random(int(seed))
-        given_d = dict(given)
-        num = 0
-        den = 0
+    def _query_seed(self, prefix: str, *parts: object) -> int:
+        """Deterministic seed derived from the SCM structure and a query payload.
 
-        if n_samples <= 0:
-            raise ValueError("FiniteSCM.probability_monte_carlo: n_samples must be positive")
+        Identical queries on the same SCM produce identical Monte-Carlo estimates,
+        which keeps DMN dreams reproducible without exposing a tunable ``seed``.
+        """
 
-        for _ in range(int(n_samples)):
-            world = self._sample_exogenous_world(rng)
-            vals = self.evaluate_world(world, interventions)
+        h = hashlib.blake2b(digest_size=8)
+        h.update(prefix.encode())
+        h.update(repr(self.order).encode())
+        h.update(repr(sorted(self.domains.items())).encode())
 
-            if self._valuation_matches(vals, given_d):
-                den += 1
+        for part in parts:
+            if isinstance(part, Mapping):
+                h.update(repr(sorted(part.items(), key=lambda kv: str(kv[0]))).encode())
+            else:
+                h.update(repr(part).encode())
 
-                if self._valuation_matches(vals, event):
-                    num += 1
-
-        if den <= 0:
-            raise ValueError(
-                "FiniteSCM.probability_monte_carlo: conditioning event never occurred in sampled worlds "
-                f"(given={given_d}, interventions={dict(interventions)})",
-            )
-
-        return num / den
+        return int.from_bytes(h.digest(), "big")
 
     def distribution(
         self,
@@ -376,26 +502,85 @@ class FiniteSCM:
         *,
         given: Mapping[str, object],
         interventions: Mapping[str, object],
-    ) -> dict[tuple, float]:
-        out: dict[tuple, float] = {}
-        den = 0.0
+    ) -> dict[tuple, ProbabilityEstimate]:
+        """Joint marginal over ``variables`` with per-cell Wilson coverage.
+
+        Cells absent from the support have zero point mass; cells with positive
+        sampled mass return a Wilson interval at MC_COVERAGE_ALPHA. Exactness is
+        decided by world volume vs. ``MC_SAMPLE_BUDGET``.
+        """
+
         given_d = dict(given)
+        interventions_d = dict(interventions)
+
+        if self.exogenous_world_volume <= MC_SAMPLE_BUDGET:
+            return self._distribution_exact(variables, given_d, interventions_d)
+
+        return self._distribution_monte_carlo(variables, given_d, interventions_d)
+
+    def _distribution_exact(
+        self,
+        variables: Sequence[str],
+        given_d: dict[str, object],
+        interventions_d: dict[str, object],
+    ) -> dict[tuple, ProbabilityEstimate]:
+        mass: dict[tuple, float] = {}
+        den = 0.0
 
         for exo, p in self._exogenous_worlds():
-            vals = self.evaluate_world(exo, interventions)
+            vals = self.evaluate_world(exo, interventions_d)
 
             if self._valuation_matches(vals, given_d):
                 key = tuple(vals[v] for v in variables)
-                out[key] = out.get(key, 0.0) + p
+                mass[key] = mass.get(key, 0.0) + p
                 den += p
 
         if den <= _EPS:
             raise ValueError(
                 "FiniteSCM.distribution: conditioning event has zero probability "
-                f"(given={given_d}, interventions={dict(interventions)})",
+                f"(given={given_d}, interventions={interventions_d})",
             )
 
-        return {k: v / den for k, v in out.items()}
+        n_world = self.exogenous_world_volume
+
+        return {
+            key: ProbabilityEstimate(m / den, lo=m / den, hi=m / den, n_samples=n_world, exact=True)
+            for key, m in mass.items()
+        }
+
+    def _distribution_monte_carlo(
+        self,
+        variables: Sequence[str],
+        given_d: dict[str, object],
+        interventions_d: dict[str, object],
+    ) -> dict[tuple, ProbabilityEstimate]:
+        rng = random.Random(self._query_seed("distribution", tuple(variables), given_d, interventions_d))
+        counts: dict[tuple, int] = {}
+        den = 0
+
+        for _ in range(MC_SAMPLE_BUDGET):
+            world = self._sample_exogenous_world(rng)
+            vals = self.evaluate_world(world, interventions_d)
+
+            if self._valuation_matches(vals, given_d):
+                key = tuple(vals[v] for v in variables)
+                counts[key] = counts.get(key, 0) + 1
+                den += 1
+
+        if den <= 0:
+            raise ValueError(
+                "FiniteSCM.distribution: conditioning event never matched in "
+                f"{MC_SAMPLE_BUDGET} sampled worlds (given={given_d}, interventions={interventions_d})",
+            )
+
+        out: dict[tuple, ProbabilityEstimate] = {}
+
+        for key, count in counts.items():
+            point = count / den
+            lo, hi = wilson_interval(count, den)
+            out[key] = ProbabilityEstimate(point, lo=lo, hi=hi, n_samples=den, exact=False)
+
+        return out
 
     def counterfactual_probability(
         self,
@@ -403,28 +588,28 @@ class FiniteSCM:
         *,
         evidence: Mapping[str, object],
         interventions: Mapping[str, object],
-        n_samples: int,
-        seed: int,
-        gibbs_thin: int = 1,
-    ) -> float:
-        return self.counterfactual_probability_monte_carlo(
-            query_event,
-            evidence=evidence,
-            interventions=interventions,
-            n_samples=int(n_samples),
-            seed=int(seed),
-            gibbs_thin=int(gibbs_thin),
-        )
+    ) -> ProbabilityEstimate:
+        """Counterfactual probability via abduction-action-prediction with Wilson coverage.
 
-    def counterfactual_probability_exact(
-        self,
-        query_event: Mapping[str, object],
-        *,
-        evidence: Mapping[str, object],
-        interventions: Mapping[str, object],
-    ) -> float:
+        World volume picks the path: small SCMs enumerate exogenous worlds matching
+        evidence (zero-width interval); larger ones initialise an evidence-consistent
+        chain via rejection + WalkSAT and Gibbs-sample under the exact conditional.
+        """
+
         evidence_d = dict(evidence)
         query_event_d = dict(query_event)
+
+        if self.exogenous_world_volume <= MC_SAMPLE_BUDGET:
+            return self._counterfactual_probability_exact(query_event_d, evidence_d, dict(interventions))
+
+        return self._counterfactual_probability_monte_carlo(query_event_d, evidence_d, dict(interventions))
+
+    def _counterfactual_probability_exact(
+        self,
+        query_event_d: dict[str, object],
+        evidence_d: dict[str, object],
+        interventions_d: dict[str, object],
+    ) -> ProbabilityEstimate:
         num = 0.0
         den = 0.0
 
@@ -433,58 +618,49 @@ class FiniteSCM:
 
             if self._valuation_matches(actual, evidence_d):
                 den += p
-                cf = self.evaluate_world(exo, interventions)
+                cf = self.evaluate_world(exo, interventions_d)
 
                 if self._valuation_matches(cf, query_event_d):
                     num += p
 
         if den <= _EPS:
             raise ValueError(
-                "FiniteSCM.counterfactual_probability_exact: evidence has zero structural probability mass "
+                "FiniteSCM.counterfactual_probability: evidence has zero structural probability mass "
                 f"(evidence={evidence_d})",
             )
 
-        return num / den
+        point = num / den
 
-    def counterfactual_probability_monte_carlo(
+        return ProbabilityEstimate(point, lo=point, hi=point, n_samples=self.exogenous_world_volume, exact=True)
+
+    def _counterfactual_probability_monte_carlo(
         self,
-        query_event: Mapping[str, object],
-        *,
-        evidence: Mapping[str, object],
-        interventions: Mapping[str, object],
-        n_samples: int,
-        seed: int,
-        gibbs_thin: int = 1,
-    ) -> float:
-        rng = random.Random(int(seed))
-        evidence_d = dict(evidence)
-        query_event_d = dict(query_event)
+        query_event_d: dict[str, object],
+        evidence_d: dict[str, object],
+        interventions_d: dict[str, object],
+    ) -> ProbabilityEstimate:
+        rng = random.Random(self._query_seed("counterfactual", query_event_d, evidence_d, interventions_d))
         exo_names = list(self.exogenous)
-
-        if n_samples <= 0:
-            raise ValueError("FiniteSCM.counterfactual_probability_monte_carlo: n_samples must be positive")
-
-        if gibbs_thin < 1:
-            raise ValueError("FiniteSCM.counterfactual_probability_monte_carlo: gibbs_thin must be >= 1")
 
         if not exo_names:
             actual = self.evaluate_world({}, {})
 
             if not self._valuation_matches(actual, evidence_d):
                 raise ValueError(
-                    "FiniteSCM.counterfactual_probability_monte_carlo: evidence contradicts deterministic SCM "
+                    "FiniteSCM.counterfactual_probability: evidence contradicts deterministic SCM "
                     f"(evidence={evidence_d})",
                 )
 
-            cf = self.evaluate_world({}, interventions)
+            cf = self.evaluate_world({}, interventions_d)
+            point = 1.0 if self._valuation_matches(cf, query_event_d) else 0.0
 
-            return 1.0 if self._valuation_matches(cf, query_event_d) else 0.0
+            return ProbabilityEstimate(point, lo=point, hi=point, n_samples=1, exact=True)
 
         state = self._initialize_evidence_consistent_state(rng, evidence_d)
 
         if state is None:
             raise RuntimeError(
-                "FiniteSCM.counterfactual_probability_monte_carlo: could not initialise any exogenous assignment "
+                "FiniteSCM.counterfactual_probability: could not initialise any exogenous assignment "
                 "consistent with evidence under this SCM",
             )
 
@@ -495,18 +671,26 @@ class FiniteSCM:
                 state = self._gibbs_resample(rng, name, state, evidence_d)
 
         num = 0
-        thin = int(gibbs_thin)
 
-        for _ in range(int(n_samples)):
-            for _ in range(thin):
-                name = rng.choice(exo_names)
-                state = self._gibbs_resample(rng, name, state, evidence_d)
-            cf = self.evaluate_world(state, interventions)
+        for _ in range(MC_SAMPLE_BUDGET):
+            name = rng.choice(exo_names)
+            state = self._gibbs_resample(rng, name, state, evidence_d)
+            cf = self.evaluate_world(state, interventions_d)
 
             if self._valuation_matches(cf, query_event_d):
                 num += 1
 
-        return num / float(n_samples)
+        point = num / float(MC_SAMPLE_BUDGET)
+        lo, hi = wilson_interval(num, MC_SAMPLE_BUDGET)
+        logger.debug(
+            "FiniteSCM.counterfactual_probability: p=%.4f ci=[%.4f, %.4f] mode=gibbs n=%d",
+            point,
+            lo,
+            hi,
+            MC_SAMPLE_BUDGET,
+        )
+
+        return ProbabilityEstimate(point, lo=lo, hi=hi, n_samples=MC_SAMPLE_BUDGET, exact=False)
 
     def _gibbs_resample(
         self,
