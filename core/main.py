@@ -84,6 +84,24 @@ def _cmd_paper(argv: list[str]) -> None:
     paper_main(_strip_optional_ddash(argv))
 
 
+def _cmd_manifest(argv: list[str]) -> None:
+    from .kernel.cli import run_manifest_cli
+
+    run_manifest_cli(argv)
+
+
+def _cmd_graph(argv: list[str]) -> None:
+    from .kernel.cli import run_graph_cli
+
+    run_graph_cli(argv)
+
+
+def _cmd_health(argv: list[str]) -> None:
+    from .kernel.cli import run_health_cli
+
+    run_health_cli(argv)
+
+
 _COMMANDS: dict[str, tuple[str, Handler]] = {
     "chat": ("Streaming terminal chat (full stack; same substrate as chat-tui).", _cmd_chat),
     "chat-tui": ("Textual chat dashboard.", _cmd_chat_tui),
@@ -94,6 +112,9 @@ _COMMANDS: dict[str, tuple[str, Handler]] = {
     "bench-tui": ("Textual benchmark dashboard (wraps research_lab.benchmarks).", _cmd_bench_tui),
     "demo": ("Faculty experiments and Broca architecture benchmark.", _cmd_demo),
     "paper": ("Regenerate paper experiment TeX from benchmark harness.", _cmd_paper),
+    "manifest": ("Print declared runtime manifest/profile.", _cmd_manifest),
+    "graph": ("Print declared runtime dependency graph.", _cmd_graph),
+    "health": ("Build or statically inspect runtime health and invariants.", _cmd_health),
 }
 
 

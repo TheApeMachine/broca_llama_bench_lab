@@ -49,6 +49,7 @@ from ..causal.causal_discovery import (
     project_rows_to_variables,
 )
 from ..causal.temporal import TemporalCausalTraceBuilder
+from ..comprehension.text_relevance import TextRelevance
 from ..frame import CognitiveFrame, FrameDimensions, SubwordProjector
 from ..temporal.hawkes import fit_excitation_em
 from ..workspace import IntrinsicCue
@@ -567,12 +568,15 @@ class CognitiveBackgroundWorker:
             return None
         frame_a = CognitiveFrame.from_episode_row(row_a)
         frame_b = CognitiveFrame.from_episode_row(row_b)
-        text_a = " ".join(_frame_descriptor_tokens(frame_a))
-        text_b = " ".join(_frame_descriptor_tokens(frame_b))
+        text_a = " ".join(frame_a.descriptor_tokens())
+        text_b = " ".join(frame_b.descriptor_tokens())
         if not text_a.strip() or not text_b.strip():
             return None
         try:
-            return float(_cosine(_text_vector(text_a, text_encoder), _text_vector(text_b, text_encoder)))
+            return TextRelevance.cosine(
+                TextRelevance.vector(text_a, text_encoder),
+                TextRelevance.vector(text_b, text_encoder),
+            )
         except (RuntimeError, ValueError):
             logger.debug("DMN.phase3.transitive.similarity_failed a=%d b=%d", a, b, exc_info=True)
             return None

@@ -12,12 +12,20 @@ from typing import Any, Callable, Mapping, Optional, Sequence
 
 import torch
 
+from core.cognition.intent_gate import UtteranceIntent
+from core.cognition.observation import CognitiveObservation
+from core.comprehension import DeferredRelationIngest
+from core.dmn.background_worker import CognitiveBackgroundWorker
+from core.dmn.config import DMNConfig
 from core.encoders.affect import AffectState
 from core.frame import CognitiveFrame, ParsedClaim
+from core.grafting.dynamic_grafts import CapturedActivationMode
 from core.host.hf_tokenizer_compat import HuggingFaceBrocaTokenizer
 from core.host.llama_broca_host import LlamaBrocaHost
 from core.idletime.chunking import CompiledMacro
+from core.natives.native_tools import NativeTool
 
+from .facades import SubstrateRuntime
 from ..numeric import Probability
 
 

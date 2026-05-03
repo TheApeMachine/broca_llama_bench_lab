@@ -203,12 +203,15 @@ class ConformalPredictor:
         else:
             label_probs = {str(lab): float(p) for lab, p in distribution.items()}
             ranked = sorted(distribution.items(), key=lambda kv: -float(kv[1]))
-            cumulative = 0.0
-            for label, p in ranked:
-                cumulative += float(p)
-                labels.append(label)
-                if cumulative >= threshold or not math.isfinite(threshold):
-                    break
+            if not math.isfinite(threshold):
+                labels = [str(label) for label, _ in ranked]
+            else:
+                cumulative = 0.0
+                for label, p in ranked:
+                    cumulative += float(p)
+                    labels.append(str(label))
+                    if cumulative >= threshold:
+                        break
         if not labels:
             # Coverage guarantee requires a non-empty set; fall back to top-1.
             top = max(distribution.items(), key=lambda kv: float(kv[1]))[0]

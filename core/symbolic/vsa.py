@@ -161,11 +161,10 @@ def bundle(vectors: Iterable[torch.Tensor], *, normalize: bool = True) -> torch.
     for v in items[1:]:
         common_dtype = torch.promote_types(common_dtype, v.dtype)
 
-    target_device = items[0].device
-    out = items[0].to(device=target_device, dtype=torch.float32).clone()
+    out = items[0].to(torch.float32).clone()
 
     for v in items[1:]:
-        out = out + v.to(device=target_device, dtype=torch.float32)
+        out = out + v.to(torch.float32)
 
     if normalize:
         out = out / out.norm().clamp_min(1e-12)

@@ -109,7 +109,7 @@ class SubstrateControllerFactory:
         ensure_parent_dir(resolved_path)
         resolved_namespace = namespace if namespace is not None else CHAT_NAMESPACE
         model_id = llama_model_id if llama_model_id is not None else default_model_id()
-        resolved_device = pick_torch_device()
+        resolved_device = pick_torch_device(device)
         token_kw: str | bool | None
 
         if hf_token is _DEFAULT_HF_TOKEN:

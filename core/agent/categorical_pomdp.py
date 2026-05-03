@@ -44,6 +44,9 @@ class CategoricalPOMDP:
         self._normalize_observation_likelihoods()
         self._normalize_transition_likelihoods()
         self._initialize_counts()
+        from .invariants import POMDPInvariants
+
+        POMDPInvariants().validate_or_raise(self, name="categorical_pomdp")
 
     @property
     def n_states(self) -> int:
@@ -296,12 +299,15 @@ class CategoricalPOMDP:
                 average = sum(self.A[a][o]) / max(old_state_count, 1)
                 duplicate = self.A[a][o][old_state_count - 1]
                 self.A[a][o].append(0.6 * duplicate + 0.4 * average)
-                normalized = self.math.normalize(
-                    [self.A[a][o][s] for s in range(old_state_count + 1)]
-                )
 
-                for s in range(old_state_count + 1):
-                    self.A[a][o][s] = normalized[s]
+            # A[action][observation][state] stores P(o | state, action), so
+            # the new model must normalize over observations for each state.
+            for s in range(old_state_count + 1):
+                column = self.math.normalize(
+                    [self.A[a][o][s] for o in range(observation_count)]
+                )
+                for o, value in enumerate(column):
+                    self.A[a][o][s] = value
 
     def _expand_transition_model(self, old_state_count: int, action_count: int) -> None:
         for a in range(action_count):
