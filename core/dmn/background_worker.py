@@ -33,12 +33,10 @@ import random
 import threading
 import time
 from dataclasses import asdict
-from typing import Any, Mapping, Sequence
+from typing import TYPE_CHECKING, Any, Mapping, Sequence
 
 import torch
 import torch.nn.functional as F
-
-from core.substrate.controller import SubstrateController
 
 from ..agent.active_inference import entropy as belief_entropy
 from ..causal.causal_discovery import (
@@ -54,6 +52,9 @@ from ..frame import CognitiveFrame, FrameDimensions, SubwordProjector
 from ..temporal.hawkes import fit_excitation_em
 from ..workspace import IntrinsicCue
 from .config import DMNConfig
+
+if TYPE_CHECKING:
+    from core.substrate.controller import SubstrateController
 
 
 logger = logging.getLogger(__name__)
@@ -104,7 +105,7 @@ class CognitiveBackgroundWorker:
 
     def __init__(
         self,
-        mind: "SubstrateController",
+        mind: SubstrateController,
         *,
         interval_s: float = 5.0,
         config: DMNConfig | None = None,
