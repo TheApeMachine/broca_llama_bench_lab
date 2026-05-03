@@ -255,16 +255,14 @@ class SubstrateBuilder:
         )
         mind.host.add_graft("final_hidden", mind.swm_residual_graft)
 
-        # Chat-time recursion uses a single latent step and a single round
-        # so per-turn latency stays bounded. The LatentMAS-validated optima
-        # (``DEFAULT_M_LATENT_STEPS = 40`` / ``DEFAULT_MAX_ROUNDS = 3``) are
-        # preserved as constants; deeper rollouts are obtained by
-        # constructing a separate :class:`LatentDecoder` /
-        # :class:`RecursionHalt` against the same host and SWM.
-        mind.latent_decoder = LatentDecoder(host=mind.host, m_latent_steps=1)
+        # The LatentMAS-validated optima (``DEFAULT_M_LATENT_STEPS`` think
+        # steps per round, ``DEFAULT_MAX_ROUNDS`` rounds with closed-form
+        # convergence halt) are the spec; chat-time and offline rollouts use
+        # the same recursion budget so the system has only one operating mode.
+        mind.latent_decoder = LatentDecoder(host=mind.host)
         mind.alignment_registry.register(mind.latent_decoder.alignment)
 
-        mind.recursion_halt = RecursionHalt(swm=mind.swm, max_rounds=1)
+        mind.recursion_halt = RecursionHalt(swm=mind.swm)
         mind.recursion_controller = RecursionController(
             swm=mind.swm,
             publisher=mind.swm_publisher,
@@ -294,6 +292,16 @@ class SubstrateBuilder:
         mind.dynamic_graft_synth = DynamicGraftSynthesizer(
             mind.activation_memory, namespace=f"{namespace}__activation"
         )
+        # Hydrate the live KV memory graft from any modes captured in prior sessions
+        # so the host re-encounters them via attention from turn one. The graft is
+        # built by HostGraftsBuilder and attached at "final_hidden"; the synthesizer
+        # is the bridge between persisted activation modes and the live graft.
+        kv_graft = getattr(mind, "kv_memory_graft", None)
+        if kv_graft is not None:
+            try:
+                mind.dynamic_graft_synth.load_modes(kv_graft, clear_first=True)
+            except Exception:
+                logger.exception("SubstrateBuilder._build_dynamic_grafts: load_modes failed")
 
     @classmethod
     def _build_tool_foraging(cls, mind: Any) -> None:

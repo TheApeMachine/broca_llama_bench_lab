@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import logging
 from typing import Any
+
+logger = logging.getLogger(__name__)
 
 
 class PreferenceAdapter:
@@ -64,3 +67,51 @@ class PreferenceAdapter:
 
     def observe_event(self, channel: str, *, t: float | None = None) -> None:
         self._hawkes.observe(channel, t=t)
+
+    def observe_affect(self, affect: Any) -> None:
+        """Translate one ``AffectState`` into Dirichlet feedback on both faculties.
+
+        The substrate's existing affect encoder produces ``preference_signal``
+        ("positive_preference" / "negative_preference" / "") and
+        ``preference_strength`` ∈ [0, 1] on every utterance. That is the natural
+        feedback channel for the Dirichlet prior over preferences ``C``. With no
+        explicit user observation index to attribute reward to, we reinforce the
+        agent's *current* favorite observation per faculty: positive affect
+        strengthens the existing preference, negative affect flattens it. This
+        mirrors operant conditioning of a confidence vector by valence.
+        """
+
+        signal = str(getattr(affect, "preference_signal", "") or "")
+
+        if signal not in ("positive_preference", "negative_preference"):
+            return
+
+        polarity = 1.0 if signal == "positive_preference" else -1.0
+        strength = float(getattr(affect, "preference_strength", 0.0) or 0.0)
+
+        if strength <= 0.0:
+            return
+
+        for faculty, target in (("spatial", self._spatial), ("causal", self._causal)):
+            mean = target.expected_C()
+
+            if not mean:
+                continue
+
+            obs_index = max(range(len(mean)), key=lambda i: mean[i])
+
+            self.observe_user_feedback(
+                faculty=faculty,
+                observation_index=obs_index,
+                polarity=polarity,
+                weight=strength,
+                reason=f"affect:{signal}",
+            )
+
+        logger.debug(
+            "PreferenceAdapter.observe_affect: signal=%s strength=%.3f spatial_mean=%s causal_mean=%s",
+            signal,
+            strength,
+            [round(x, 3) for x in self._spatial.expected_C()],
+            [round(x, 3) for x in self._causal.expected_C()],
+        )

@@ -8,7 +8,8 @@ from typing import Any, Mapping, Sequence
 
 from ..agent.active_inference import ToolForagingAgent, entropy as belief_entropy
 from ..workspace import IntrinsicCue
-from .native_tools import NativeTool
+from .hypothesis_synthesizer import HypothesisSynthesizer
+from .native_tools import NativeTool, ToolSynthesisError
 from .tool_foraging_slot import ToolForagingSlot
 
 
@@ -38,6 +39,7 @@ class NativeToolManager:
         self._unified = unified_agent
         self._tool_conformal = native_tool_conformal
         self._session = session
+        self._hypothesis_synthesizer = HypothesisSynthesizer(scm=scm, tool_registry=tool_registry)
 
     def handle_drift(self, tool: NativeTool, evidence: Mapping[str, Any]) -> None:
         cue = IntrinsicCue(
@@ -125,3 +127,45 @@ class NativeToolManager:
             insufficient_prior = max(1e-6, min(1 - 1e-6, h / max(h_max, 1e-9)))
         self._slot.agent.update_belief(insufficient_prior=float(insufficient_prior))
         return bool(self._slot.agent.should_synthesize())
+
+    def synthesize_recommended(self) -> NativeTool | None:
+        """Author and persist the next conjunction hypothesis when foraging recommends it.
+
+        Closes the loop between the EFE math (which decides *that* a new tool is
+        needed) and the registry (which holds *what* tools exist). The hypothesis
+        synthesizer picks the next uncovered binary endogenous pair, compiles +
+        verifies the conjunction through the existing sandbox / conformal gate,
+        and re-attaches the registry to the SCM so the new node is queryable.
+        """
+
+        if not self.should_synthesize():
+            return None
+
+        try:
+            tool = self._hypothesis_synthesizer.attempt_one()
+        except ToolSynthesisError:
+            logger.exception("NativeToolManager.synthesize_recommended: hypothesis synthesis failed")
+            return None
+
+        if tool is None:
+            return None
+
+        try:
+            self._registry.attach_to_scm(
+                self._scm,
+                topology_lock=self._session.cognitive_state_lock,
+                on_tool_drift=self.handle_drift,
+            )
+        except Exception:
+            logger.exception("NativeToolManager.synthesize_recommended: SCM re-attach failed")
+
+        self._slot.agent = ToolForagingAgent.build(
+            n_existing_tools=self._registry.count(),
+            insufficient_prior=0.5,
+        )
+        self._event_bus.publish(
+            "native_tool.synthesized",
+            {"tool": tool.name, "parents": list(tool.parents), "domain": list(tool.domain)},
+        )
+
+        return tool

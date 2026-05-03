@@ -90,19 +90,31 @@ class LatentDecoder:
         )
 
         prompt_embeds = self._host.llm.get_input_embeddings()(ids)
+        prompt_len = int(prompt_embeds.shape[1])
+        full_mask_len = prompt_len + self._m
+
+        # Pre-allocate the full attention mask once; sequential ``torch.cat``
+        # on every think step is a known MPS hot path that crashes inside
+        # ``at::native::cat_out_mps`` for m≳20. All positions stay attended
+        # (latent thoughts are non-padded), so a precomputed all-ones mask is
+        # mathematically identical to the iterative cat.
+        full_mask = torch.ones(
+            (mask.shape[0], full_mask_len), dtype=torch.bool, device=mask.device
+        )
+        full_mask[:, :prompt_len] = mask
 
         WorkspacePublisher.emit(
             "latent.think.start",
             {
                 "m_latent_steps": self._m,
-                "prompt_seq_len": int(prompt_embeds.shape[1]),
+                "prompt_seq_len": prompt_len,
                 "batch_size": int(prompt_embeds.shape[0]),
             },
         )
 
         hidden, past_kv = self._host.latent_forward(
             inputs_embeds=prompt_embeds,
-            attention_mask=mask,
+            attention_mask=full_mask[:, :prompt_len],
             extra_state=extra_state,
             past_key_values=None,
         )
@@ -110,12 +122,9 @@ class LatentDecoder:
 
         for step in range(self._m):
             next_embed = self._alignment.apply(last_hidden.to(torch.float32)).to(prompt_embeds.dtype)
-            mask = torch.cat(
-                [mask, torch.ones((mask.shape[0], 1), dtype=torch.bool, device=mask.device)], dim=1
-            )
             hidden, past_kv = self._host.latent_forward(
                 inputs_embeds=next_embed,
-                attention_mask=mask,
+                attention_mask=full_mask[:, : prompt_len + step + 1],
                 extra_state=extra_state,
                 past_key_values=past_kv,
             )
@@ -125,7 +134,7 @@ class LatentDecoder:
             "latent.think.complete",
             {
                 "m_latent_steps": self._m,
-                "final_seq_len": int(mask.shape[1]),
+                "final_seq_len": full_mask_len,
                 "last_hidden_norm": float(last_hidden.detach().to(torch.float32).norm().item()),
             },
         )

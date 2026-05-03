@@ -38,6 +38,8 @@ from typing import Any, Mapping, Sequence
 import torch
 import torch.nn.functional as F
 
+from core.substrate.controller import SubstrateController
+
 from ..agent.active_inference import entropy as belief_entropy
 from ..causal.causal_discovery import (
     build_scm_from_skeleton,
@@ -47,9 +49,7 @@ from ..causal.causal_discovery import (
     project_rows_to_variables,
 )
 from ..causal.temporal import TemporalCausalTraceBuilder
-from ..frame import CognitiveFrame, FacultyCandidate, FrameDimensions, SubwordProjector
-from ..memory import ClaimTrust, SymbolicMemory
-from ..symbolic.vsa import VSACodebook, bundle, cosine as vsa_cosine
+from ..frame import CognitiveFrame, FrameDimensions, SubwordProjector
 from ..temporal.hawkes import fit_excitation_em
 from ..workspace import IntrinsicCue
 from .config import DMNConfig
@@ -602,23 +602,24 @@ class CognitiveBackgroundWorker:
     # ------------------------------------------------------------------ Phase 5
 
     def _phase5_tool_foraging(self) -> tuple[list[dict], dict[str, Any]]:
-        """Decide whether the substrate should synthesize a new native tool.
+        """Decide whether the substrate should synthesize a new native tool —
+        and, on a positive recommendation, actually synthesize it.
 
-        We do **not** synthesize the tool here — that requires an LLM call to
-        produce candidate Python source and is therefore an external,
-        user-or-agent-driven step.  What we *do* run during DMN time is the
-        active-inference math itself: when the unified faculty's posterior is
-        confused (high entropy) and there are few existing tools, the EFE of
-        ``synthesize_tool`` collapses below the alternatives, and we emit a
-        ``tool_synthesis_recommended`` reflection so a downstream agent
-        knows to act.
+        The active-inference math runs first: when the unified faculty's
+        posterior is high-entropy and there are few existing tools, the EFE of
+        ``synthesize_tool`` collapses below the alternatives. The substrate
+        then calls :meth:`NativeToolManager.synthesize_recommended`, which uses
+        the deterministic :class:`HypothesisSynthesizer` to author the next
+        uncovered conjunction over binary endogenous variables and persists
+        the resulting tool through the existing sandbox + conformal gate.
         """
 
         slot = self.mind.tool_foraging
         agent = slot.agent
         unified = getattr(self.mind, "unified_agent", None)
         registry = getattr(self.mind, "tool_registry", None)
-        if agent is None or unified is None or registry is None:
+        manager = getattr(self.mind, "native_tools", None)
+        if agent is None or unified is None or registry is None or manager is None:
             return [], {"ran": False}
 
         try:
@@ -645,6 +646,7 @@ class CognitiveBackgroundWorker:
         recommended = decision.action_name == "synthesize_tool"
 
         reflections: list[dict] = []
+        synthesized_name: str | None = None
         if recommended:
             evidence = {
                 "action": decision.action_name,
@@ -677,12 +679,40 @@ class CognitiveBackgroundWorker:
                     registry.count(),
                 )
 
+            try:
+                tool = manager.synthesize_recommended()
+            except Exception:
+                logger.exception("DMN.phase5.tool_foraging: synthesize_recommended raised")
+                tool = None
+
+            if tool is not None:
+                synthesized_name = tool.name
+                synthesis_evidence = {
+                    "tool": tool.name,
+                    "parents": list(tool.parents),
+                    "domain": [repr(v) for v in tool.domain],
+                    "instrument": "dmn_tool_foraging",
+                }
+                synthesis_reflection_id = self.mind.memory.record_reflection(
+                    "tool_synthesized",
+                    "tool_foraging",
+                    "synthesize_tool",
+                    f"Synthesized {tool.name} after EFE recommendation (insufficient_prior={insufficient_prior:.3f})",
+                    synthesis_evidence,
+                    dedupe_key=f"tool_synthesized:{tool.name}",
+                )
+                if synthesis_reflection_id is not None:
+                    reflections.append(
+                        {"id": synthesis_reflection_id, "kind": "tool_synthesized", **synthesis_evidence}
+                    )
+
         summary = {
             "ran": True,
             "recommended": recommended,
             "insufficient_prior": float(insufficient_prior),
             "n_existing_tools": int(registry.count()),
             "chosen_action": decision.action_name,
+            "synthesized": synthesized_name,
         }
         return reflections, summary
 

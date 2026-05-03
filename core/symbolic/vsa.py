@@ -145,22 +145,30 @@ def bundle(vectors: Iterable[torch.Tensor], *, normalize: bool = True) -> torch.
     Cosine similarity between each constituent and the bundle stays positive
     until capacity (~0.5 * d / log d) is exceeded, after which crosstalk
     dominates and clean unbinding fails.
+
+    The accumulation is iterative (not a ``torch.stack(...).sum(dim=0)``)
+    because Apple's MPS backend crashes ``cat_out_mps`` / ``stack`` paths once
+    the constituent tensors get into the 10k+ dimension range. Iterative add
+    is mathematically identical and stable across backends.
     """
     items = list(vectors)
-    
+
     if not items:
         raise ValueError("bundle expects at least one vector")
-    
+
     common_dtype = items[0].dtype
-    
-    for i, v in enumerate(items[1:], start=1):
+
+    for v in items[1:]:
         common_dtype = torch.promote_types(common_dtype, v.dtype)
-    
-    out = torch.stack([v.to(torch.float32) for v in items], dim=0).sum(dim=0)
-    
+
+    out = items[0].to(torch.float32).clone()
+
+    for v in items[1:]:
+        out = out + v.to(torch.float32)
+
     if normalize:
         out = out / out.norm().clamp_min(1e-12)
-    
+
     return out.to(dtype=common_dtype)
 
 

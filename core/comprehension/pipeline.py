@@ -136,6 +136,17 @@ class ComprehensionPipeline:
         self.observe_frame_concepts(out)
         self.remember_declarative_binding(out, utterance)
 
+        last_affect = mind.session.last_affect
+        if last_affect is not None:
+            try:
+                mind.preference.observe_affect(last_affect)
+            except Exception:
+                logger.exception("ComprehensionPipeline.after_frame_commit: preference observe_affect failed")
+
+        self._capture_activation_mode(out, utterance)
+        self._maybe_synthesize_native_tool()
+        self._persist_hot_state()
+
         try:
             payload = {
                 "intent": out.intent,
@@ -166,6 +177,110 @@ class ComprehensionPipeline:
                 mind.ontology.observe(concept)
                 base = _SUBWORD.encode(concept)
                 mind.ontology.maybe_promote(concept, base)
+
+    def _capture_activation_mode(self, out: CognitiveFrame, utterance: str) -> None:
+        """Persist a (key, value) activation mode for declarative content and seed the KV graft.
+
+        Only fires on declarative ``memory_write`` intents — the explicit "remember
+        this" channel — so the perf cost (one extra ungrafted forward pass) only
+        attaches to frames the substrate has already classified as worth keeping.
+        The captured mode is both written to ``activation_memory`` (so future
+        sessions see it) and remembered into the live ``kv_memory_graft`` (so the
+        host can attend to it on the very next forward pass).
+        """
+
+        if out.intent != "memory_write":
+            return
+
+        if not (isinstance(out.subject, str) and out.subject and out.subject != "unknown"):
+            return
+
+        if not (isinstance(out.answer, str) and out.answer and out.answer != "unknown"):
+            return
+
+        mind = self._mind
+        kv_graft = getattr(mind, "kv_memory_graft", None)
+        synth = getattr(mind, "dynamic_graft_synth", None)
+
+        if synth is None or kv_graft is None:
+            return
+
+        predicate = str((out.evidence or {}).get("predicate", out.intent))
+        name = f"{out.intent}/{out.subject}/{predicate}/{out.answer}"
+
+        try:
+            captured = synth.synthesize(
+                mind.host,
+                mind.tokenizer,
+                name=name,
+                prompt=utterance,
+                confidence=float(out.confidence),
+            )
+        except Exception:
+            logger.exception(
+                "ComprehensionPipeline._capture_activation_mode: synthesize failed for name=%s", name
+            )
+            return
+
+        try:
+            kv_graft.remember(
+                captured.key.reshape(1, -1),
+                captured.value.reshape(1, -1),
+                metadata={
+                    "name": name,
+                    "memory_id": captured.record_id,
+                    "confidence": float(out.confidence),
+                    "intent": out.intent,
+                },
+            )
+        except Exception:
+            logger.exception(
+                "ComprehensionPipeline._capture_activation_mode: kv_memory_graft.remember failed"
+            )
+
+    def _maybe_synthesize_native_tool(self) -> None:
+        """Act on a tool-foraging recommendation while the user is still active.
+
+        DMN's phase 5 only fires during idle cycles, so without this hot-path
+        check the substrate would never synthesize during interactive chat. The
+        manager gates internally on the foraging EFE — when the math doesn't
+        recommend synthesis this is a cheap no-op.
+        """
+
+        manager = getattr(self._mind, "native_tools", None)
+        if manager is None:
+            return
+
+        try:
+            manager.synthesize_recommended()
+        except Exception:
+            logger.exception("ComprehensionPipeline._maybe_synthesize_native_tool: synthesis failed")
+
+    def _persist_hot_state(self) -> None:
+        """Flush per-turn in-memory state (Hawkes, ontology, conformal) to disk.
+
+        Without this the persistent stores only update during DMN REM cycles.
+        For an interactive session that may never trigger consolidation, that
+        leaves their tables effectively cold-start-only. We pay one upsert per
+        store per turn to keep the database in sync with the live runtime.
+        """
+
+        mind = self._mind
+
+        try:
+            mind.hawkes_persistence.save(mind.hawkes)
+        except Exception:
+            logger.exception("ComprehensionPipeline._persist_hot_state: hawkes save failed")
+
+        try:
+            mind.ontology_persistence.save(mind.ontology)
+        except Exception:
+            logger.exception("ComprehensionPipeline._persist_hot_state: ontology save failed")
+
+        try:
+            mind.conformal_calibration.persist(mind.relation_conformal, "relation_extraction")
+        except Exception:
+            logger.exception("ComprehensionPipeline._persist_hot_state: conformal persist failed")
 
     def remember_declarative_binding(
         self, out: CognitiveFrame, utterance: str
@@ -355,16 +470,26 @@ class ComprehensionPipeline:
         """Publish encoder outputs (structured + hidden) into the substrate working memory.
 
         Hidden-state slots come from the captured ``last_hidden`` on each
-        encoder (only published if the encoder has been called and exposes a
-        captured tensor). Structured slots come from the comprehension frame
-        and the intent classification.
+        encoder. Each publish carries the encoder's own confidence so the
+        per-organ prediction error (``1 - confidence``) is a real signal that
+        the joint EFE active inference loop can react to:
+
+        * gliner2 extraction: the cognitive frame's relation confidence,
+        * gliclass classification: the intent confidence.
+
+        Structured slots come from the comprehension frame and the intent
+        classification.
         """
 
         mind = self._mind
         publisher = mind.swm_publisher
 
-        self._publish_encoder_hidden(publisher, mind.extraction_encoder, SWMSource.GLINER2)
-        self._publish_encoder_hidden(publisher, mind.classification_encoder, SWMSource.GLICLASS)
+        self._publish_encoder_hidden(
+            publisher, mind.extraction_encoder, SWMSource.GLINER2, confidence=float(frame.confidence)
+        )
+        self._publish_encoder_hidden(
+            publisher, mind.classification_encoder, SWMSource.GLICLASS, confidence=float(intent.confidence)
+        )
 
         publisher.publish_classifications(
             source=SWMSource.GLICLASS,
@@ -395,14 +520,17 @@ class ComprehensionPipeline:
             )
 
     @staticmethod
-    def _publish_encoder_hidden(publisher: Any, encoder: Any, source: SWMSource) -> None:
+    def _publish_encoder_hidden(
+        publisher: Any, encoder: Any, source: SWMSource, *, confidence: float
+    ) -> None:
         if encoder is None or not getattr(encoder, "has_captured_hidden", False):
             return
 
-        # Encoders with no native confidence reporting are treated as unit
-        # confidence; the recorded prediction error therefore collapses to 0
-        # and the joint EFE leaves them out of the active organ-error budget.
-        publisher.publish_hidden(source=source, hidden=encoder.last_hidden, confidence=1.0)
+        # Clamp into the publisher's [0, 1] contract; the encoders can
+        # occasionally return out-of-range scores (e.g. logit-space outputs that
+        # weren't softmaxed), which the SWM publisher would otherwise reject.
+        c = max(0.0, min(1.0, float(confidence)))
+        publisher.publish_hidden(source=source, hidden=encoder.last_hidden, confidence=c)
 
     @staticmethod
     def attach_perception(

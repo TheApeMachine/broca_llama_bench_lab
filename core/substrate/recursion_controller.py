@@ -30,6 +30,7 @@ derived from its own embedding matrices.
 from __future__ import annotations
 
 import logging
+import math
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -161,10 +162,22 @@ class RecursionController:
                 extra_state=round_state,
             )
 
+            decision = self._halt.check(slot_name=thought_slot, rounds_completed=round_idx + 1)
+            halts.append(decision)
+
+            # Confidence in the rollout = how close the substrate's working memory
+            # is to its previous-round state on the cosine axis. Round 0 has no
+            # previous (cos = -inf) and so reports 0 confidence — full prediction
+            # error, which is the right signal for "this is the rawest hypothesis."
+            cos_prev = decision.cosine_to_previous
+            llama_confidence = (
+                max(0.0, min(1.0, float(cos_prev))) if math.isfinite(cos_prev) else 0.0
+            )
+
             self._publisher.publish_hidden(
                 source=SWMSource.LLAMA,
                 hidden=last_hidden,
-                confidence=1.0,
+                confidence=llama_confidence,
             )
             self._swm.write(
                 llama_slot,
@@ -172,9 +185,6 @@ class RecursionController:
                 source=SWMSource.LLAMA,
             )
             llama_slots.append(llama_slot)
-
-            decision = self._halt.check(slot_name=thought_slot, rounds_completed=round_idx + 1)
-            halts.append(decision)
 
             logger.debug(
                 "RecursionController.run: round=%d halt=%s reason=%s cos_prev=%.4f",
