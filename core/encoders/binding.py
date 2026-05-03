@@ -26,17 +26,10 @@ from typing import Any, Literal
 import torch
 import torch.nn.functional as F
 
-from ..system.event_bus import get_default_bus
+from ..workspace import WorkspacePublisher
 from .base import BaseEncoder, EncoderOutput
 
 logger = logging.getLogger(__name__)
-
-
-def _publish(topic: str, payload: dict) -> None:
-    try:
-        get_default_bus().publish(topic, payload)
-    except Exception:
-        pass
 
 _IMAGEBIND_MODEL = "nielsr/imagebind-huge"
 _IMAGEBIND_DIM = 1024  # ImageBind's shared embedding dimension
@@ -117,7 +110,7 @@ class BindingEncoder(BaseEncoder):
 
         elapsed = (time.time() - start) * 1000
         self._record_call(elapsed, method="encode_image")
-        _publish(
+        WorkspacePublisher.emit(
             "encoder.binding.encode",
             {"modality": "image", "latency_ms": elapsed, "feature_dim": int(features.numel())},
         )
@@ -139,7 +132,7 @@ class BindingEncoder(BaseEncoder):
 
         elapsed = (time.time() - start) * 1000
         self._record_call(elapsed, method="encode_text")
-        _publish(
+        WorkspacePublisher.emit(
             "encoder.binding.encode",
             {
                 "modality": "text",
@@ -169,7 +162,7 @@ class BindingEncoder(BaseEncoder):
 
         elapsed = (time.time() - start) * 1000
         self._record_call(elapsed, method="encode_audio")
-        _publish(
+        WorkspacePublisher.emit(
             "encoder.binding.encode",
             {"modality": "audio", "latency_ms": elapsed, "feature_dim": int(features.numel())},
         )

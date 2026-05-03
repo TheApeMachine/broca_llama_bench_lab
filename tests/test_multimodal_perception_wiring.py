@@ -12,23 +12,7 @@ from core.cli import build_substrate_controller
 from core.cognition.observation import CognitiveObservation
 from core.cognition.substrate import SubstrateController
 
-from conftest import make_stub_llm_pair
-
-
-class FakeHost:
-    cfg = types.SimpleNamespace(d_model=8)
-
-    def __init__(self) -> None:
-        self.grafts: list[tuple[str, Any]] = []
-        self.llm, self._stub_tokenizer = make_stub_llm_pair()
-
-    def add_graft(self, slot: str, graft: Any) -> None:
-        self.grafts.append((slot, graft))
-
-
-class FakeTokenizer:
-    def __init__(self, stub_inner: Any) -> None:
-        self.inner = stub_inner
+from conftest import FakeHost, FakeTokenizer, make_stub_llm_pair
 
 
 class StubMultimodalPipeline:

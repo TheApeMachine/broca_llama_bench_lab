@@ -8,40 +8,13 @@ import pytest
 
 import core.cognition.substrate as substrate_mod
 from core.cli import build_substrate_controller
-from core.cognition.substrate import (
-    LLMRelationExtractor,
-    PersistentSemanticMemory,
-    _claim_trust_weight,
-)
+from core.memory import ClaimTrust, SymbolicMemory
 
-from conftest import make_stub_llm_pair
+from conftest import FakeHost, FakeTokenizer, make_stub_llm_pair
 
 
 def _symbol(prefix: str) -> str:
     return f"{prefix}_{uuid.uuid4().hex[:10]}"
-
-
-def _stub_extractor_pair(extractor=None):
-    llm, hf_tok = make_stub_llm_pair(extractor)
-    host = types.SimpleNamespace(llm=llm)
-    tok = types.SimpleNamespace(inner=hf_tok)
-    return host, tok
-
-
-class FakeHost:
-    cfg = types.SimpleNamespace(d_model=8)
-
-    def __init__(self):
-        self.grafts: list = []
-        self.llm, self._stub_tokenizer = make_stub_llm_pair()
-
-    def add_graft(self, slot, graft):
-        self.grafts.append((slot, graft))
-
-
-class FakeTokenizer:
-    def __init__(self, stub_inner):
-        self.inner = stub_inner
 
 
 @pytest.fixture
@@ -55,54 +28,22 @@ def fake_host_loader(monkeypatch: pytest.MonkeyPatch):
     return _make
 
 
-def test_llm_extractor_resolves_subordinate_clause_subject_object():
-    host, tok = _stub_extractor_pair(lambda _s: ("apple", "fell from", "tree"))
-    extractor = LLMRelationExtractor(host, tok)
-
-    utterance = "the apple, which was incredibly red, fell from the tree ."
-    parsed = extractor.extract_claim(utterance, utterance.split())
-
-    assert parsed is not None
-    assert parsed.subject == "apple"
-    assert parsed.predicate == "fell from"
-    assert parsed.obj == "tree"
-    assert parsed.evidence["parser"] == "llm_relation_extractor"
-
-
-def test_llm_extractor_returns_none_for_questions():
-    host, tok = _stub_extractor_pair(lambda _s: ("x", "y", "z"))
-    extractor = LLMRelationExtractor(host, tok)
-
-    parsed = extractor.extract_claim("where is ada ?", ["where", "is", "ada", "?"])
-    assert parsed is None
-
-
-def test_llm_extractor_returns_none_when_llm_emits_unparseable_output():
-    host, tok = _stub_extractor_pair(lambda _s: None)
-    extractor = LLMRelationExtractor(host, tok)
-
-    utterance = "ada is in rome ."
-    parsed = extractor.extract_claim(utterance, utterance.split())
-
-    assert parsed is None  # no heuristic fallback — extraction failure is final.
-
-
 def test_claim_trust_weight_decays_with_prediction_gap():
     no_gap = {"evidence": {}}
     low_gap = {"evidence": {"prediction_gap": 0.1}}
     high_gap = {"evidence": {"prediction_gap": 5.0}}
 
-    assert _claim_trust_weight(no_gap) == 1.0
-    assert 0.5 < _claim_trust_weight(low_gap) < 1.0
-    assert _claim_trust_weight(high_gap) < 0.25
-    assert _claim_trust_weight(low_gap) > _claim_trust_weight(high_gap)
+    assert ClaimTrust.weight(no_gap) == 1.0
+    assert 0.5 < ClaimTrust.weight(low_gap) < 1.0
+    assert ClaimTrust.weight(high_gap) < 0.25
+    assert ClaimTrust.weight(low_gap) > ClaimTrust.weight(high_gap)
 
 
 def test_consolidation_resists_high_surprise_repeated_claims(tmp_path: Path):
     """Three high-surprise (poison) challengers must NOT outweigh one trusted accepted claim."""
 
     db = tmp_path / "poisoning.sqlite"
-    mem = PersistentSemanticMemory(db, namespace="poison")
+    mem = SymbolicMemory(db, namespace="poison")
     subject = _symbol("subject")
     truth = _symbol("truth")
     poison = _symbol("poison")
@@ -133,7 +74,7 @@ def test_consolidation_still_revises_when_challengers_have_low_surprise(tmp_path
     """Sanity check: low-surprise challengers should still drive belief revision."""
 
     db = tmp_path / "low_surprise.sqlite"
-    mem = PersistentSemanticMemory(db, namespace="low_surprise")
+    mem = SymbolicMemory(db, namespace="low_surprise")
     subject = _symbol("subject")
     truth = _symbol("truth")
     challenger = _symbol("challenger")
@@ -160,11 +101,9 @@ def test_consolidation_still_revises_when_challengers_have_low_surprise(tmp_path
 def test_runtime_router_uses_encoder_relation_extractor(tmp_path: Path, fake_host_loader):
     """Chat pipeline must route through the encoder-backed extractor.
 
-    Knowledge ingestion (``core.knowledge.pipelines``) keeps using
-    :class:`LLMRelationExtractor` because trusted documents need different
-    parsing assumptions than adversarial chat input. The conversational
-    substrate must use :class:`EncoderRelationExtractor` so requests like
-    "Tell me a joke" can never be parsed into a triple and stored.
+    The substrate has only one relation extractor (the encoder-backed one); the
+    LLM-based path was removed because it parsed imperatives like "Tell me a
+    joke" into the triple ``(me, tell, joke)`` and shoved them into memory.
     """
 
     from core.cognition.encoder_relation_extractor import EncoderRelationExtractor

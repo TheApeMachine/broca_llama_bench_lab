@@ -3,7 +3,7 @@
 Real models (CLIP, SigLIP) are loaded lazily via ``transformers`` when the user
 opts in. When the heavy stack isn't installed the module falls back to a
 deterministic perceptual hash + frequency sketch that maps any PIL/torch image
-into the same ``COGNITIVE_FRAME_DIM`` space as the rest of the substrate, so
+into the same ``FrameDimensions.cognitive_frame_dim()`` space as the rest of the substrate, so
 the rest of the architecture can interoperate with the encoder without a hard
 dependency.
 
@@ -30,7 +30,7 @@ from typing import Any
 import torch
 import torch.nn.functional as F
 
-from ..frame.continuous_frame import COGNITIVE_FRAME_DIM, SKETCH_DIM, stable_sketch
+from ..frame import FrameDimensions, SubwordProjector
 
 logger = logging.getLogger(__name__)
 
@@ -76,7 +76,7 @@ def _to_tensor(image: Any) -> torch.Tensor:
     return t.to(dtype=torch.float32).clamp(0.0, 1.0)
 
 
-def _phash_sketch(image: torch.Tensor, *, dim: int = SKETCH_DIM) -> torch.Tensor:
+def _phash_sketch(image: torch.Tensor, *, dim: int = FrameDimensions.SKETCH_DIM) -> torch.Tensor:
     """Deterministic perceptual sketch for the no-deps path.
 
     The first mosaic version used a hand-rolled DCT plus FFT. That is elegant,
@@ -116,7 +116,7 @@ def _phash_sketch(image: torch.Tensor, *, dim: int = SKETCH_DIM) -> torch.Tensor
     feature = torch.cat([hist, low_freq, texture]).nan_to_num(0.0)
     feature = F.normalize(feature, dim=0)
     digest = " ".join(f"{x:.4f}" for x in feature.detach().cpu().tolist())
-    sketch = stable_sketch(digest, dim=dim)
+    sketch = SubwordProjector(dim=dim).encode(digest)
     pad = torch.zeros(dim, dtype=torch.float32)
     cpu_feature = feature.detach().cpu().to(torch.float32)
     pad[: min(dim, cpu_feature.shape[0])] = cpu_feature[: min(dim, cpu_feature.shape[0])]
@@ -276,15 +276,15 @@ def _embed_to_cognitive_frame(embed: torch.Tensor) -> torch.Tensor:
     """Project an arbitrary-dim embedding into the cognitive-frame layout."""
 
     e = embed.detach().to(torch.float32).flatten()
-    if e.numel() < SKETCH_DIM:
-        e = torch.cat([e, torch.zeros(SKETCH_DIM - e.numel(), dtype=torch.float32)])
-    base = F.normalize(e[:SKETCH_DIM], dim=0)
-    intent = stable_sketch("vision", dim=SKETCH_DIM)
-    scene = stable_sketch(f"scene:{base[:8].tolist()}", dim=SKETCH_DIM)
-    tail_len = COGNITIVE_FRAME_DIM - 3 * SKETCH_DIM
+    if e.numel() < FrameDimensions.SKETCH_DIM:
+        e = torch.cat([e, torch.zeros(FrameDimensions.SKETCH_DIM - e.numel(), dtype=torch.float32)])
+    base = F.normalize(e[:FrameDimensions.SKETCH_DIM], dim=0)
+    intent = SubwordProjector(dim=FrameDimensions.SKETCH_DIM).encode("vision")
+    scene = SubwordProjector(dim=FrameDimensions.SKETCH_DIM).encode(f"scene:{base[:8].tolist()}")
+    tail_len = FrameDimensions.cognitive_frame_dim() - 3 * FrameDimensions.SKETCH_DIM
     if tail_len < 0:
         raise ValueError(
-            f"COGNITIVE_FRAME_DIM ({COGNITIVE_FRAME_DIM}) must be >= 3 * SKETCH_DIM ({3 * SKETCH_DIM}); "
+            f"FrameDimensions.cognitive_frame_dim() ({FrameDimensions.cognitive_frame_dim()}) must be >= 3 * FrameDimensions.SKETCH_DIM ({3 * FrameDimensions.SKETCH_DIM}); "
             "check continuous_frame layout constants."
         )
     tail = torch.zeros(tail_len, dtype=torch.float32)

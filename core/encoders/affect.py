@@ -28,17 +28,10 @@ from typing import Any, Sequence
 import numpy as np
 import torch
 
-from ..system.event_bus import get_default_bus
+from ..workspace import WorkspacePublisher
 from .base import BaseEncoder, EncoderOutput
 
 logger = logging.getLogger(__name__)
-
-
-def _publish(topic: str, payload: dict) -> None:
-    try:
-        get_default_bus().publish(topic, payload)
-    except Exception:
-        pass
 
 # Primary emotion model
 _GOEMOTION_MODEL = "SamLowe/roberta-base-go_emotions"
@@ -311,7 +304,7 @@ class AffectEncoder(BaseEncoder):
 
         latency = (time.time() - start) * 1000
         self._record_call(latency, method="detect")
-        _publish(
+        WorkspacePublisher.emit(
             "encoder.affect",
             {
                 "text": text[:120],

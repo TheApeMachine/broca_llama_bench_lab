@@ -64,7 +64,7 @@ except ImportError as exc:  # pragma: no cover
 from core.infra.constants import BRAND, BRAND_BG, BRAND_DEEP, BRAND_SOFT, OFFLINE, ONLINE, WARNING
 
 from core.cli import attach_core_logs_to_bus, configure_lab_session, default_bus, detach_core_log_handler
-from core.system.event_bus import EventBus
+from core.workspace import BaseWorkspace as EventBus
 from .state import StatePanel
 
 logger = logging.getLogger(__name__)

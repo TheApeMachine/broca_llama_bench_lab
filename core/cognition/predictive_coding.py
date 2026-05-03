@@ -19,16 +19,9 @@ import torch
 import torch.nn.functional as F
 
 from ..host.tokenizer import speech_seed_ids
-from ..system.event_bus import get_default_bus
+from ..workspace import WorkspacePublisher
 
 logger = logging.getLogger(__name__)
-
-
-def _publish(topic: str, payload: dict) -> None:
-    try:
-        get_default_bus().publish(topic, payload)
-    except Exception:
-        pass
 
 
 def _batch_from_ids(rows: Sequence[Sequence[int]], pad_id: int, *, device: torch.device | str):
@@ -195,7 +188,7 @@ def lexical_surprise_gap(
             gap,
             (utterance[:100] + "…") if len(utterance) > 100 else utterance,
         )
-        _publish(
+        WorkspacePublisher.emit(
             "cog.predictive_coding",
             {
                 "path": "dual_ce",
@@ -235,7 +228,7 @@ def lexical_surprise_gap(
         gap_fb,
         (utterance[:100] + "…") if len(utterance) > 100 else utterance,
     )
-    _publish(
+    WorkspacePublisher.emit(
         "cog.predictive_coding",
         {
             "path": "fallback_two_pass",

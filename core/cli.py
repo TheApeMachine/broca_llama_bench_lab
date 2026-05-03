@@ -15,7 +15,8 @@ from typing import Any
 
 from .cognition.substrate import SubstrateController
 from .system.device import pick_torch_device
-from .system.event_bus import EventBus, LogToBusHandler, get_default_bus
+from .workspace import BaseWorkspace, WorkspaceBuilder
+from .workspace.log_handler import LogToBusHandler
 from .host.llama_broca_host import quiet_transformers_benchmark_log_warnings, resolve_hf_hub_token
 from .infra.logging_setup import configure_lab_logging
 from .substrate.runtime import (
@@ -101,7 +102,7 @@ _DEFAULT_HF_TOKEN = object()
 
 def build_substrate_controller(
     *,
-    bus: EventBus | None = None,
+    bus: BaseWorkspace | None = None,
     seed: int = 0,
     db_path: str | Path | None = None,
     namespace: str | None = None,
@@ -147,7 +148,7 @@ def build_substrate_controller(
     return controller
 
 
-def build_broca_mind(*, bus: EventBus | None = None) -> SubstrateController:
+def build_broca_mind(*, bus: BaseWorkspace | None = None) -> SubstrateController:
     """Deprecated name for :func:`build_substrate_controller`."""
 
     warnings.warn(
@@ -159,7 +160,7 @@ def build_broca_mind(*, bus: EventBus | None = None) -> SubstrateController:
     return build_substrate_controller(bus=bus)
 
 
-def attach_core_logs_to_bus(bus: EventBus, *, env_var: str = "TUI_LOG_LEVEL") -> logging.Handler:
+def attach_core_logs_to_bus(bus: BaseWorkspace, *, env_var: str = "TUI_LOG_LEVEL") -> logging.Handler:
     log_level = getattr(logging, str(os.environ.get(env_var, "INFO")).upper(), logging.INFO)
     handler = LogToBusHandler(bus, level=log_level)
     handler.setFormatter(logging.Formatter("%(message)s"))
@@ -175,7 +176,7 @@ def detach_core_log_handler(handler: logging.Handler) -> None:
         logging.getLogger("core").debug("Failed to remove handler %s: %s", handler, e)
 
 
-def default_bus() -> EventBus:
-    """Explicit singleton for call sites that need the bus before the controller exists."""
+def default_bus() -> BaseWorkspace:
+    """Explicit singleton for call sites that need the workspace before the controller exists."""
 
-    return get_default_bus()
+    return WorkspaceBuilder().process_default()

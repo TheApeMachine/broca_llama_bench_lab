@@ -34,23 +34,7 @@ from core.cognition.substrate import SubstrateController
 from core.encoders.affect import AffectState
 from core.encoders.extraction import ExtractedRelation
 
-from conftest import make_stub_llm_pair
-
-
-class FakeHost:
-    cfg = types.SimpleNamespace(d_model=8)
-
-    def __init__(self):
-        self.grafts: list = []
-        self.llm, self._stub_tokenizer = make_stub_llm_pair()
-
-    def add_graft(self, slot, graft):
-        self.grafts.append((slot, graft))
-
-
-class FakeTokenizer:
-    def __init__(self, stub_inner):
-        self.inner = stub_inner
+from conftest import FakeHost, FakeTokenizer, make_stub_llm_pair
 
 
 @pytest.fixture

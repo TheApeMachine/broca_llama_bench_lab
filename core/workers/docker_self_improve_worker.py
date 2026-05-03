@@ -43,7 +43,9 @@ from pathlib import Path
 from typing import Any
 
 from ..cognition.substrate import CognitiveFrame, SubstrateController
-from ..frame.continuous_frame import stable_sketch
+from ..frame import SubwordProjector
+
+_SUBWORD = SubwordProjector()
 
 logger = logging.getLogger(__name__)
 
@@ -363,8 +365,8 @@ class SelfImproveDockerWorker:
         except Exception:
             logger.exception("_record_outcome: journal failed")
         try:
-            ut = stable_sketch(f"self_improve:{summary[:256]}")
-            trip = stable_sketch(f"outcome:{'ok' if ok else 'fail'}:{branch or 'none'}:{run_id[:8]}")
+            ut = _SUBWORD.encode(f"self_improve:{summary[:256]}")
+            trip = _SUBWORD.encode(f"outcome:{'ok' if ok else 'fail'}:{branch or 'none'}:{run_id[:8]}")
             self.mind.remember_hopfield(
                 ut,
                 trip,

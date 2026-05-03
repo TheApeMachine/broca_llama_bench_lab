@@ -1,8 +1,9 @@
 """Encoder-backed relation extractor that respects the intent gate.
 
-Replaces :class:`LLMRelationExtractor` (few-shot SVO via the host LLM, which
-happily turned imperatives like "Tell me a joke" into the triple
-``(me, tell, joke)`` and shoved them into semantic memory). The new path is:
+The substrate's only relation extractor. The previous LLM-driven
+``LLMRelationExtractor`` was deleted because it happily turned imperatives
+like "Tell me a joke" into the triple ``(me, tell, joke)`` and shoved them
+into semantic memory. The pipeline is now:
 
   1. :class:`IntentGate` decides if the utterance is even storable. If not
      — request, command, greeting, feedback, question — the extractor
@@ -24,17 +25,10 @@ import logging
 from typing import Any, Sequence
 
 from ..encoders.extraction import ExtractionEncoder, ExtractedRelation
-from ..system.event_bus import get_default_bus
+from ..workspace import WorkspacePublisher
 from .intent_gate import IntentGate, UtteranceIntent
 
 logger = logging.getLogger(__name__)
-
-
-def _publish(topic: str, payload: dict) -> None:
-    try:
-        get_default_bus().publish(topic, payload)
-    except Exception:
-        pass
 
 
 class EncoderRelationExtractor:
@@ -61,7 +55,7 @@ class EncoderRelationExtractor:
 
         text = (utterance or "").strip()
         if not text:
-            _publish(
+            WorkspacePublisher.emit(
                 "cog.relation_extract",
                 {"outcome": "empty", "utterance": ""},
             )
@@ -74,7 +68,7 @@ class EncoderRelationExtractor:
                 intent.label,
                 intent.confidence,
             )
-            _publish(
+            WorkspacePublisher.emit(
                 "cog.relation_extract",
                 {
                     "outcome": "gated_out",
@@ -91,7 +85,7 @@ class EncoderRelationExtractor:
                 text[:160],
                 intent.label,
             )
-            _publish(
+            WorkspacePublisher.emit(
                 "cog.relation_extract",
                 {
                     "outcome": "no_relations",
@@ -104,7 +98,7 @@ class EncoderRelationExtractor:
         best = self._select_best(relations)
         evidence = self._build_evidence(text, intent, relations, best, toks)
         confidence = self._claim_confidence(best, intent)
-        _publish(
+        WorkspacePublisher.emit(
             "cog.relation_extract",
             {
                 "outcome": "extracted",

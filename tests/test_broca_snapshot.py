@@ -8,7 +8,7 @@ import pytest
 import core.cognition.substrate as substrate_mod
 from core.cli import build_substrate_controller
 from core.cognition.substrate import CognitiveFrame, SubstrateController
-from core.system.event_bus import EventBus
+from core.workspace.event_bus import EventBus
 
 from conftest import make_stub_llm_pair
 
@@ -82,7 +82,7 @@ def test_snapshot_reflects_workspace_publish(tmp_path: Path, fake_host_loader):
     # so we can verify the snapshot picks it up without going through the
     # journal-write path.
     frame = CognitiveFrame(intent="memory_lookup", subject="ada", answer="rome", confidence=0.8)
-    mind.workspace.publish(frame)
+    mind.workspace.post_frame(frame)
     snap = mind.snapshot()
     assert snap["workspace"]["frames_total"] >= 1
     latest = snap["workspace"]["latest_frame"]

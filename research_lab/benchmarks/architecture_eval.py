@@ -15,9 +15,10 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Sequence
 
-from core.cognition.substrate import SubstrateController, generate_without_substrate
+from core.cognition.substrate import SubstrateController
 from core.cli import build_substrate_controller
 from core.substrate.runtime import CHAT_NAMESPACE
+from research_lab.benchmarks.bare_language_host import BareLanguageHostGenerator
 
 logger = logging.getLogger(__name__)
 
@@ -143,16 +144,9 @@ def run_broca_architecture_eval(
 
     mid = llama_model_id or os.environ.get("MODEL_ID", "meta-llama/Llama-3.2-1B-Instruct")
 
-    try:
-        from core.system.event_bus import get_default_bus
+    from core.workspace import WorkspaceBuilder
 
-        bus = get_default_bus()
-    except Exception:
-        logger.debug(
-            "Could not initialize bench event bus (get_default_bus); proceeding without bench.arch_case.* publishes",
-            exc_info=True,
-        )
-        bus = None
+    bus = WorkspaceBuilder().process_default()
 
     rows: list[dict[str, Any]] = []
     graft_reports_by_case: dict[str, str] = {}
@@ -177,7 +171,7 @@ def run_broca_architecture_eval(
         max_new_tokens = _encode_len(mind.tokenizer, case.expected_speech)
         prompt = _baseline_prompt(case)
         with mind.host.grafts_enabled(False):
-            baseline_output = generate_without_substrate(
+            baseline_output = BareLanguageHostGenerator.generate(
                 mind.host,
                 mind.tokenizer,
                 prefix=prompt,

@@ -44,7 +44,7 @@ from research_lab.benchmarks.hf_datasets_eval import (
 )
 from research_lab.benchmarks.lm_eval_pair import run_paired_lm_eval
 from core.system.device import normalize_device_arg, pick_torch_device
-from core.system.event_bus import get_default_bus
+from core.workspace import WorkspaceBuilder
 
 logger = logging.getLogger(__name__)
 
@@ -224,7 +224,7 @@ def run_lm_eval_harness(
     print("\n--- EleutherAI LM Evaluation Harness (host parity check) ---", flush=True)
     print(f"preset={preset} tasks={tasks} limit={limit} device={dev_s} fewshot={num_fewshot}", flush=True)
 
-    bus = get_default_bus()
+    bus = WorkspaceBuilder().process_default()
     bus.publish(
         "bench.phase.start",
         {
@@ -284,7 +284,7 @@ def run_broca_architecture_benchmark(
 
     dev = device if (device and str(device).strip()) else str(pick_torch_device(_device_env_for_pick()))
     path = output_run_dir / "broca_architecture_eval.json"
-    bus = get_default_bus()
+    bus = WorkspaceBuilder().process_default()
     bus.publish(
         "bench.phase.start",
         {"phase": "architecture_eval", "model_id": llama_model_id, "device": dev},
@@ -390,7 +390,7 @@ def main(argv: Sequence[str] | None = None) -> None:
 
     _touch_canonical_substrate_sqlite_early(model_id=model_id)
 
-    bus = get_default_bus()
+    bus = WorkspaceBuilder().process_default()
     bus.publish(
         "bench.suite.start",
         {

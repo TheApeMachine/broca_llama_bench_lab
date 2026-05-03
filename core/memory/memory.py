@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import json
 import logging
-import sqlite3
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -11,6 +10,13 @@ from typing import Optional, Protocol, Sequence
 import numpy as np
 import torch
 import torch.nn.functional as F
+from sqlalchemy import delete, func, or_
+from sqlalchemy.dialects.sqlite import insert as sqlite_insert
+from sqlmodel import Session, col, select
+
+from core.persistence.sqlite_engine import SqliteEngine
+
+from .model import ActivationMemory, ActivationAssociation
 
 logger = logging.getLogger(__name__)
 
@@ -64,56 +70,15 @@ class SQLiteActivationMemory:
 
     def __init__(self, path: str | Path, *, default_namespace: str = "main"):
         self.path = Path(path)
-        self.path.parent.mkdir(parents=True, exist_ok=True)
         self.default_namespace = default_namespace
+        self._engine = SqliteEngine.create(
+            self.path,
+            timeout_seconds=SqliteEngine.CONNECT_TIMEOUT_SECONDS,
+        )
         self._init_schema()
 
-    def _connect(self) -> sqlite3.Connection:
-        con = sqlite3.connect(self.path, timeout=5.0)
-        row = con.execute("PRAGMA journal_mode=WAL").fetchone()
-        mode_raw = row[0] if row else None
-        mode = str(mode_raw).lower() if mode_raw is not None else ""
-        if mode != "wal":
-            logger.warning(
-                "SQLiteActivationMemory(%s): expected journal_mode wal, got %r",
-                self.path,
-                mode_raw,
-            )
-        return con
-
     def _init_schema(self) -> None:
-        with self._connect() as con:
-            con.execute(
-                """
-                CREATE TABLE IF NOT EXISTS activation_memory (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    namespace TEXT NOT NULL,
-                    kind TEXT NOT NULL,
-                    dim INTEGER NOT NULL,
-                    key_blob BLOB NOT NULL,
-                    value_blob BLOB NOT NULL,
-                    metadata_json TEXT NOT NULL,
-                    confidence REAL NOT NULL,
-                    access_count INTEGER NOT NULL DEFAULT 0,
-                    created_at REAL NOT NULL,
-                    updated_at REAL NOT NULL
-                )
-                """
-            )
-            con.execute("CREATE INDEX IF NOT EXISTS idx_activation_namespace_kind ON activation_memory(namespace, kind)")
-            con.execute(
-                """
-                CREATE TABLE IF NOT EXISTS activation_association (
-                    lo INTEGER NOT NULL,
-                    hi INTEGER NOT NULL,
-                    weight REAL NOT NULL,
-                    updated_at REAL NOT NULL,
-                    PRIMARY KEY(lo, hi)
-                )
-                """
-            )
-            con.execute("CREATE INDEX IF NOT EXISTS idx_activation_assoc_lo ON activation_association(lo)")
-            con.execute("CREATE INDEX IF NOT EXISTS idx_activation_assoc_hi ON activation_association(hi)")
+        SqliteEngine.create_tables(self._engine, ActivationMemory, ActivationAssociation)
 
     def bump_association(self, id_a: int, id_b: int, *, delta: float = 1.0) -> None:
         """Symmetric co-activation counter between activation_memory rows.
@@ -127,24 +92,31 @@ class SQLiteActivationMemory:
             return
         lo, hi = (ia, ib) if ia < ib else (ib, ia)
         now = time.time()
-        with self._connect() as con:
-            con.execute(
-                """
-                INSERT INTO activation_association(lo, hi, weight, updated_at)
-                VALUES (?,?,?,?)
-                ON CONFLICT(lo, hi) DO UPDATE SET
-                    weight = activation_association.weight + excluded.weight,
-                    updated_at = excluded.updated_at
-                """,
-                (lo, hi, float(delta), now),
-            )
-            row = con.execute(
-                "SELECT weight FROM activation_association WHERE lo=? AND hi=?",
-                (lo, hi),
-            ).fetchone()
-            w = float(row[0]) if row else float(delta)
+        table = ActivationAssociation.__table__
+        stmt = sqlite_insert(table).values(
+            lo=lo,
+            hi=hi,
+            weight=float(delta),
+            updated_at=now,
+        )
+        stmt = stmt.on_conflict_do_update(
+            index_elements=[table.c.lo, table.c.hi],
+            set_={
+                "weight": table.c.weight + stmt.excluded.weight,
+                "updated_at": stmt.excluded.updated_at,
+            },
+        )
 
-            logger.debug("SQLiteActivationMemory.bump_association: pair=(%s,%s) weight=%s", lo, hi, w)
+        with Session(self._engine) as session:
+            session.exec(stmt)
+            session.flush()
+            row = session.get(ActivationAssociation, (lo, hi))
+            if row is None:
+                raise RuntimeError(f"association row ({lo},{hi}) missing after upsert")
+            w = float(row.weight)
+            session.commit()
+
+        logger.debug("SQLiteActivationMemory.bump_association: pair=(%s,%s) weight=%s", lo, hi, w)
 
     def normalized_spread_matrix(self, record_ids: list[int]) -> torch.Tensor:
         """Row-stochastic spread operator over ordered graft slots (derived self-loop + co-access mass)."""
@@ -158,13 +130,15 @@ class SQLiteActivationMemory:
             return accum
 
         ids_tuple = tuple(sorted(index_of.keys()))
-        placeholders = ",".join("?" for _ in ids_tuple)
-        sql = (
-            f"SELECT lo, hi, weight FROM activation_association WHERE lo IN ({placeholders}) AND hi IN ({placeholders})"
+
+        stmt = select(ActivationAssociation).where(
+            col(ActivationAssociation.lo).in_(ids_tuple),
+            col(ActivationAssociation.hi).in_(ids_tuple),
         )
-        args = ids_tuple + ids_tuple
-        with self._connect() as con:
-            rows = con.execute(sql, args).fetchall()
+        rows: list[tuple[int, int, float]] = []
+        with Session(self._engine) as session:
+            for assoc in session.exec(stmt).all():
+                rows.append((int(assoc.lo), int(assoc.hi), float(assoc.weight)))
         for lo, hi, w in rows:
             i = index_of.get(int(lo))
             j = index_of.get(int(hi))
@@ -188,21 +162,36 @@ class SQLiteActivationMemory:
     def clear(self, *, namespace: Optional[str] = None, kind: Optional[str] = None) -> None:
         namespace = namespace or self.default_namespace
 
-        with self._connect() as con:
-            if kind is None:
-                ids_subsel = "(SELECT id FROM activation_memory WHERE namespace=?)"
-                assoc_params = (namespace, namespace)
-            else:
-                ids_subsel = "(SELECT id FROM activation_memory WHERE namespace=? AND kind=?)"
-                assoc_params = (namespace, kind, namespace, kind)
-            con.execute(
-                f"DELETE FROM activation_association WHERE lo IN {ids_subsel} OR hi IN {ids_subsel}",
-                assoc_params,
+        with Session(self._engine) as session:
+            id_subselect = (
+                select(col(ActivationMemory.id)).where(ActivationMemory.namespace == namespace)
+                if kind is None
+                else select(col(ActivationMemory.id)).where(
+                    ActivationMemory.namespace == namespace,
+                    ActivationMemory.kind == kind,
+                )
             )
-            if kind is None:
-                con.execute("DELETE FROM activation_memory WHERE namespace=?", (namespace,))
-            else:
-                con.execute("DELETE FROM activation_memory WHERE namespace=? AND kind=?", (namespace, kind))
+
+            assoc_del = delete(ActivationAssociation).where(
+                or_(
+                    col(ActivationAssociation.lo).in_(id_subselect),
+                    col(ActivationAssociation.hi).in_(id_subselect),
+                ),
+            )
+        
+            session.exec(assoc_del)
+        
+            row_del = (
+                delete(ActivationMemory).where(ActivationMemory.namespace == namespace)
+                if kind is None
+                else delete(ActivationMemory).where(
+                    ActivationMemory.namespace == namespace,
+                    ActivationMemory.kind == kind,
+                )
+            )
+        
+            session.exec(row_del)
+            session.commit()
 
         logger.debug("SQLiteActivationMemory.clear: namespace=%s kind=%s", namespace, kind)
 
@@ -210,30 +199,47 @@ class SQLiteActivationMemory:
         """Remove activation_memory rows (and association edges touching them) by primary key."""
 
         ids = [int(i) for i in record_ids]
+        
         if not ids:
             return 0
-        placeholders = ",".join("?" for _ in ids)
-        id_tuple = tuple(ids)
-        with self._connect() as con:
-            con.execute(
-                f"DELETE FROM activation_association WHERE lo IN ({placeholders}) OR hi IN ({placeholders})",
-                id_tuple + id_tuple,
+        
+        with Session(self._engine) as session:
+            assoc_del = delete(ActivationAssociation).where(
+                or_(
+                    col(ActivationAssociation.lo).in_(ids),
+                    col(ActivationAssociation.hi).in_(ids),
+                ),
             )
-            cur = con.execute(f"DELETE FROM activation_memory WHERE id IN ({placeholders})", id_tuple)
-            deleted = int(cur.rowcount) if cur.rowcount is not None and cur.rowcount >= 0 else len(ids)
+        
+            session.exec(assoc_del)
+            row_del = delete(ActivationMemory).where(col(ActivationMemory.id).in_(ids))
+            cur = session.exec(row_del)
+            session.commit()
+            deleted = int(cur.rowcount) if getattr(cur, "rowcount", None) is not None and cur.rowcount >= 0 else len(ids)
+        
         logger.debug("SQLiteActivationMemory.delete_records: n_ids=%s deleted=%s", len(ids), deleted)
         return deleted
 
     def count(self, *, namespace: Optional[str] = None, kind: Optional[str] = None) -> int:
         namespace = namespace or self.default_namespace
 
-        with self._connect() as con:
-            if kind is None:
-                row = con.execute("SELECT COUNT(*) FROM activation_memory WHERE namespace=?", (namespace,)).fetchone()
-            else:
-                row = con.execute("SELECT COUNT(*) FROM activation_memory WHERE namespace=? AND kind=?", (namespace, kind)).fetchone()
+        stmt = (
+            select(func.count())
+            .select_from(ActivationMemory)
+            .where(
+                ActivationMemory.namespace == namespace,
+            )
+        
+            if kind is None
+            else select(func.count()).select_from(ActivationMemory).where(
+                ActivationMemory.namespace == namespace,
+                ActivationMemory.kind == kind,
+            )
+        )
 
-        n = int(row[0])
+        with Session(self._engine) as session:
+            n = int(session.exec(stmt).one())
+
         logger.debug("SQLiteActivationMemory.count: namespace=%s kind=%s n=%s", namespace, kind, n)
         return n
 
@@ -255,55 +261,69 @@ class SQLiteActivationMemory:
             raise ValueError(f"key dim {key_dim} != value dim {value_dim}")
 
         now = time.time()
+        row_in = ActivationMemory(
+            namespace=namespace,
+            kind=kind,
+            dim=key_dim,
+            key_blob=key_blob,
+            value_blob=value_blob,
+            metadata_json=json.dumps(metadata or {}, sort_keys=True),
+            confidence=float(confidence),
+            access_count=0,
+            created_at=now,
+            updated_at=now,
+        )
 
-        with self._connect() as con:
-            cur = con.execute(
-                """
-                INSERT INTO activation_memory
-                (namespace, kind, dim, key_blob, value_blob, metadata_json, confidence, access_count, created_at, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?, ?)
-                """,
-                (namespace, kind, key_dim, key_blob, value_blob, json.dumps(metadata or {}, sort_keys=True), float(confidence), now, now),
-            )
+        with Session(self._engine) as session:
+            session.add(row_in)
+            session.commit()
+            session.refresh(row_in)
 
-            rid = int(cur.lastrowid)
-            meta = metadata or {}
-            logger.debug(
-                "SQLiteActivationMemory.write: id=%s ns=%s kind=%s dim=%s conf=%s meta_keys=%s",
-                rid,
-                namespace,
-                kind,
-                key_dim,
-                float(confidence),
-                sorted(meta.keys()),
-            )
-            return rid
+        rid = int(row_in.id) if row_in.id is not None else 0
+        
+        if rid <= 0:
+            raise RuntimeError("activation_memory insert did not produce a primary key")
+
+        meta = metadata or {}
+
+        logger.debug(
+            "SQLiteActivationMemory.write: id=%s ns=%s kind=%s dim=%s conf=%s meta_keys=%s",
+            rid,
+            namespace,
+            kind,
+            key_dim,
+            float(confidence),
+            sorted(meta.keys()),
+        )
+        
+        return rid
 
     def load(self, *, namespace: Optional[str] = None, kind: Optional[str] = None, limit: Optional[int] = None) -> list[MemoryRecord]:
         namespace = namespace or self.default_namespace
-        sql = "SELECT id, namespace, kind, dim, key_blob, value_blob, metadata_json, confidence, access_count FROM activation_memory WHERE namespace=?"
-        args: list[object] = [namespace]
+        stmt = select(ActivationMemory).where(ActivationMemory.namespace == namespace)
+        
         if kind is not None:
-            sql += " AND kind=?"
-            args.append(kind)
-        sql += " ORDER BY id ASC"
+            stmt = stmt.where(ActivationMemory.kind == kind)
+        
+        stmt = stmt.order_by(col(ActivationMemory.id))
+        
         if limit is not None:
-            sql += " LIMIT ?"
-            args.append(int(limit))
+            stmt = stmt.limit(int(limit))
+
         out: list[MemoryRecord] = []
-        with self._connect() as con:
-            for row in con.execute(sql, tuple(args)):
-                rid, ns, kd, dim, kb, vb, mj, conf, access = row
+        
+        with Session(self._engine) as session:
+            for row_db in session.exec(stmt).all():
                 out.append(
                     MemoryRecord(
-                        id=int(rid),
-                        namespace=str(ns),
-                        kind=str(kd),
-                        key=_blob_to_tensor(kb, int(dim)),
-                        value=_blob_to_tensor(vb, int(dim)),
-                        metadata=json.loads(mj),
-                        confidence=float(conf),
-                        access_count=int(access),
+                        id=int(row_db.id),
+                        namespace=str(row_db.namespace),
+                        kind=str(row_db.kind),
+                        key=_blob_to_tensor(row_db.key_blob, int(row_db.dim)),
+                        value=_blob_to_tensor(row_db.value_blob, int(row_db.dim)),
+                        metadata=json.loads(row_db.metadata_json),
+                        confidence=float(row_db.confidence),
+                        access_count=int(row_db.access_count),
                     )
                 )
 
@@ -327,31 +347,43 @@ class SQLiteActivationMemory:
         """
 
         records = self.load(namespace=namespace, kind=kind)
+        
         if not records:
             return []
+        
         q = F.normalize(query.detach().cpu().float().reshape(1, -1), dim=-1)
         chunk = max(1, int(sim_chunk_rows))
         sim_parts: list[torch.Tensor] = []
+        
         for off in range(0, len(records), chunk):
             batch = records[off : off + chunk]
+        
             keys_b = F.normalize(
                 torch.stack([r.key.float() for r in batch], dim=0),
                 dim=-1,
             )
+        
             sim_parts.append((q @ keys_b.T).squeeze(0))
+        
         sims = torch.cat(sim_parts, dim=0)
         vals, idxs = sims.topk(min(top_k, len(records)))
         ids = [records[int(i)].id for i in idxs]
+
+        now = time.time()
+        
         if ids:
-            placeholders = ",".join("?" for _ in ids)
-            now = time.time()
-            with self._connect() as con:
-                con.execute(
-                    f"UPDATE activation_memory SET access_count=access_count+1, updated_at=? WHERE id IN ({placeholders})",
-                    (now, *ids),
-                )
+            with Session(self._engine) as session:
+                stm = select(ActivationMemory).where(col(ActivationMemory.id).in_(ids))
+        
+                for bump_row in session.exec(stm).all():
+                    bump_row.access_count = int(bump_row.access_count) + 1
+                    bump_row.updated_at = now
+                    session.add(bump_row)
+        
+                session.commit()
 
         tops = [(int(records[int(i)].id), float(v)) for v, i in zip(vals, idxs)]
+        
         logger.debug(
             "SQLiteActivationMemory.retrieve: namespace=%s kind=%s pool=%d top_k=%d tops=%s",
             namespace,
@@ -360,12 +392,15 @@ class SQLiteActivationMemory:
             len(idxs),
             tops,
         )
+        
         pairs: list[tuple[MemoryRecord, float]] = []
+
         for v, ti in zip(vals, idxs):
             ix = int(ti)
             rec = records[ix]
             rec.access_count += 1
             pairs.append((rec, float(v)))
+        
         return pairs
 
     def load_into_graft(
@@ -377,33 +412,42 @@ class SQLiteActivationMemory:
         clear_first: bool = True,
     ) -> int:
         remember = getattr(graft, "remember", None)
+        
         if not callable(remember):
             raise TypeError(
                 "SQLiteActivationMemory.load_into_graft requires graft.remember to be callable; "
                 f"got graft type={type(graft).__name__!r}",
             )
+        
         records = self.load(namespace=namespace, kind=kind)
+        
         if clear_first and hasattr(graft, "clear"):
             clr = getattr(graft, "clear", None)
+        
             if clr is None or not callable(clr):
                 raise TypeError(
                     "SQLiteActivationMemory.load_into_graft: graft declares clear but graft.clear "
                     "is not callable — provide a callable clear(), or pass clear_first=False",
                 )
+        
             clr()
+        
         for rec in records:
             meta = dict(rec.metadata)
             meta["memory_id"] = rec.id
             meta["confidence"] = rec.confidence
             remember(rec.key.reshape(1, -1), rec.value.reshape(1, -1), metadata=meta)
+        
         spread = self.normalized_spread_matrix([rec.id for rec in records])
         setter = getattr(graft, "set_spread_matrix", None)
+
         if setter is not None:
             if not callable(setter):
                 raise TypeError(
                     "SQLiteActivationMemory.load_into_graft: graft.set_spread_matrix must be callable when present "
                     f"(graft={type(graft).__name__!r})",
                 )
+        
             setter(spread if spread.numel() else None)
 
         logger.debug(
@@ -413,4 +457,5 @@ class SQLiteActivationMemory:
             len(records),
             tuple(spread.shape) if spread.numel() else None,
         )
+        
         return len(records)

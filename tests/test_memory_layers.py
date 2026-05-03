@@ -8,38 +8,16 @@ import pytest
 
 from core.cli import build_substrate_controller
 from core.cognition.substrate import (
-    CognitiveFrame,
     GlobalWorkspace,
     TrainableFeatureGraft,
     WorkspaceJournal,
-    working_memory_synthesize,
 )
+from core.frame import CognitiveFrame
 import core.cognition.substrate as substrate_mod
 from core.memory import SQLiteActivationMemory
 from core.substrate.graph import EpisodeAssociationGraph, merge_epistemic_evidence_dict
 
-from conftest import make_stub_llm_pair, stub_substrate_encoders
-
-
-class FakeHost:
-    cfg = types.SimpleNamespace(d_model=8)
-
-    def __init__(self, track_grafts: bool = False):
-        self.grafts: list | None = [] if track_grafts else None
-        self.llm, self._stub_tokenizer = make_stub_llm_pair()
-
-    def parameters(self, recurse=True):
-        _ = recurse
-        return self.llm.parameters()
-
-    def add_graft(self, slot, graft):
-        if self.grafts is not None:
-            self.grafts.append((slot, graft))
-
-
-class FakeTokenizer:
-    def __init__(self, stub_inner):
-        self.inner = stub_inner
+from conftest import FakeHost, FakeTokenizer, make_stub_llm_pair, stub_substrate_encoders
 
 
 @pytest.fixture
@@ -270,8 +248,8 @@ def test_working_memory_synthesis_binds_episodes():
     obj = _symbol("object")
     a = CognitiveFrame("memory_location", subject=subject, answer=obj, confidence=0.9, evidence={"journal_id": 10})
     b = CognitiveFrame("causal_effect", subject="treatment", answer="helps", confidence=0.8, evidence={"journal_id": 11, "ate": 0.05})
-    ws.publish(a)
-    ws.publish(b)
+    ws.post_frame(a)
+    ws.post_frame(b)
     syn = [f for f in ws.frames if f.intent == "synthesis_bundle"]
     assert syn
     assert syn[-1].subject == subject
@@ -307,6 +285,6 @@ def test_working_memory_synthesize_standalone():
         CognitiveFrame("memory_location", subject=subject, answer=obj, confidence=1.0, evidence={"journal_id": 3}),
         CognitiveFrame("causal_effect", subject="treatment", answer="helps", confidence=1.0, evidence={"journal_id": 4}),
     ]
-    syn = working_memory_synthesize(frames)
+    syn = CognitiveFrame.synthesize_bundle(frames)
     assert syn is not None
     assert syn.intent == "synthesis_bundle"

@@ -99,12 +99,12 @@ def main(argv: list[str] | None = None) -> None:
     )
 
     # Set up memory
-    from core.broca import PersistentSemanticMemory
+    from core.broca import SymbolicMemory
     from core.substrate_runtime import default_substrate_sqlite_path
 
     db_path = args.db or default_substrate_sqlite_path()
     db_path.parent.mkdir(parents=True, exist_ok=True)
-    memory = PersistentSemanticMemory(db_path, namespace=args.namespace)
+    memory = SymbolicMemory(db_path, namespace=args.namespace)
 
     # Create seeder
     from .seeder import KnowledgeSeeder

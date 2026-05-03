@@ -21,7 +21,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Sequence
 
-from ..system.event_bus import get_default_bus
+from ..workspace import WorkspacePublisher
 from .base import BaseEncoder, EncoderOutput
 
 logger = logging.getLogger(__name__)
@@ -161,7 +161,7 @@ class ExtractionEncoder(BaseEncoder):
                     )
         latency = (time.time() - start) * 1000
         self._record_call(latency, method="extract_entities")
-        self._publish(
+        WorkspacePublisher.emit(
             "encoder.extraction.entities",
             {
                 "text": text[:120],
@@ -240,7 +240,7 @@ class ExtractionEncoder(BaseEncoder):
         if identity_relations:
             latency = (time.time() - start) * 1000
             self._record_call(latency, method="extract_relations")
-            self._publish(
+            WorkspacePublisher.emit(
                 "encoder.extraction.relations",
                 {
                     "text": text[:120],
@@ -297,7 +297,7 @@ class ExtractionEncoder(BaseEncoder):
 
         latency = (time.time() - start) * 1000
         self._record_call(latency, method="extract_relations")
-        self._publish(
+        WorkspacePublisher.emit(
             "encoder.extraction.relations",
             {
                 "text": text[:120],
@@ -322,7 +322,7 @@ class ExtractionEncoder(BaseEncoder):
         relations = self._identity_relations_from_raw(raw)
         latency = (time.time() - start) * 1000
         self._record_call(latency, method="extract_identity_relations")
-        self._publish(
+        WorkspacePublisher.emit(
             "encoder.extraction.identity_relations",
             {
                 "text": text[:120],
@@ -434,7 +434,7 @@ class ExtractionEncoder(BaseEncoder):
         # label appears first *in `labels=`* win whenever every score was 1.0.
         latency = (time.time() - start) * 1000
         self._record_call(latency, method="classify")
-        self._publish(
+        WorkspacePublisher.emit(
             "encoder.extraction.classify",
             {
                 "text": text[:120],
@@ -485,6 +485,3 @@ class ExtractionEncoder(BaseEncoder):
             return (0, 0)
         return (idx, idx + len(mention))
 
-    @staticmethod
-    def _publish(topic: str, payload: dict) -> None:
-        get_default_bus().publish(topic, payload)

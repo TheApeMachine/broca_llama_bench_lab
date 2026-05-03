@@ -138,20 +138,45 @@ class StubGenerationTokenizer:
     def decode(self, ids, skip_special_tokens: bool = True):
         return self._llm._next_response
 
+    def encode(self, text: str, add_special_tokens: bool = False):
+        # Deterministic, no learning — just enough so EmbeddingProjector has
+        # token ids to index into the stub embedding weight.
+        _ = add_special_tokens
+        n_vocab = self._llm._input_embedding.weight.shape[0]
+        return [(hash(tok) % n_vocab) for tok in str(text).split() or [str(text)]]
+
     def apply_chat_template(self, messages, add_generation_prompt: bool = True, return_tensors: str | None = "pt"):
         _ = messages, add_generation_prompt, return_tensors
         return torch.tensor([[1, 2, 3]], dtype=torch.long)
 
 
+class _StubInputEmbedding:
+    """Minimal stand-in for nn.Embedding exposing only the ``weight`` attribute."""
+
+    def __init__(self, n_vocab: int = 64, dim: int = 8) -> None:
+        g = torch.Generator().manual_seed(0)
+        self.weight = torch.empty(n_vocab, dim).normal_(0.0, 0.02, generator=g)
+
+
 class StubGenerationLLM:
-    """Pretends to be an HF causal LM. The decode after generate returns whatever the tokenizer primed."""
+    """Pretends to be an HF causal LM. The decode after generate returns whatever the tokenizer primed.
+
+    Exposes a tiny ``get_input_embeddings()`` so :class:`EmbeddingProjector.from_host`
+    can produce a valid frame projector against the stub host the same way it
+    does against a real Llama checkpoint — no fallback path needed in the
+    production code.
+    """
 
     def __init__(self, device: str = "cpu"):
         self.device = torch.device(device)
         self._next_response: str = ""
+        self._input_embedding = _StubInputEmbedding()
 
     def parameters(self):
         yield torch.zeros(1, device=self.device)
+
+    def get_input_embeddings(self):
+        return self._input_embedding
 
     def generate(
         self,
@@ -175,6 +200,48 @@ def make_stub_llm_pair(extractor: Callable[[str], tuple[str, str, str] | None] |
     llm = StubGenerationLLM()
     tok = StubGenerationTokenizer(llm, extractor or _default_stub_extract)
     return llm, tok
+
+
+import types as _types  # noqa: E402  (kept here so the canonical fakes live near their dependencies)
+
+
+class FakeHost:
+    """Canonical test fake for :class:`core.host.llama_broca_host.LlamaBrocaHost`.
+
+    Replaces the five identical per-file copies. Holds a stub LLM (with a tiny
+    input embedding so :class:`EmbeddingProjector.from_host` succeeds), records
+    attached grafts when ``track_grafts=True``, and forwards ``parameters()``
+    to the stub LLM so device-detection helpers find a tensor.
+    """
+
+    cfg = _types.SimpleNamespace(d_model=8)
+
+    def __init__(self, *, track_grafts: bool = True) -> None:
+        self.grafts: list[tuple[str, object]] | None = [] if track_grafts else None
+        self.llm, self._stub_tokenizer = make_stub_llm_pair()
+
+    def add_graft(self, slot: str, graft: object) -> None:
+        if self.grafts is not None:
+            self.grafts.append((slot, graft))
+
+    def parameters(self, recurse: bool = True):
+        _ = recurse
+        return self.llm.parameters()
+
+
+class FakeTokenizer:
+    """Canonical test fake for :class:`core.host.HuggingFaceBrocaTokenizer`.
+
+    Wraps a :class:`StubGenerationTokenizer` so test code that wants the inner
+    HF-shaped surface can reach it via ``.inner`` while the rest of the
+    substrate uses the wrapper's ``encode`` method.
+    """
+
+    def __init__(self, stub_inner: StubGenerationTokenizer) -> None:
+        self.inner = stub_inner
+
+    def encode(self, text: str, add_special_tokens: bool = False):
+        return self.inner.encode(text, add_special_tokens=add_special_tokens)
 
 
 # ---------------------------------------------------------------------------

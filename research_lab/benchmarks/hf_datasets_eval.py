@@ -896,9 +896,9 @@ def evaluate_task(
     # Late import keeps the benchmark module usable in environments where the
     # optional event_bus shim is unavailable; publish() is no-op without subs.
     try:
-        from core.system.event_bus import get_default_bus
+        from core.workspace import WorkspaceBuilder
 
-        bus = get_default_bus()
+        bus = WorkspaceBuilder().process_default()
     except ImportError:
         bus = None
     total = len(examples)
@@ -964,9 +964,9 @@ def _run_hf_tasks_to_dir(
 ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     task_out_dir.mkdir(parents=True, exist_ok=True)
     try:
-        from core.system.event_bus import get_default_bus
+        from core.workspace import WorkspaceBuilder
 
-        bus = get_default_bus()
+        bus = WorkspaceBuilder().process_default()
     except ImportError:
         bus = None
     per_task: dict[str, Any] = {}
@@ -1174,9 +1174,9 @@ def run_hf_datasets_benchmark(
         print("\n--- Native HF datasets benchmark · vanilla_lm (HFLocalCausalLM) ---", flush=True)
 
     try:
-        from core.system.event_bus import get_default_bus
+        from core.workspace import WorkspaceBuilder
 
-        bus = get_default_bus()
+        bus = WorkspaceBuilder().process_default()
     except ImportError:
         bus = None
     if bus is not None:

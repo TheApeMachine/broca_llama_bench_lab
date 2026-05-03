@@ -22,17 +22,10 @@ from typing import Any
 import torch
 import torch.nn.functional as F
 
-from ..system.event_bus import get_default_bus
+from ..workspace import WorkspacePublisher
 from .base import BaseEncoder, EncoderOutput
 
 logger = logging.getLogger(__name__)
-
-
-def _publish(topic: str, payload: dict) -> None:
-    try:
-        get_default_bus().publish(topic, payload)
-    except Exception:
-        pass
 
 _WHISPER_MODEL = "openai/whisper-large-v3-turbo"
 _WHISPER_DIM = 1280  # Whisper-large encoder hidden size
@@ -133,7 +126,7 @@ class AuditoryEncoder(BaseEncoder):
         latency = (time.time() - start) * 1000
         self._record_call(latency, method="transcribe")
         stripped = text.strip()
-        _publish(
+        WorkspacePublisher.emit(
             "encoder.auditory.transcribe",
             {
                 "transcription": stripped[:160],
@@ -182,7 +175,7 @@ class AuditoryEncoder(BaseEncoder):
 
         elapsed = (time.time() - start) * 1000
         self._record_call(elapsed, method="encode")
-        _publish(
+        WorkspacePublisher.emit(
             "encoder.auditory.encode",
             {
                 "n_frames": int(hidden.shape[0]),

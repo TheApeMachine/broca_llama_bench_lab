@@ -1,8 +1,9 @@
 """Knowledge gathering pipeline for the Mosaic cognitive substrate.
 
 Integrates Scrapy for polite web crawling with Trafilatura for content extraction
-and the substrate's LLMRelationExtractor for triple extraction. Extracted
-(subject, predicate, object) triples are stored in PersistentSemanticMemory
+and :class:`core.cognition.encoder_relation_extractor.EncoderRelationExtractor`
+for triple extraction. Extracted
+(subject, predicate, object) triples are stored in SymbolicMemory
 with full provenance (source URL, extraction timestamp, confidence).
 
 Architecture:

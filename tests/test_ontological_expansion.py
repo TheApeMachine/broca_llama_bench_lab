@@ -4,7 +4,10 @@ from pathlib import Path
 
 import torch
 
-from core.frame.continuous_frame import SKETCH_DIM, stable_sketch
+from core.frame import FrameDimensions, SubwordProjector
+
+SKETCH_DIM = FrameDimensions.SKETCH_DIM
+_SUBWORD = SubwordProjector()
 from core.idletime.ontological_expansion import (
     OntologicalRegistry,
     PersistentOntologicalRegistry,
@@ -23,7 +26,7 @@ def test_gram_schmidt_produces_orthogonal_axes():
 
 def test_registry_promotes_only_after_threshold():
     registry = OntologicalRegistry(dim=SKETCH_DIM, frequency_threshold=3)
-    base = stable_sketch("ada", dim=SKETCH_DIM)
+    base = _SUBWORD.encode("ada")
     for i in range(2):
         registry.observe("ada")
     assert registry.maybe_promote("ada", base) is None
@@ -40,7 +43,7 @@ def test_promoted_axes_are_mutually_orthogonal():
     names = ["ada", "alan", "alice", "bob"]
     for n in names:
         registry.observe(n)
-        registry.maybe_promote(n, stable_sketch(n, dim=SKETCH_DIM))
+        registry.maybe_promote(n, _SUBWORD.encode(n))
     axes = list(registry.promoted.values())
     for i in range(len(axes)):
         for j in range(i + 1, len(axes)):
@@ -52,7 +55,7 @@ def test_promoted_axes_are_mutually_orthogonal():
 
 def test_vector_for_returns_promoted_axis_after_promotion():
     registry = OntologicalRegistry(dim=SKETCH_DIM, frequency_threshold=2)
-    base = stable_sketch("project_x", dim=SKETCH_DIM)
+    base = _SUBWORD.encode("project_x")
     v_pre = registry.vector_for("project_x", base)
     cos_pre = float(torch.dot(v_pre, base / base.norm()).item())
     assert cos_pre > 0.99  # before promotion the vector is the normalized sketch
@@ -68,7 +71,7 @@ def test_vector_for_returns_promoted_axis_after_promotion():
 def test_persistence_round_trip(tmp_path: Path):
     registry = OntologicalRegistry(dim=SKETCH_DIM, frequency_threshold=1)
     registry.observe("ada")
-    registry.maybe_promote("ada", stable_sketch("ada", dim=SKETCH_DIM))
+    registry.maybe_promote("ada", _SUBWORD.encode("ada"))
     store = PersistentOntologicalRegistry(tmp_path / "ont.sqlite", namespace="t")
     store.save(registry)
 

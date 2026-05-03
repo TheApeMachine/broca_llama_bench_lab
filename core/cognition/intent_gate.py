@@ -28,7 +28,7 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass, field
 
-from ..system.event_bus import get_default_bus
+from ..workspace import WorkspacePublisher
 from .semantic_cascade import SemanticCascade
 
 logger = logging.getLogger(__name__)
@@ -171,7 +171,7 @@ class IntentGate:
             intent.confidence,
             intent.is_actionable,
         )
-        self._publish(
+        WorkspacePublisher.emit(
             "cog.intent",
             {
                 "utterance": text[:120],
@@ -184,7 +184,3 @@ class IntentGate:
                 "source": source,
             },
         )
-
-    @staticmethod
-    def _publish(topic: str, payload: dict) -> None:
-        get_default_bus().publish(topic, payload)

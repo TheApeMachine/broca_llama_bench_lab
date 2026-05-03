@@ -4,13 +4,11 @@ import uuid
 
 import torch
 
-from core.frame.continuous_frame import (
-    BROCA_FEATURE_DIM,
-    COGNITIVE_FRAME_DIM,
-    FrozenSubwordProjector,
-    pack_broca_features,
-    pack_cognitive_frame,
-    stable_sketch,
+from core.frame import (
+    EmbeddingProjector,
+    FrameDimensions,
+    FramePacker,
+    SubwordProjector,
 )
 from core.host.tokenizer import RegexTokenizer, SPEECH_BRIDGE_PREFIX, speech_seed_ids
 
@@ -28,21 +26,30 @@ def test_subword_sketch_keeps_morphologically_related_terms_nearby():
     related = f"{root}_variant"
     unrelated = _symbol("other")
 
-    assert _cos(stable_sketch(root), stable_sketch(related)) > _cos(stable_sketch(root), stable_sketch(unrelated))
-    assert _cos(stable_sketch(root), stable_sketch(related)) > 0.15
+    sw = SubwordProjector()
+    assert _cos(sw.encode(root), sw.encode(related)) > _cos(sw.encode(root), sw.encode(unrelated))
+    assert _cos(sw.encode(root), sw.encode(related)) > 0.15
 
 
 def test_pack_cognitive_frame_shape_stays_fixed_for_open_vocab():
-    feats = pack_cognitive_frame(_symbol("intent"), _symbol("subject"), _symbol("object"), 0.8, {"ate": 0.2})
+    packer = FramePacker(SubwordProjector())
+    feats = packer.cognitive(
+        _symbol("intent"),
+        _symbol("subject"),
+        _symbol("object"),
+        0.8,
+        {"ate": 0.2},
+    )
 
-    assert feats.shape == (COGNITIVE_FRAME_DIM,)
+    assert feats.shape == (FrameDimensions.cognitive_frame_dim(),)
     assert torch.isfinite(feats).all()
 
 
 def test_pack_broca_features_extends_cognitive_frame_with_vsa_tail():
+    packer = FramePacker(SubwordProjector())
     v = torch.nn.functional.normalize(torch.ones(128), dim=0)
     intent, subject, obj = _symbol("intent"), _symbol("subject"), _symbol("object")
-    full = pack_broca_features(
+    full = packer.broca(
         intent,
         subject,
         obj,
@@ -51,17 +58,18 @@ def test_pack_broca_features_extends_cognitive_frame_with_vsa_tail():
         vsa_bundle=v,
         vsa_projection_seed=3,
     )
-    base = pack_cognitive_frame(
+    base = packer.cognitive(
         intent,
         subject,
         obj,
         0.8,
         {"ate": 0.2},
     )
-    assert full.shape == (BROCA_FEATURE_DIM,)
-    assert base.shape == (COGNITIVE_FRAME_DIM,)
-    assert torch.allclose(full[: COGNITIVE_FRAME_DIM], base)
-    assert full[COGNITIVE_FRAME_DIM:].norm() > 1e-6
+    cf_dim = FrameDimensions.cognitive_frame_dim()
+    assert full.shape == (FrameDimensions.broca_feature_dim(),)
+    assert base.shape == (cf_dim,)
+    assert torch.allclose(full[:cf_dim], base)
+    assert full[cf_dim:].norm() > 1e-6
 
 
 def test_frozen_subword_projector_preserves_embedding_geometry():
@@ -82,7 +90,7 @@ def test_frozen_subword_projector_preserves_embedding_geometry():
     weight[near_a_id] = basis
     weight[near_b_id] = basis + 0.01
     weight[far_id] = -basis
-    enc = FrozenSubwordProjector(tok, weight, seed=3)
+    enc = EmbeddingProjector(tok, weight, seed=3)
 
     assert _cos(enc(near_a), enc(near_b)) > 0.95
     assert _cos(enc(near_a), enc(far)) < 0.0

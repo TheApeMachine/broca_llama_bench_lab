@@ -16,7 +16,7 @@ from pathlib import Path
 from core.cognition.substrate import (
     CognitiveBackgroundWorker,
     DMNConfig,
-    PersistentSemanticMemory,
+    SymbolicMemory,
     WorkspaceJournal,
     CognitiveFrame,
 )
@@ -26,12 +26,14 @@ from core.temporal.hawkes import MultivariateHawkesProcess, PersistentHawkes
 from core.idletime.ontological_expansion import OntologicalRegistry, PersistentOntologicalRegistry
 from core.learning.preference_learning import DirichletPreference, PersistentPreference
 from core.substrate.graph import EpisodeAssociationGraph
-from core.frame.continuous_frame import SKETCH_DIM
+from core.frame import FrameDimensions
+
+SKETCH_DIM = FrameDimensions.SKETCH_DIM
 
 
 def _build_synthetic_mind(tmp: Path) -> types.SimpleNamespace:
     db = tmp / "rem.sqlite"
-    memory = PersistentSemanticMemory(db, namespace="t")
+    memory = SymbolicMemory(db, namespace="t")
     journal = WorkspaceJournal(db, shared_memory=memory)
     graph = EpisodeAssociationGraph(db)
     rng = random.Random(0)

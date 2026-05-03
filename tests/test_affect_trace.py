@@ -12,7 +12,7 @@ from core.cli import build_substrate_controller
 from core.cognition.affect_trace import PersistentAffectTrace
 from core.encoders.affect import AffectEncoder, AffectState, EmotionScore
 
-from conftest import make_stub_llm_pair, stub_substrate_encoders
+from conftest import FakeHost, FakeTokenizer, make_stub_llm_pair, stub_substrate_encoders
 
 
 def _emotion(label: str, score: float) -> EmotionScore:
@@ -45,27 +45,6 @@ def _state(
         entropy=entropy,
         certainty=certainty,
     )
-
-
-class FakeHost:
-    cfg = types.SimpleNamespace(d_model=8)
-
-    def __init__(self) -> None:
-        self.grafts: list[tuple[str, Any]] = []
-        self.llm, self._stub_tokenizer = make_stub_llm_pair()
-
-    def add_graft(self, slot: str, graft: Any) -> None:
-        self.grafts.append((slot, graft))
-
-    def parameters(self):
-        import torch
-
-        yield torch.zeros(1)
-
-
-class FakeTokenizer:
-    def __init__(self, stub_inner: Any) -> None:
-        self.inner = stub_inner
 
 
 class SequenceAffectEncoder:

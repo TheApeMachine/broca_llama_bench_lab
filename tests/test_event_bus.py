@@ -4,7 +4,9 @@ import logging
 
 import pytest
 
-from core.system.event_bus import EventBus, LogToBusHandler, _reset_default_bus, get_default_bus
+from core.workspace import WorkspaceBuilder
+from core.workspace.event_bus import EventBus
+from core.workspace.log_handler import LogToBusHandler
 
 
 def test_subscribe_and_publish_round_trip():
@@ -82,11 +84,11 @@ def test_log_handler_forwards_records_as_events():
     assert "careful" in msgs
 
 
-def test_default_bus_is_singleton():
-    _reset_default_bus()
-    a = get_default_bus()
-    b = get_default_bus()
+def test_default_workspace_is_singleton():
+    WorkspaceBuilder.reset_process_default()
+    a = WorkspaceBuilder().process_default()
+    b = WorkspaceBuilder().process_default()
     assert a is b
-    _reset_default_bus()
-    c = get_default_bus()
+    WorkspaceBuilder.reset_process_default()
+    c = WorkspaceBuilder().process_default()
     assert c is not a

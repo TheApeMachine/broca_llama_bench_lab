@@ -29,16 +29,9 @@ import logging
 import math
 from dataclasses import dataclass
 
-from ..system.event_bus import get_default_bus
+from ..workspace import WorkspacePublisher
 
 logger = logging.getLogger(__name__)
-
-
-def _publish(topic: str, payload: dict) -> None:
-    try:
-        get_default_bus().publish(topic, payload)
-    except Exception:
-        pass
 
 
 @dataclass(frozen=True)
@@ -108,7 +101,7 @@ class DerivedStrength:
         actionability = _clamp01(inputs.intent_actionability)
         
         if actionability <= 0.0:
-            _publish(
+            WorkspacePublisher.emit(
                 "cog.derived_strength",
                 {
                     "intent_actionability": actionability,
@@ -136,7 +129,7 @@ class DerivedStrength:
         
         clamped = _clamp01(strength)
         
-        _publish(
+        WorkspacePublisher.emit(
             "cog.derived_strength",
             {
                 "intent_actionability": actionability,

@@ -70,8 +70,8 @@ class KnowledgeSeeder:
     """Orchestrates web crawling and knowledge extraction into semantic memory.
 
     Usage:
-        from core.broca import PersistentSemanticMemory
-        memory = PersistentSemanticMemory("runs/knowledge.sqlite", namespace="web")
+        from core.broca import SymbolicMemory
+        memory = SymbolicMemory("runs/knowledge.sqlite", namespace="web")
         seeder = KnowledgeSeeder(memory=memory)
         result = seeder.gather(urls=["https://en.wikipedia.org/wiki/Python_(programming_language)"])
         print(result.summary_line())

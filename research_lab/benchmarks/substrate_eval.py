@@ -130,7 +130,7 @@ def bench_rule_shift(
     ``seed + trial_index * 1_000_003`` and micro-jitter on challenger prediction
     gaps so finite-sample variability can be summarized (mean, variance, CI).
     """
-    from core.cognition.substrate import PersistentSemanticMemory
+    from core.cognition.substrate import SymbolicMemory
 
     start = time.time()
     trial_scores: list[float] = []
@@ -144,9 +144,9 @@ def bench_rule_shift(
 
         fd, trial_db_path = tempfile.mkstemp(suffix=".sqlite")
         os.close(fd)
-        mem: PersistentSemanticMemory | None = None
+        mem: SymbolicMemory | None = None
         try:
-            mem = PersistentSemanticMemory(trial_db_path, namespace=f"rule_shift_{trial_seed}")
+            mem = SymbolicMemory(trial_db_path, namespace=f"rule_shift_{trial_seed}")
 
             mem.upsert("ada", "location", "rome", confidence=0.9, evidence={"source": "seed"})
             for i in range(n_initial_claims):
@@ -403,7 +403,7 @@ def bench_causal_reasoning() -> SubstrateBenchmarkResult:
 
 def bench_memory_fidelity(*, n_triples: int = 100, seed: int = 0) -> SubstrateBenchmarkResult:
     """Write N random triples to semantic memory, recall each, measure accuracy."""
-    from core.cognition.substrate import PersistentSemanticMemory
+    from core.cognition.substrate import SymbolicMemory
 
     start = time.time()
     rng = random.Random(seed)
@@ -414,7 +414,7 @@ def bench_memory_fidelity(*, n_triples: int = 100, seed: int = 0) -> SubstrateBe
     base_path = default_substrate_sqlite_path()
     ensure_parent_dir(base_path)
     mem_ns = f"memory_fidelity_{seed}_{n_triples}"
-    mem = PersistentSemanticMemory(base_path, namespace=mem_ns)
+    mem = SymbolicMemory(base_path, namespace=mem_ns)
 
     try:
         written: list[tuple[str, str, str, float]] = []

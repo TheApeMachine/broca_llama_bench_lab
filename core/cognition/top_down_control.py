@@ -49,17 +49,10 @@ from ..grafting.grafts import (
     state_confidence,
     state_inertia,
 )
-from ..system.event_bus import get_default_bus
+from ..workspace import WorkspacePublisher
 
 
 logger = logging.getLogger(__name__)
-
-
-def _publish(topic: str, payload: dict) -> None:
-    try:
-        get_default_bus().publish(topic, payload)
-    except Exception:
-        pass
 
 
 def _infer_host_device(host: Any) -> torch.device:
@@ -159,7 +152,7 @@ class HypothesisMaskingGraft(BaseGraft):
                 reason,
                 len(self.banned),
             )
-            _publish(
+            WorkspacePublisher.emit(
                 "cog.hypothesis.ban",
                 {
                     "tokens": added,
@@ -346,7 +339,7 @@ class IterativeHypothesisSearch:
         history: list[HypothesisAttempt] = []
         last_attempt: HypothesisAttempt | None = None
 
-        _publish(
+        WorkspacePublisher.emit(
             "cog.hypothesis.start",
             {
                 "max_iterations": self.max_iterations,
@@ -370,7 +363,7 @@ class IterativeHypothesisSearch:
             history.append(attempt)
             last_attempt = attempt
 
-            _publish(
+            WorkspacePublisher.emit(
                 "cog.hypothesis.attempt",
                 {
                     "iteration": it,
@@ -389,7 +382,7 @@ class IterativeHypothesisSearch:
                     generated,
                     text,
                 )
-                _publish(
+                WorkspacePublisher.emit(
                     "cog.hypothesis.complete",
                     {
                         "accepted": True,
@@ -425,7 +418,7 @@ class IterativeHypothesisSearch:
         accepted = False
         final_ids = list(last_attempt.token_ids) if last_attempt is not None else []
         final_text = last_attempt.text if last_attempt is not None else ""
-        _publish(
+        WorkspacePublisher.emit(
             "cog.hypothesis.complete",
             {
                 "accepted": False,
@@ -590,7 +583,7 @@ class EpistemicInterruptionMonitor:
         active_correction: Optional[torch.Tensor] = None
         truncations = 0
 
-        _publish(
+        WorkspacePublisher.emit(
             "cog.epistemic.start",
             {
                 "prompt_len": len(prompt),
@@ -675,7 +668,7 @@ class EpistemicInterruptionMonitor:
                 )
             )
             truncations += 1
-            _publish(
+            WorkspacePublisher.emit(
                 "cog.epistemic.intervention",
                 {
                     "step": step,
@@ -688,7 +681,7 @@ class EpistemicInterruptionMonitor:
             )
 
         text = _decode_token_ids(self.tokenizer, generated)
-        _publish(
+        WorkspacePublisher.emit(
             "cog.epistemic.complete",
             {
                 "final_step": step,
@@ -788,7 +781,7 @@ class ModalityShiftGraft(BaseGraft):
         unit = F.normalize(d.reshape(1, -1), dim=-1).reshape(-1)
         self.modes[str(name)] = unit
         logger.debug("ModalityShiftGraft.register_mode: name=%s d_model=%d", name, self.d_model)
-        _publish(
+        WorkspacePublisher.emit(
             "cog.modality_shift.register",
             {
                 "name": str(name),
@@ -837,12 +830,12 @@ class ModalityShiftGraft(BaseGraft):
     def set_active_mode(self, name: Optional[str]) -> None:
         if name is None:
             self.active_mode = None
-            _publish("cog.modality_shift.set_active", {"name": None})
+            WorkspacePublisher.emit("cog.modality_shift.set_active", {"name": None})
             return
         if name not in self.modes:
             raise KeyError(f"mode {name!r} is not registered")
         self.active_mode = str(name)
-        _publish(
+        WorkspacePublisher.emit(
             "cog.modality_shift.set_active",
             {"name": str(name), "n_modes": len(self.modes)},
         )
@@ -1011,7 +1004,7 @@ class CausalConstraintGraft(KVMemoryGraft):
                 metadata=meta,
             )
         self.constraints.append(constraint)
-        _publish(
+        WorkspacePublisher.emit(
             "cog.causal.constraint",
             {
                 "treatment": constraint.treatment,

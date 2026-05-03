@@ -21,7 +21,9 @@ from core.idletime.chunking import (
     macro_frame_features,
     _macro_name_for_pattern,
 )
-from core.frame.continuous_frame import BROCA_FEATURE_DIM
+from core.frame import FrameDimensions
+
+BROCA_FEATURE_DIM = FrameDimensions.broca_feature_dim()
 
 
 class _StubJournal:

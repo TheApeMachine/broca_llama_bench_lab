@@ -53,7 +53,7 @@ except ImportError as exc:
     ) from exc
 
 from core.cognition.substrate import SubstrateController
-from core.system.event_bus import EventBus
+from core.workspace import BaseWorkspace as EventBus
 from core.substrate.runtime import (
     CHAT_DO_SAMPLE,
     CHAT_MAX_NEW_TOKENS,

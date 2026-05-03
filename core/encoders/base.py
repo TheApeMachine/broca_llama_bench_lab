@@ -21,16 +21,9 @@ from typing import Any, Protocol, runtime_checkable
 import torch
 import torch.nn.functional as F
 
-from ..system.event_bus import get_default_bus
+from ..workspace import WorkspacePublisher
 
 logger = logging.getLogger(__name__)
-
-
-def _publish(topic: str, payload: dict) -> None:
-    try:
-        get_default_bus().publish(topic, payload)
-    except Exception:
-        pass
 
 
 @dataclass
@@ -165,7 +158,7 @@ class BaseEncoder(ABC):
                 "Encoder loaded: %s (%s) on %s in %.0fms",
                 self._name, self._model_id, self.device, elapsed,
             )
-            _publish(
+            WorkspacePublisher.emit(
                 "encoder.load",
                 {
                     "name": self._name,
@@ -184,7 +177,7 @@ class BaseEncoder(ABC):
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
             logger.info("Encoder unloaded: %s", self._name)
-            _publish("encoder.unload", {"name": self._name})
+            WorkspacePublisher.emit("encoder.unload", {"name": self._name})
 
     def _ensure_loaded(self) -> None:
         """Load on first use if not already loaded."""
@@ -194,7 +187,7 @@ class BaseEncoder(ABC):
     def _record_call(self, latency_ms: float, *, method: str | None = None) -> None:
         self._total_calls += 1
         self._total_latency_ms += latency_ms
-        _publish(
+        WorkspacePublisher.emit(
             "encoder.call",
             {
                 "name": self._name,

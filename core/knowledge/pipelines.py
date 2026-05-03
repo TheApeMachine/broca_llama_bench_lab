@@ -4,7 +4,7 @@ Four-stage pipeline:
 1. TextCleaningPipeline: HTML -> clean text via Trafilatura
 2. ChunkingPipeline: Split text into LLM-safe chunks (~1500 tokens)
 3. TripleExtractionPipeline: Extract (subject, predicate, object) triples
-4. SemanticMemoryStorePipeline: Store triples in PersistentSemanticMemory
+4. SemanticMemoryStorePipeline: Store triples in SymbolicMemory
 
 Each pipeline stage is also usable standalone (without Scrapy) for testing
 and for the non-Scrapy path (direct URL fetch via trafilatura.fetch_url).
@@ -231,11 +231,12 @@ class TripleExtractionPipeline:
     """Extract (subject, predicate, object) triples from text chunks.
 
     Supports two extraction backends:
-    - LLMRelationExtractor (when BrocaMind host is available)
+    - :class:`core.cognition.encoder_relation_extractor.EncoderRelationExtractor`
+      (the substrate's GLiNER-backed extractor, the production path)
     - Lightweight regex/heuristic fallback (for crawling without GPU)
 
-    The LLM backend uses a 2-shot prompt for ~90% F1 (per literature).
-    The heuristic backend is lower quality but runs without a model.
+    The encoder backend respects the same intent-gating rules the chat path
+    does. The heuristic backend is lower quality but runs without a model.
     """
 
     def __init__(
@@ -246,7 +247,7 @@ class TripleExtractionPipeline:
         confidence_threshold: float = 0.6,
         max_triples_per_chunk: int = 20,
     ):
-        self.extractor = extractor  # LLMRelationExtractor or compatible
+        self.extractor = extractor  # EncoderRelationExtractor or compatible
         self.use_heuristic = use_heuristic or (extractor is None)
         self.confidence_threshold = confidence_threshold
         self.max_triples_per_chunk = max_triples_per_chunk
@@ -258,7 +259,7 @@ class TripleExtractionPipeline:
         return self._llm_extract(chunk, source_url=source_url)
 
     def _llm_extract(self, chunk: str, *, source_url: str = "") -> list[ExtractedTriple]:
-        """Use LLMRelationExtractor for high-quality extraction."""
+        """Run the encoder-backed extractor on each sentence."""
         if self.extractor is None:
             return []
 
@@ -380,7 +381,7 @@ class TripleExtractionPipeline:
 # ---------------------------------------------------------------------------
 
 class SemanticMemoryStorePipeline:
-    """Store extracted triples in PersistentSemanticMemory with provenance.
+    """Store extracted triples in SymbolicMemory with provenance.
 
     Deduplicates against existing memory: if the same (subject, predicate)
     pair already exists with the same object, corroborates it (boosting
@@ -395,7 +396,7 @@ class SemanticMemoryStorePipeline:
         confidence_threshold: float = 0.6,
         deduplicate: bool = True,
     ):
-        self.memory = memory  # PersistentSemanticMemory instance
+        self.memory = memory  # SymbolicMemory instance
         self.confidence_threshold = confidence_threshold
         self.deduplicate = deduplicate
         self._stored_count = 0

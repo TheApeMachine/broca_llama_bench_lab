@@ -20,14 +20,13 @@ from .agent.active_inference import (
 from .cognition.substrate import (
     SubstrateController,
     CognitiveBackgroundWorker,
-    CognitiveFrame,
     DMNConfig,
     IntrinsicCue,
-    PersistentSemanticMemory,
     TrainableFeatureGraft,
     WorkspaceJournal,
-    cognitive_frame_from_episode_row,
 )
+from .memory import SymbolicMemory
+from .frame import CognitiveFrame
 from .causal import FiniteSCM, build_frontdoor_scm, build_simpson_scm
 from .system.device import pick_torch_device
 from .grafting.grafts import (
@@ -42,15 +41,13 @@ from .host.llama_broca_host import LlamaBrocaHost, load_llama_broca_host
 from .memory import SQLiteActivationMemory
 from .substrate.graph import EpisodeAssociationGraph, merge_epistemic_evidence_dict
 from .host.tokenizer import SPEECH_BRIDGE_PREFIX, speech_seed_ids, utterance_words
-from .frame.continuous_frame import (
-    COGNITIVE_FRAME_DIM,
-    BROCA_FEATURE_DIM,
-    FrozenSubwordProjector,
-    frozen_subword_projector_from_model,
-    pack_broca_features,
-    pack_cognitive_frame,
-    semantic_subword_sketch,
-    stable_sketch,
+from .frame import (
+    EmbeddingProjector,
+    FrameDimensions,
+    FramePacker,
+    HypervectorProjector,
+    NumericTail,
+    SubwordProjector,
 )
 from .symbolic.vsa import bind, unbind, bundle, permute, hypervector, cleanup
 
@@ -180,10 +177,9 @@ __all__ = [
     "CognitiveFrame",
     "DMNConfig",
     "IntrinsicCue",
-    "PersistentSemanticMemory",
+    "SymbolicMemory",
     "WorkspaceJournal",
     "TrainableFeatureGraft",
-    "cognitive_frame_from_episode_row",
     "EpisodeAssociationGraph",
     "merge_epistemic_evidence_dict",
     "FiniteSCM",
@@ -202,14 +198,12 @@ __all__ = [
     "SPEECH_BRIDGE_PREFIX",
     "speech_seed_ids",
     "utterance_words",
-    "COGNITIVE_FRAME_DIM",
-    "BROCA_FEATURE_DIM",
-    "FrozenSubwordProjector",
-    "frozen_subword_projector_from_model",
-    "pack_cognitive_frame",
-    "pack_broca_features",
-    "semantic_subword_sketch",
-    "stable_sketch",
+    "EmbeddingProjector",
+    "FrameDimensions",
+    "FramePacker",
+    "HypervectorProjector",
+    "NumericTail",
+    "SubwordProjector",
     "VSACodebook",
     "bind",
     "unbind",

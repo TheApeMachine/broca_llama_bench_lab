@@ -34,7 +34,9 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-from ..frame.continuous_frame import BROCA_FEATURE_DIM
+from ..frame import FrameDimensions
+
+BROCA_FEATURE_DIM = FrameDimensions.broca_feature_dim()
 
 
 logger = logging.getLogger(__name__)
@@ -341,15 +343,14 @@ class MacroChunkRegistry:
 
 
 def _frame_features_from_row(row: dict, *, text_encoder=None) -> torch.Tensor:
-    from ..frame.continuous_frame import pack_cognitive_frame
+    from ..frame import FramePacker
 
-    return pack_cognitive_frame(
+    return FramePacker(text_encoder).cognitive(
         str(row.get("intent", "")),
         str(row.get("subject", "")),
         str(row.get("answer", "")),
         float(row.get("confidence", 0.0)),
         row.get("evidence") if isinstance(row.get("evidence"), dict) else None,
-        text_encoder=text_encoder,
     )
 
 

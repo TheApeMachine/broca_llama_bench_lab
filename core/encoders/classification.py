@@ -7,7 +7,7 @@ from typing import Any, Sequence
 
 from transformers import AutoTokenizer
 
-from ..system.event_bus import get_default_bus
+from ..workspace import WorkspacePublisher
 from .base import BaseEncoder, EncoderOutput
 
 
@@ -73,7 +73,7 @@ class SemanticClassificationEncoder(BaseEncoder):
         axes = self._normalize_axes(raw_batch[0], labels)
         latency = (time.time() - start) * 1000
         self._record_call(latency, method="classify_axes")
-        self._publish(
+        WorkspacePublisher.emit(
             "encoder.semantic_classification.axes",
             {
                 "text": text[:120],
@@ -150,6 +150,3 @@ class SemanticClassificationEncoder(BaseEncoder):
             out[str(axis)] = axis_out
         return out
 
-    @staticmethod
-    def _publish(topic: str, payload: dict[str, Any]) -> None:
-        get_default_bus().publish(topic, payload)

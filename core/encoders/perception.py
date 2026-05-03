@@ -26,17 +26,10 @@ from typing import Any
 import torch
 import torch.nn.functional as F
 
-from ..system.event_bus import get_default_bus
+from ..workspace import WorkspacePublisher
 from .base import BaseEncoder, EncoderOutput
 
 logger = logging.getLogger(__name__)
-
-
-def _publish(topic: str, payload: dict) -> None:
-    try:
-        get_default_bus().publish(topic, payload)
-    except Exception:
-        pass
 
 # Model IDs
 _VJEPA_MODEL = "facebook/vjepa2-vith-fpc64-256"
@@ -101,7 +94,7 @@ class DINOv2Encoder(BaseEncoder):
         elapsed = (time.time() - start) * 1000
         self._record_call(elapsed, method="encode")
         n_patches = int(outputs.last_hidden_state.shape[1] - 1)
-        _publish(
+        WorkspacePublisher.emit(
             "encoder.perception.visual",
             {
                 "stream": "visual_cortex",
@@ -139,7 +132,7 @@ class DINOv2Encoder(BaseEncoder):
 
         elapsed = (time.time() - start) * 1000
         self._record_call(elapsed, method="encode_patches")
-        _publish(
+        WorkspacePublisher.emit(
             "encoder.perception.visual",
             {
                 "stream": "visual_cortex",
@@ -211,7 +204,7 @@ class IJEPAEncoder(BaseEncoder):
 
         elapsed = (time.time() - start) * 1000
         self._record_call(elapsed, method="encode")
-        _publish(
+        WorkspacePublisher.emit(
             "encoder.perception.ventral",
             {
                 "stream": "ventral_stream",
@@ -295,7 +288,7 @@ class VJEPAEncoder(BaseEncoder):
         elapsed = (time.time() - start) * 1000
         self._record_call(elapsed, method="encode_frames")
         n_frames = len(frames) if hasattr(frames, "__len__") else 0
-        _publish(
+        WorkspacePublisher.emit(
             "encoder.perception.dorsal",
             {
                 "stream": "dorsal_stream",
@@ -330,7 +323,7 @@ class VJEPAEncoder(BaseEncoder):
 
         elapsed = (time.time() - start) * 1000
         self._record_call(elapsed, method="encode_single_frame")
-        _publish(
+        WorkspacePublisher.emit(
             "encoder.perception.dorsal",
             {
                 "stream": "dorsal_stream",
@@ -432,7 +425,7 @@ class DepthEncoder(BaseEncoder):
 
         elapsed = (time.time() - start) * 1000
         self._record_call(elapsed, method="estimate_depth")
-        _publish(
+        WorkspacePublisher.emit(
             "encoder.perception.spatial",
             {
                 "stream": "spatial_cortex",
