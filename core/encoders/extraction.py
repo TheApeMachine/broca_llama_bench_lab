@@ -484,4 +484,3 @@ class ExtractionEncoder(BaseEncoder):
         if idx < 0:
             return (0, 0)
         return (idx, idx + len(mention))
-

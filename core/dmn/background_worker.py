@@ -842,6 +842,3 @@ class CognitiveBackgroundWorker:
             except Exception as exc:  # pragma: no cover - background safety net
                 logger.exception("Broca background DMN loop failed")
                 self.last_error = repr(exc)
-
-
-

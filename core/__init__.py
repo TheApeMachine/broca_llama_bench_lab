@@ -1,55 +1,31 @@
-__version__ = "0.6.1-mosaic"
+"""Mosaic public API.
 
-import os
+The package root is intentionally a thin lazy-export surface.  Importing
+``core`` no longer imports the live substrate, SQL-backed memory, host models,
+or background workers; those concerns are resolved only when their public name
+is requested.
+"""
+
+from __future__ import annotations
+
 from typing import Any
 
-from .infra.logging_setup import configure_lab_logging
+from .infra.lazy_exports import LazyExportRegistry
 
-from .agent.active_inference import (
-    ActiveInferenceAgent,
-    CategoricalPOMDP,
-    CoupledDecision,
-    CoupledEFEAgent,
-    ToolForagingAgent,
-    build_causal_epistemic_pomdp,
-    build_tiger_pomdp,
-    build_tool_foraging_pomdp,
-    derived_listen_channel_reliability,
-    extend_pomdp_with_synthesize_tool,
-)
-from .substrate.controller import SubstrateController
-from .dmn import CognitiveBackgroundWorker, DMNConfig
-from .grafts import TrainableFeatureGraft
-from .memory import SymbolicMemory, WorkspaceJournal
-from .workspace import IntrinsicCue
-from .frame import CognitiveFrame
-from .causal import FiniteSCM, build_frontdoor_scm, build_simpson_scm
-from .system.device import pick_torch_device
-from .grafting.grafts import (
-    ActiveInferenceTokenGraft,
-    CoupledActiveInferenceTokenGraft,
-    CausalEffectTokenGraft,
-    FeatureVectorGraft,
-    KVMemoryGraft,
-)
-from .host.hf_tokenizer_compat import HuggingFaceBrocaTokenizer
-from .host.llama_broca_host import LlamaBrocaHost, load_llama_broca_host
-from .memory import SQLiteActivationMemory
-from .substrate.graph import EpisodeAssociationGraph, merge_epistemic_evidence_dict
-from .host.tokenizer import SPEECH_BRIDGE_PREFIX, speech_seed_ids, utterance_words
-from .frame import (
-    EmbeddingProjector,
-    FrameDimensions,
-    FramePacker,
-    HypervectorProjector,
-    NumericTail,
-    SubwordProjector,
-)
-from .symbolic.vsa import bind, unbind, bundle, permute, hypervector, cleanup
+__version__ = "0.6.1-mosaic"
 
-# Optional / heavier subsystems: imported on first attribute access via __getattr__ (PEP 562).
-
-_LAZY_EXPORTS: dict[str, tuple[str, str]] = {
+_EXPORTS: dict[str, tuple[str, str]] = {
+    "configure_lab_logging": (".infra.logging_setup", "configure_lab_logging"),
+    "ActiveInferenceAgent": (".agent.active_inference", "ActiveInferenceAgent"),
+    "CategoricalPOMDP": (".agent.active_inference", "CategoricalPOMDP"),
+    "CoupledDecision": (".agent.active_inference", "CoupledDecision"),
+    "CoupledEFEAgent": (".agent.active_inference", "CoupledEFEAgent"),
+    "ToolForagingAgent": (".agent.active_inference", "ToolForagingAgent"),
+    "build_causal_epistemic_pomdp": (".agent.active_inference", "build_causal_epistemic_pomdp"),
+    "build_tiger_pomdp": (".agent.active_inference", "build_tiger_pomdp"),
+    "build_tool_foraging_pomdp": (".agent.active_inference", "build_tool_foraging_pomdp"),
+    "derived_listen_channel_reliability": (".agent.active_inference", "derived_listen_channel_reliability"),
+    "extend_pomdp_with_synthesize_tool": (".agent.active_inference", "extend_pomdp_with_synthesize_tool"),
     "ChunkingDetectionConfig": (".idletime.chunking", "ChunkingDetectionConfig"),
     "CompiledMacro": (".idletime.chunking", "CompiledMacro"),
     "MacroChunkRegistry": (".idletime.chunking", "MacroChunkRegistry"),
@@ -77,8 +53,46 @@ _LAZY_EXPORTS: dict[str, tuple[str, str]] = {
     "InterruptionVerdict": (".cognition.top_down_control", "InterruptionVerdict"),
     "IterativeHypothesisSearch": (".cognition.top_down_control", "IterativeHypothesisSearch"),
     "ModalityShiftGraft": (".cognition.top_down_control", "ModalityShiftGraft"),
+    "SubstrateController": (".substrate.controller", "SubstrateController"),
+    "CognitiveBackgroundWorker": (".dmn", "CognitiveBackgroundWorker"),
+    "CognitiveFrame": (".frame", "CognitiveFrame"),
+    "DMNConfig": (".dmn", "DMNConfig"),
+    "IntrinsicCue": (".workspace", "IntrinsicCue"),
+    "SymbolicMemory": (".memory", "SymbolicMemory"),
+    "WorkspaceJournal": (".memory", "WorkspaceJournal"),
+    "TrainableFeatureGraft": (".grafts", "TrainableFeatureGraft"),
+    "EpisodeAssociationGraph": (".substrate.graph", "EpisodeAssociationGraph"),
+    "merge_epistemic_evidence_dict": (".substrate.graph", "merge_epistemic_evidence_dict"),
+    "FiniteSCM": (".causal", "FiniteSCM"),
+    "build_frontdoor_scm": (".causal", "build_frontdoor_scm"),
+    "build_simpson_scm": (".causal", "build_simpson_scm"),
+    "KVMemoryGraft": (".grafting.grafts", "KVMemoryGraft"),
+    "ActiveInferenceTokenGraft": (".grafting.grafts", "ActiveInferenceTokenGraft"),
+    "CoupledActiveInferenceTokenGraft": (".grafting.grafts", "CoupledActiveInferenceTokenGraft"),
+    "CausalEffectTokenGraft": (".grafting.grafts", "CausalEffectTokenGraft"),
+    "FeatureVectorGraft": (".grafting.grafts", "FeatureVectorGraft"),
+    "HuggingFaceBrocaTokenizer": (".host.hf_tokenizer_compat", "HuggingFaceBrocaTokenizer"),
+    "SQLiteActivationMemory": (".memory", "SQLiteActivationMemory"),
+    "LlamaBrocaHost": (".host.llama_broca_host", "LlamaBrocaHost"),
+    "load_llama_broca_host": (".host.llama_broca_host", "load_llama_broca_host"),
+    "pick_torch_device": (".system.device", "pick_torch_device"),
+    "SPEECH_BRIDGE_PREFIX": (".host.tokenizer", "SPEECH_BRIDGE_PREFIX"),
+    "speech_seed_ids": (".host.tokenizer", "speech_seed_ids"),
+    "utterance_words": (".host.tokenizer", "utterance_words"),
+    "EmbeddingProjector": (".frame", "EmbeddingProjector"),
+    "FrameDimensions": (".frame", "FrameDimensions"),
+    "FramePacker": (".frame", "FramePacker"),
+    "HypervectorProjector": (".frame", "HypervectorProjector"),
+    "NumericTail": (".frame", "NumericTail"),
+    "SubwordProjector": (".frame", "SubwordProjector"),
     "VSACodebook": (".symbolic.vsa", "VSACodebook"),
+    "bind": (".symbolic.vsa", "bind"),
+    "unbind": (".symbolic.vsa", "unbind"),
+    "bundle": (".symbolic.vsa", "bundle"),
+    "permute": (".symbolic.vsa", "permute"),
+    "hypervector": (".symbolic.vsa", "hypervector"),
     "vsa_cosine": (".symbolic.vsa", "cosine"),
+    "cleanup": (".symbolic.vsa", "cleanup"),
     "HopfieldAssociativeMemory": (".memory.hopfield", "HopfieldAssociativeMemory"),
     "hopfield_update": (".memory.hopfield", "hopfield_update"),
     "derived_inverse_temperature": (".memory.hopfield", "derived_inverse_temperature"),
@@ -90,7 +104,7 @@ _LAZY_EXPORTS: dict[str, tuple[str, str]] = {
     "empirical_coverage": (".calibration.conformal", "empirical_coverage"),
     "MultivariateHawkesProcess": (".temporal.hawkes", "MultivariateHawkesProcess"),
     "PersistentHawkes": (".temporal.hawkes", "PersistentHawkes"),
-    "fit_excitation_em": (".temporal.hawkes", "fit_excitation_em"),
+    "fit_excitation_em": (".temporal.hawkes_em", "fit_excitation_em"),
     "GraftMotorTrainer": (".learning.motor_learning", "GraftMotorTrainer"),
     "MotorLearningConfig": (".learning.motor_learning", "MotorLearningConfig"),
     "DirichletPreference": (".learning.preference_learning", "DirichletPreference"),
@@ -111,135 +125,16 @@ _LAZY_EXPORTS: dict[str, tuple[str, str]] = {
     "SelfImproveDockerWorker": (".workers.docker_self_improve_worker", "SelfImproveDockerWorker"),
 }
 
+_registry = LazyExportRegistry(package=__package__ or __name__, exports=_EXPORTS)
+__all__ = _registry.names()
+
 
 def __getattr__(name: str) -> Any:
-    spec = _LAZY_EXPORTS.get(name)
-    if spec is None:
-        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
-    module_name, attr = spec
-    import importlib
-
-    mod = importlib.import_module(module_name, __package__)
-    val = getattr(mod, attr)
-    globals()[name] = val
-    return val
+    return _registry.resolve(globals(), name)
 
 
 def __dir__() -> list[str]:
-    return sorted(set(globals()) | set(__all__))
+    return _registry.dir_entries(globals())
 
 
-__all__ = [
-    "configure_lab_logging",
-    "ActiveInferenceAgent",
-    "CategoricalPOMDP",
-    "CoupledDecision",
-    "CoupledEFEAgent",
-    "ToolForagingAgent",
-    "build_causal_epistemic_pomdp",
-    "build_tiger_pomdp",
-    "build_tool_foraging_pomdp",
-    "extend_pomdp_with_synthesize_tool",
-    "derived_listen_channel_reliability",
-    "ChunkingDetectionConfig",
-    "CompiledMacro",
-    "DMNChunkingCompiler",
-    "MacroChunkRegistry",
-    "macro_frame_features",
-    "NativeTool",
-    "NativeToolRegistry",
-    "SandboxResult",
-    "ToolSandbox",
-    "tool_sandbox_from_env",
-    "ToolSynthesisError",
-    "ACTIVATION_MODE_KIND",
-    "CapturedActivationMode",
-    "DynamicGraftSynthesizer",
-    "capture_activation_mode",
-    "CausalConstraint",
-    "CausalConstraintGraft",
-    "EpistemicInterruptionMonitor",
-    "EpistemicInterruptionResult",
-    "HypothesisAttempt",
-    "HypothesisMaskingGraft",
-    "HypothesisSearchResult",
-    "HypothesisVerdict",
-    "InterruptionEvent",
-    "InterruptionVerdict",
-    "IterativeHypothesisSearch",
-    "ModalityShiftGraft",
-    "SubstrateController",
-    "CognitiveBackgroundWorker",
-    "CognitiveFrame",
-    "DMNConfig",
-    "IntrinsicCue",
-    "SymbolicMemory",
-    "WorkspaceJournal",
-    "TrainableFeatureGraft",
-    "EpisodeAssociationGraph",
-    "merge_epistemic_evidence_dict",
-    "FiniteSCM",
-    "build_frontdoor_scm",
-    "build_simpson_scm",
-    "KVMemoryGraft",
-    "ActiveInferenceTokenGraft",
-    "CoupledActiveInferenceTokenGraft",
-    "CausalEffectTokenGraft",
-    "FeatureVectorGraft",
-    "HuggingFaceBrocaTokenizer",
-    "SQLiteActivationMemory",
-    "LlamaBrocaHost",
-    "load_llama_broca_host",
-    "pick_torch_device",
-    "SPEECH_BRIDGE_PREFIX",
-    "speech_seed_ids",
-    "utterance_words",
-    "EmbeddingProjector",
-    "FrameDimensions",
-    "FramePacker",
-    "HypervectorProjector",
-    "NumericTail",
-    "SubwordProjector",
-    "VSACodebook",
-    "bind",
-    "unbind",
-    "bundle",
-    "permute",
-    "hypervector",
-    "vsa_cosine",
-    "cleanup",
-    "HopfieldAssociativeMemory",
-    "hopfield_update",
-    "derived_inverse_temperature",
-    "VisionEncoder",
-    "ConformalPredictor",
-    "ConformalSet",
-    "OnlineConformalMartingale",
-    "PersistentConformalCalibration",
-    "empirical_coverage",
-    "MultivariateHawkesProcess",
-    "PersistentHawkes",
-    "fit_excitation_em",
-    "GraftMotorTrainer",
-    "MotorLearningConfig",
-    "DirichletPreference",
-    "PersistentPreference",
-    "feedback_polarity_from_text",
-    "OntologicalRegistry",
-    "PersistentOntologicalRegistry",
-    "gram_schmidt_orthogonalize",
-    "pc_algorithm",
-    "build_scm_from_skeleton",
-    "DiscoveredGraph",
-    "local_predicate_cluster",
-    "orient_temporal_edges",
-    "project_rows_to_variables",
-    "TemporalCausalTraceBuilder",
-    "DockerToolSandbox",
-    "SelfImproveConfig",
-    "SelfImproveDockerWorker",
-]
-
-_auto_log = str(os.environ.get("AUTO_CONFIGURE_LAB_LOGGING", "")).strip().lower()
-if _auto_log in {"1", "true"}:
-    configure_lab_logging()
+_registry.auto_configure_logging(__import__(__name__), env_var="AUTO_CONFIGURE_LAB_LOGGING")

@@ -1,4 +1,4 @@
-"""Shared persistence helpers (SQLModel / SQLite)."""
+"""Shared persistence helpers."""
 
 from __future__ import annotations
 

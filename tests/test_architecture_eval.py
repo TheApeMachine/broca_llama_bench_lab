@@ -18,4 +18,3 @@ def test_broca_architecture_eval_writes_metrics(tmp_path: Path, llama_broca_load
         assert 0.0 <= metrics[arm]["speech_exact_accuracy"] <= 1.0
         assert 0.0 <= metrics[arm]["answer_present_accuracy"] <= 1.0
     assert out.exists()
-

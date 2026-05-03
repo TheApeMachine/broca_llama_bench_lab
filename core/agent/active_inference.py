@@ -1,816 +1,174 @@
+"""Compatibility facade for active-inference agents and POMDP builders.
+
+The implementation is split into small composable objects in this package:
+``DistributionMath``, ``CategoricalPOMDP``, active/coupled agents, and POMDP
+builder classes.  This module keeps the historical import surface stable by
+exporting bound methods from :class:`ActiveInferenceFacade` instead of keeping
+logic in module-level functions.
+"""
+
 from __future__ import annotations
 
-import itertools
-import logging
-import math
-import random
-from collections.abc import Iterable
-from dataclasses import dataclass, field
-from typing import Sequence
+from collections.abc import Sequence
+from typing import Any
 
-logger = logging.getLogger(__name__)
-
-
-_EPS = 1e-12
-
-# Cap for ``n_actions ** horizon`` full policy enumeration; above this, :meth:`CategoricalPOMDP.enumerate_policies`
-# logs a warning and returns a lazy ``itertools.product`` iterator instead of a concrete ``list``.
-MAX_POLICY_ENUMERATION = 500_000
-
-
-def normalize(xs: Sequence[float]) -> list[float]:
-    s = float(sum(max(0.0, x) for x in xs))
-    if s <= _EPS:
-        return [1.0 / len(xs) for _ in xs]
-    return [max(0.0, float(x)) / s for x in xs]
+from .active_agent import ActiveInferenceAgent
+from .categorical_pomdp import CategoricalPOMDP
+from .coupled_decision import CoupledDecision
+from .coupled_efe_agent import CoupledEFEAgent
+from .decision import Decision
+from .distribution_math import DistributionMath
+from .policy_evaluation import PolicyEvaluation
+from .pomdp_builder import POMDPBuilder
+from .tiger_door_env import TigerDoorEnv
+from .tiger_episode_runner import TigerEpisodeRunner
+from .tool_foraging_agent import ToolForagingAgent
+from .tool_foraging_builder import ToolForagingPOMDPBuilder
 
 
-def entropy(p: Sequence[float]) -> float:
-    return -sum(float(x) * math.log(max(float(x), _EPS)) for x in p)
+class ActiveInferenceFacade:
+    """Import-preserving surface over the active-inference object graph."""
 
-
-def kl(p: Sequence[float], q: Sequence[float]) -> float:
-    if len(p) != len(q):
-        raise ValueError(f"kl: length mismatch len(p)={len(p)} len(q)={len(q)}; distributions must have the same support size")
-    return sum(float(pi) * (math.log(max(float(pi), _EPS)) - math.log(max(float(qi), _EPS))) for pi, qi in zip(p, q))
-
-
-def softmax_neg(xs: Sequence[float], precision: float = 1.0) -> list[float]:
-    vals = [-precision * float(x) for x in xs]
-    m = max(vals)
-    exps = [math.exp(v - m) for v in vals]
-    z = sum(exps)
-    return [e / z for e in exps]
-
-
-@dataclass
-class PolicyEvaluation:
-    policy: tuple[int, ...]
-    expected_free_energy: float
-    risk: float
-    ambiguity: float
-    epistemic_value: float
-
-
-@dataclass
-class Decision:
-    action: int | None
-    action_name: str
-    qs: list[float]
-    policies: list[PolicyEvaluation]
-    posterior_over_policies: list[float]
-
-
-@dataclass
-class CategoricalPOMDP:
-    """Finite categorical active-inference model.
-
-    A[action][observation][state] = P(o | s, action)
-    B[action][next_state][state] = P(s' | s, action)
-    C[observation] = preferred observation distribution
-    D[state] = prior over hidden states
-    """
-
-    A: list[list[list[float]]]
-    B: list[list[list[float]]]
-    C: list[float]
-    D: list[float]
-    state_names: list[str]
-    action_names: list[str]
-    observation_names: list[str]
-    a_counts: list[list[list[float]]] = field(default_factory=list)
-    b_counts: list[list[list[float]]] = field(default_factory=list)
-
-    def __post_init__(self) -> None:
-        self.D = normalize(self.D)
-        self.C = normalize(self.C)
-        for a in range(len(self.A)):
-            for s in range(len(self.state_names)):
-                col = normalize([self.A[a][o][s] for o in range(len(self.observation_names))])
-                for o, val in enumerate(col):
-                    self.A[a][o][s] = val
-        for a in range(len(self.B)):
-            for s in range(len(self.state_names)):
-                col = normalize([self.B[a][sp][s] for sp in range(len(self.state_names))])
-                for sp, val in enumerate(col):
-                    self.B[a][sp][s] = val
-        if not self.a_counts:
-            self.a_counts = [[[20.0 * self.A[a][o][s] + 1e-3 for s in range(len(self.state_names))] for o in range(len(self.observation_names))] for a in range(len(self.action_names))]
-        if not self.b_counts:
-            self.b_counts = [[[20.0 * self.B[a][sp][s] + 1e-3 for s in range(len(self.state_names))] for sp in range(len(self.state_names))] for a in range(len(self.action_names))]
+    def __init__(self, math: DistributionMath | None = None) -> None:
+        self.math = math or DistributionMath()
+        self.pomdp_builder = POMDPBuilder(math=self.math)
+        self.tool_foraging_builder = ToolForagingPOMDPBuilder(
+            math=self.math,
+            transitions=self.pomdp_builder,
+        )
+        self.tiger_runner = TigerEpisodeRunner()
 
     @property
-    def n_states(self) -> int:
-        return len(self.state_names)
+    def epsilon(self) -> float:
+        return self.math.epsilon
 
     @property
-    def n_actions(self) -> int:
-        return len(self.action_names)
+    def max_policy_enumeration(self) -> int:
+        return CategoricalPOMDP.max_policy_enumeration
 
-    @property
-    def n_observations(self) -> int:
-        return len(self.observation_names)
+    def normalize(self, xs: Sequence[float]) -> list[float]:
+        return self.math.normalize(xs)
 
-    def predict_state(self, qs: Sequence[float], action: int) -> list[float]:
-        out = []
-        for sp in range(self.n_states):
-            out.append(sum(self.B[action][sp][s] * qs[s] for s in range(self.n_states)))
-        return normalize(out)
+    def entropy(self, p: Sequence[float]) -> float:
+        return self.math.entropy(p)
 
-    def observation_distribution(self, qs: Sequence[float], action: int) -> list[float]:
-        out = []
-        for o in range(self.n_observations):
-            out.append(sum(self.A[action][o][s] * qs[s] for s in range(self.n_states)))
-        return normalize(out)
+    def kl(self, p: Sequence[float], q: Sequence[float]) -> float:
+        return self.math.kl(p, q)
 
-    def posterior_after_observation(self, qs_pred: Sequence[float], action: int, obs: int) -> list[float]:
-        numer = [self.A[action][obs][s] * qs_pred[s] for s in range(self.n_states)]
-        return normalize(numer)
+    def softmax_neg(self, xs: Sequence[float], precision: float = 1.0) -> list[float]:
+        return self.math.softmax_neg(xs, precision)
 
-    def ambiguity(self, qs: Sequence[float], action: int) -> float:
-        total = 0.0
-        for s in range(self.n_states):
-            col = [self.A[action][o][s] for o in range(self.n_observations)]
-            total += qs[s] * entropy(col)
-        return total
-
-    def epistemic_value(self, qs_pred: Sequence[float], action: int) -> float:
-        po = self.observation_distribution(qs_pred, action)
-        info = 0.0
-        for o in range(self.n_observations):
-            if po[o] <= _EPS:
-                continue
-            post = self.posterior_after_observation(qs_pred, action, o)
-            info += po[o] * kl(post, qs_pred)
-        return info
-
-    def evaluate_policy(self, policy: Sequence[int], qs: Sequence[float] | None = None) -> PolicyEvaluation:
-        q = list(self.D if qs is None else qs)
-        risk = 0.0
-        ambiguity_value = 0.0
-        epistemic = 0.0
-        for action in policy:
-            q_pred = self.predict_state(q, action)
-            po = self.observation_distribution(q_pred, action)
-            risk += kl(po, self.C)
-            ambiguity_value += self.ambiguity(q_pred, action)
-            epistemic += self.epistemic_value(q_pred, action)
-            q = q_pred
-        G = risk + ambiguity_value - epistemic
-        return PolicyEvaluation(tuple(policy), G, risk, ambiguity_value, epistemic)
-
-    def enumerate_policies(
+    def build_causal_epistemic_pomdp(
         self,
-        horizon: int,
+        scm: Any,
         *,
-        max_policies: int | None = None,
-    ) -> Iterable[tuple[int, ...]]:
-        """Yield all action sequences of length ``horizon``.
-
-        For small problems (``n_actions ** horizon <= max_policies``), returns a
-        concrete list; for larger horizons, logs a warning and returns an
-        ``itertools.product`` iterator so callers can stream without holding
-        every tuple in memory at once. Prefer horizons that keep the count within
-        a few hundred thousand for interactive agents; raise ``horizon`` only
-        when ``n_actions`` is tiny or use custom planners for long horizons.
-
-        ``max_policies`` defaults to :data:`MAX_POLICY_ENUMERATION`.
-        """
-        h = int(horizon)
-        if h < 0:
-            raise ValueError("horizon must be non-negative")
-        na = int(self.n_actions)
-        cap = int(MAX_POLICY_ENUMERATION if max_policies is None else max_policies)
-        if cap < 1:
-            raise ValueError("max_policies must be >= 1")
-        total = na**h if h > 0 else 1
-        prod = itertools.product(range(na), repeat=h)
-        if total > cap:
-            logger.warning(
-                "enumerate_policies: n_actions=%d horizon=%d yields %d policies (>%d); returning iterator not list",
-                na,
-                h,
-                total,
-                cap,
-            )
-            return prod
-        return list(prod)
-
-    def learn_A(self, action: int, obs: int, qs_post: Sequence[float], lr: float = 1.0) -> None:
-        for s, mass in enumerate(qs_post):
-            self.a_counts[action][obs][s] += lr * float(mass)
-        for s in range(self.n_states):
-            col = normalize([self.a_counts[action][o][s] for o in range(self.n_observations)])
-            for o, val in enumerate(col):
-                self.A[action][o][s] = val
-
-    def learn_B(self, action: int, qs_prev: Sequence[float], qs_post: Sequence[float], lr: float = 1.0) -> None:
-        for s, before in enumerate(qs_prev):
-            for sp, after in enumerate(qs_post):
-                self.b_counts[action][sp][s] += lr * float(before) * float(after)
-        for s in range(self.n_states):
-            col = normalize([self.b_counts[action][sp][s] for sp in range(self.n_states)])
-            for sp, val in enumerate(col):
-                self.B[action][sp][s] = val
-
-    def expand_state(self, new_state_name: str, *, qs: Sequence[float], predictive_mass_obs: float) -> list[float]:
-        """Append state; belief steal mass scales with surprise vs discrete-uniform observer baseline."""
-        u = 1.0 / float(max(1, self.n_observations))
-        mass_raw = (u - float(predictive_mass_obs)) / max(u, _EPS)
-        mass = float(min(0.45, max(_EPS * 1000.0, mass_raw)))
-        return self.expand_state_with_mass(new_state_name, qs=qs, mass=mass)
-
-    def expand_state_with_mass(self, new_state_name: str, *, qs: Sequence[float], mass: float = 0.08) -> list[float]:
-        """Low-level grow operator used internally once ``mass`` is already derived."""
-        n = self.n_states
-        na = self.n_actions
-        no = self.n_observations
-        mass = float(max(_EPS * 100, min(0.45, mass)))
-        new_qs = normalize([float(q) * (1.0 - mass) for q in qs] + [mass])
-
-        self.state_names.append(new_state_name)
-
-        for a in range(na):
-            for o in range(no):
-                avg = sum(self.A[a][o]) / max(n, 1)
-                dup = self.A[a][o][n - 1]
-                self.A[a][o].append(0.6 * dup + 0.4 * avg)
-                nv = normalize([self.A[a][o][s] for s in range(n + 1)])
-                for s in range(n + 1):
-                    self.A[a][o][s] = nv[s]
-
-        for a in range(na):
-            for sp in range(n):
-                row = list(self.B[a][sp])
-                row.append(0.5 * row[-1] + 0.5 / (n + 1))
-                self.B[a][sp] = row
-            new_row = normalize([1.0 / (n + 1)] * (n + 1))
-            self.B[a].append(list(new_row))
-            for s in range(n + 1):
-                col = [self.B[a][sp][s] for sp in range(n + 1)]
-                nv = normalize(col)
-                for sp in range(n + 1):
-                    self.B[a][sp][s] = nv[sp]
-
-        self.D = normalize([d * (1.0 - mass) for d in self.D] + [mass])
-
-        for a in range(na):
-            for o in range(no):
-                self.a_counts[a][o].append(20.0 * self.A[a][o][n] + 1e-3)
-            for sp in range(n):
-                self.b_counts[a][sp].append(20.0 * self.B[a][sp][n] + 1e-3)
-            self.b_counts[a].append([20.0 * self.B[a][n][s] + 1e-3 for s in range(n + 1)])
-
-        return new_qs
-
-
-@dataclass
-class ActiveInferenceAgent:
-    """Finite active-inference controller.
-
-    ``learn`` updates the likelihood/transition Dirichlet counts.
-    ``expand_on_surprise`` is deliberately opt-in: true ontological expansion is
-    useful for open-world discovery, but routine low-probability reward/punish
-    observations in a known POMDP should update beliefs rather than invent a new
-    hidden state.
-    """
-
-    pomdp: CategoricalPOMDP
-    horizon: int = 1
-    learn: bool = True
-    qs: list[float] | None = None
-    expand_on_surprise: bool = False
-    _expand_serial: int = field(default=0, repr=False)
-
-    def __post_init__(self) -> None:
-        if self.qs is None:
-            self.qs = list(self.pomdp.D)
-
-    def reset_belief(self) -> None:
-        self.qs = list(self.pomdp.D)
-
-    def decide(self) -> Decision:
-        if self.qs is None:
-            raise RuntimeError(
-                "ActiveInferenceAgent.qs is not initialized; cannot run decide() (evaluate_policy / enumerate_policies require beliefs)."
-            )
-        evals = [self.pomdp.evaluate_policy(pol, self.qs) for pol in self.pomdp.enumerate_policies(self.horizon)]
-        g_vals = [e.expected_free_energy for e in evals]
-        spread = float(max(g_vals) - min(g_vals))
-        precision = (1.0 / max(spread, _EPS)) if spread > _EPS else float(len(evals))
-        posterior = softmax_neg(g_vals, precision)
-        best_index = max(range(len(evals)), key=lambda i: posterior[i])
-        chosen_policy = evals[best_index].policy
-        if not chosen_policy:
-            action: int | None = None
-            action_name = ""
-        else:
-            action = chosen_policy[0]
-            action_name = self.pomdp.action_names[action]
-        min_g = min(g_vals)
-        logger.debug(
-            "ActiveInferenceAgent.decide: action=%s min_G=%.4f n_policies=%d horizon=%d qs=%s",
-            f"{action_name!s}({action})" if action is not None else "none",
-            min_g,
-            len(evals),
-            self.horizon,
-            [round(q, 4) for q in self.qs],
+        treatment: str = "T",
+        outcome: str = "Y",
+        outcome_hit: object = 1,
+    ) -> CategoricalPOMDP:
+        return self.pomdp_builder.build_causal_epistemic(
+            scm,
+            treatment=treatment,
+            outcome=outcome,
+            outcome_hit=outcome_hit,
         )
-        return Decision(action, action_name, list(self.qs), evals, posterior)
 
-    def update(self, action: int, obs: int, lr: float = 1.0) -> list[float]:
-        if self.qs is None:
-            raise RuntimeError("ActiveInferenceAgent.qs is not initialized; cannot run update().")
-        before = list(self.qs)
-        pred = self.pomdp.predict_state(before, action)
-        po = self.pomdp.observation_distribution(pred, action)
-        expanded = False
-        uniform_floor = 1.0 / float(max(1, self.pomdp.n_observations))
-        if self.expand_on_surprise and po[obs] < uniform_floor:
-            label = f"hyp_{self.pomdp.n_states}_{self._expand_serial}"
-            self._expand_serial += 1
-            self.qs = self.pomdp.expand_state(label, qs=before, predictive_mass_obs=float(po[obs]))
-            pred = self.pomdp.predict_state(self.qs, action)
-            expanded = True
-        post = self.pomdp.posterior_after_observation(pred, action, obs)
-        if self.learn:
-            self.pomdp.learn_A(action, obs, post, lr=lr)
-            if not expanded:
-                self.pomdp.learn_B(action, before, post, lr=0.25 * lr)
-        self.qs = post
-        logger.debug(
-            "ActiveInferenceAgent.update: action=%s obs=%d expanded=%s post=%s",
-            self.pomdp.action_names[action],
-            obs,
-            expanded,
-            [round(float(p), 4) for p in post],
-        )
-        return post
+    def identity_transition(self, n_actions: int, n_states: int) -> list[list[list[float]]]:
+        return self.pomdp_builder.identity_transition(n_actions, n_states)
 
+    def derived_listen_channel_reliability(self, *, n_hidden_states: int) -> float:
+        return self.pomdp_builder.listen_channel_reliability(n_hidden_states=n_hidden_states)
 
-@dataclass
-class CoupledDecision:
-    faculty: str
-    action_name: str
-    spatial_decision: Decision
-    causal_decision: Decision
-    spatial_min_G: float
-    causal_min_G: float
+    def build_tiger_pomdp(self) -> CategoricalPOMDP:
+        return self.pomdp_builder.build_tiger()
 
+    def run_episode(
+        self,
+        agent: ActiveInferenceAgent,
+        env: TigerDoorEnv,
+        *,
+        max_steps: int = 3,
+    ) -> tuple[bool, float, list[dict]]:
+        return self.tiger_runner.run(agent, env, max_steps=max_steps)
 
-class CoupledEFEAgent:
-    """Pick the faculty whose minimal one-step Expected Free Energy is lower."""
+    def random_episode(self, env: TigerDoorEnv, *, max_steps: int = 3) -> tuple[bool, float]:
+        return self.tiger_runner.random(env, max_steps=max_steps)
 
-    def __init__(self, spatial: ActiveInferenceAgent, causal: ActiveInferenceAgent):
-        self.spatial = spatial
-        self.causal = causal
+    def tool_foraging_likelihoods(self, *, n_existing_tools: int) -> list[list[list[float]]]:
+        return self.tool_foraging_builder.likelihoods(n_existing_tools=n_existing_tools)
 
-    def decide(self) -> CoupledDecision:
-        ds = self.spatial.decide()
-        dc = self.causal.decide()
-        gs = min(ev.expected_free_energy for ev in ds.policies)
-        gc = min(ev.expected_free_energy for ev in dc.policies)
-        if gs <= gc:
-            logger.debug(
-                "CoupledEFEAgent.decide: faculty=spatial action=%s G_spa=%.4f G_cau=%.4f (spatial wins tie)",
-                ds.action_name,
-                gs,
-                gc,
-            )
-            return CoupledDecision("spatial", ds.action_name, ds, dc, gs, gc)
-        logger.debug(
-            "CoupledEFEAgent.decide: faculty=causal action=%s G_spa=%.4f G_cau=%.4f",
-            dc.action_name,
-            gs,
-            gc,
-        )
-        return CoupledDecision("causal", dc.action_name, ds, dc, gs, gc)
-
-
-def build_causal_epistemic_pomdp(
-    scm,
-    *,
-    treatment: str = "T",
-    outcome: str = "Y",
-    outcome_hit: object = 1,
-) -> CategoricalPOMDP:
-    """POMDP where epistemic actions distinguish observational vs interventional reads.
-
-    Hidden states encode whether the average treatment effect on ``outcome_hit``
-    is non-negative (state 0) or negative (state 1), aligned with an enumerated
-    ``FiniteSCM``. Observational probes are noisier where Simpson-style masking
-    disagrees with do-calculus.
-    """
-    from ..causal import FiniteSCM
-
-    if not isinstance(scm, FiniteSCM):
-        raise TypeError("scm must be a FiniteSCM")
-
-    p_y_do_t1 = scm.probability({outcome: outcome_hit}, given={}, interventions={treatment: 1})
-    p_y_do_t0 = scm.probability({outcome: outcome_hit}, given={}, interventions={treatment: 0})
-
-    p_y_t1 = scm.probability({outcome: outcome_hit}, given={treatment: 1}, interventions={})
-    p_y_t0 = scm.probability({outcome: outcome_hit}, given={treatment: 0}, interventions={})
-    obs_positive_grad = (p_y_t1 - p_y_t0) >= 0.0
-
-    delta_obs = abs(p_y_t1 - p_y_t0)
-    delta_do = abs(p_y_do_t1 - p_y_do_t0)
-    assoc = 0.5 + 0.5 * min(1.0, abs(delta_obs - delta_do))
-    trial = max(assoc, 0.5 + 0.5 * min(1.0, delta_do))
-
-    observe_rows: list[list[float]] = []
-    for obs_idx in range(2):
-        col_over_s: list[float] = []
-        for s in range(2):
-            world_pos = s == 0
-            aligned_read = obs_positive_grad == world_pos
-            p_match = assoc if aligned_read else (1.0 - assoc)
-            col_over_s.append(p_match if obs_idx == 0 else (1.0 - p_match))
-        observe_rows.append(col_over_s)
-
-    trial_rows: list[list[float]] = []
-    for obs_idx in range(2):
-        row: list[float] = []
-        for s in range(2):
-            if obs_idx == 0:
-                row.append(trial if s == 0 else (1.0 - trial))
-            else:
-                row.append((1.0 - trial) if s == 0 else trial)
-        trial_rows.append(row)
-
-    states = ["ate_non_negative", "ate_negative"]
-    actions = ["observe_association", "run_intervention_readout"]
-    observations = ["signal_matches_intervention", "signal_mismatch_intervention"]
-    B = identity_transition(2, 2)
-    margin_do = abs(p_y_do_t1 - p_y_do_t0)
-    c_match = 0.5 + 0.5 * min(1.0, margin_do)
-    C = normalize([c_match, max(_EPS, 1.0 - c_match)])
-    D = [0.5, 0.5]
-    pomdp = CategoricalPOMDP([observe_rows, trial_rows], B, C, D, states, actions, observations)
-    logger.debug(
-        "build_causal_epistemic_pomdp: p_y|do(T=1)=%.4f p_y|do(T=0)=%.4f p_y|T=1=%.4f p_y|T=0=%.4f obs_grad_pos=%s margin_do=%.4f",
-        p_y_do_t1,
-        p_y_do_t0,
-        p_y_t1,
-        p_y_t0,
-        obs_positive_grad,
-        margin_do,
-    )
-    return pomdp
-
-
-def identity_transition(n_actions: int, n_states: int) -> list[list[list[float]]]:
-    return [
-        [[1.0 if sp == s else 0.0 for s in range(n_states)] for sp in range(n_states)]
-        for _ in range(n_actions)
-    ]
-
-
-def derived_listen_channel_reliability(*, n_hidden_states: int) -> float:
-    """Listen diagonal slack tied to latent cardinality (symmetric confusion ~ 1/(2|S|^2))."""
-
-    denom = float(max(1, 2 * int(n_hidden_states) * int(n_hidden_states)))
-    return float(max(0.5 + _EPS, min(1.0 - _EPS, 1.0 - 1.0 / denom)))
-
-
-def build_tiger_pomdp() -> CategoricalPOMDP:
-    states = ["left", "right"]
-    actions = ["listen", "open_left", "open_right"]
-    observations = ["hear_left", "hear_right", "reward", "punish"]
-    r = derived_listen_channel_reliability(n_hidden_states=len(states))
-    # A[action][obs][state]
-    listen = [
-        [r, 1.0 - r],       # hear_left
-        [1.0 - r, r],       # hear_right
-        [0.0, 0.0],         # reward
-        [0.0, 0.0],         # punish
-    ]
-    open_left = [
-        [0.0, 0.0],
-        [0.0, 0.0],
-        [1.0, 0.0],         # reward if treasure (safe door) is left — matches TigerDoorEnv.open_left (s==0)
-        [0.0, 1.0],
-    ]
-    open_right = [
-        [0.0, 0.0],
-        [0.0, 0.0],
-        [0.0, 1.0],         # reward if treasure (safe door) is right — matches TigerDoorEnv.open_right (s==1)
-        [1.0, 0.0],
-    ]
-    B = identity_transition(3, 2)
-    # Preferences: reward is strongly preferred; punishment is strongly avoided;
-    # hearing observations are acceptable but not goals.
-    C = [0.30, 0.30, 0.68, 0.02]
-    D = [0.5, 0.5]
-    return CategoricalPOMDP([listen, open_left, open_right], B, C, D, states, actions, observations)
-
-
-class TigerDoorEnv:
-    """Noisy listen/open environment for active-inference experiments."""
-
-    def __init__(self, seed: int = 0):
-        self.reliability = derived_listen_channel_reliability(n_hidden_states=2)
-        self.rng = random.Random(seed)
-        self.hidden_state = 0
-
-    def reset(self) -> int:
-        self.hidden_state = 0 if self.rng.random() < 0.5 else 1
-        return self.hidden_state
-
-    def step(self, action_name: str) -> tuple[str, float, bool]:
-        s = self.hidden_state
-        if action_name == "listen":
-            if self.rng.random() < self.reliability:
-                obs = "hear_left" if s == 0 else "hear_right"
-            else:
-                obs = "hear_right" if s == 0 else "hear_left"
-            return obs, -0.01, False
-        if action_name == "open_left":
-            return ("reward", 1.0, True) if s == 0 else ("punish", -2.0, True)
-        if action_name == "open_right":
-            return ("reward", 1.0, True) if s == 1 else ("punish", -2.0, True)
-        raise KeyError(action_name)
-
-
-def run_episode(agent: ActiveInferenceAgent, env: TigerDoorEnv, *, max_steps: int = 3) -> tuple[bool, float, list[dict]]:
-    pomdp = agent.pomdp
-    env.reset()
-    agent.reset_belief()
-    trace = []
-    total = 0.0
-    success = False
-    for _ in range(max_steps):
-        d = agent.decide()
-        if d.action is None:
-            raise ValueError(
-                "run_episode: agent.decide() returned no action (empty policy); "
-                "use horizon >= 1 for TigerDoorEnv episodes."
-            )
-        obs_name, reward, done = env.step(d.action_name)
-        if obs_name not in pomdp.observation_names:
-            raise ValueError(
-                f"run_episode: unexpected observation name {obs_name!r}; "
-                f"allowed {list(pomdp.observation_names)}"
-            )
-        obs = pomdp.observation_names.index(obs_name)
-        post = agent.update(d.action, obs)
-        logger.debug(
-            "run_episode: action=%s -> obs=%s reward=%.2f done=%s",
-            d.action_name,
-            obs_name,
-            reward,
-            done,
-        )
-        total += reward
-        if obs_name == "reward":
-            success = True
-        trace.append(
-            {
-                "action": d.action_name,
-                "observation": obs_name,
-                "reward": reward,
-                "posterior": {name: round(float(p), 3) for name, p in zip(pomdp.state_names, post)},
-            }
-        )
-        if done:
-            break
-    return success, total, trace
-
-
-def random_episode(env: TigerDoorEnv, *, max_steps: int = 3) -> tuple[bool, float]:
-    env.reset()
-    total = 0.0
-    success = False
-    for _ in range(max_steps):
-        # Let random act in the same action space, including the possibility of wasting a listen.
-        action = env.rng.choice(["listen", "open_left", "open_right"])
-        obs, reward, done = env.step(action)
-        total += reward
-        success = success or obs == "reward"
-        if done:
-            break
-    return success, total
-
-
-# ---------------------------------------------------------------------------
-# Tool foraging POMDP — when to synthesize a new native tool
-# ---------------------------------------------------------------------------
-
-
-TOOL_FORAGING_STATES: tuple[str, ...] = ("knowledge_sufficient", "knowledge_insufficient")
-TOOL_FORAGING_ACTIONS: tuple[str, ...] = (
-    "use_existing_tool",
-    "explore_memory",
-    "synthesize_tool",
-)
-TOOL_FORAGING_OBSERVATIONS: tuple[str, ...] = ("info_gained", "info_stagnant")
-
-
-def _tool_foraging_likelihoods(*, n_existing_tools: int) -> list[list[list[float]]]:
-    """Construct A[action][observation][state] for the tool-foraging POMDP.
-
-    The likelihood table is parameterized by ``n_existing_tools`` so existing
-    tools genuinely lower the perceived ambiguity of the
-    ``use_existing_tool`` action: with no tools at all, "use_existing_tool"
-    becomes nearly useless, and the maths automatically inflates the
-    epistemic value of ``synthesize_tool``.
-    """
-
-    n = max(0, int(n_existing_tools))
-    # Coverage saturates as more tools accumulate; one tool already gives ~0.5.
-    coverage = 1.0 - 1.0 / (1.0 + n)  # 0.0 at n=0, 0.5 at n=1, 0.66 at n=2, →1.0
-
-    p_use_gain_suff = max(0.5 + _EPS, 0.5 + 0.45 * coverage)  # capped well below 1.0
-    p_use_gain_insuff = 0.20  # insufficient knowledge → existing tool rarely helps
-
-    p_explore_gain_suff = 0.55  # already know the answer; memory adds little
-    p_explore_gain_insuff = 0.40  # might find context, but not the missing equation
-
-    p_synth_gain_suff = 0.30  # wasted effort when nothing was missing
-    p_synth_gain_insuff = 0.85  # builds the missing equation; large information gain
-
-    return [
-        [  # use_existing_tool
-            [p_use_gain_suff, p_use_gain_insuff],
-            [1.0 - p_use_gain_suff, 1.0 - p_use_gain_insuff],
-        ],
-        [  # explore_memory
-            [p_explore_gain_suff, p_explore_gain_insuff],
-            [1.0 - p_explore_gain_suff, 1.0 - p_explore_gain_insuff],
-        ],
-        [  # synthesize_tool
-            [p_synth_gain_suff, p_synth_gain_insuff],
-            [1.0 - p_synth_gain_suff, 1.0 - p_synth_gain_insuff],
-        ],
-    ]
-
-
-def build_tool_foraging_pomdp(
-    *,
-    n_existing_tools: int = 0,
-    insufficient_prior: float = 0.5,
-) -> CategoricalPOMDP:
-    """POMDP whose minimal-EFE action chooses *when to synthesize a new tool*.
-
-    The agent prefers ``info_gained`` over ``info_stagnant``.  When the
-    belief leans toward ``knowledge_insufficient`` and few tools exist, the
-    Expected Free Energy of ``synthesize_tool`` drops below the alternatives
-    — so the substrate is *mathematically forced* to grow itself a new
-    sensory organ rather than continue churning over an empty memory.
-
-    Args:
-        n_existing_tools:
-            How many native tools are currently registered.  Higher numbers
-            make ``use_existing_tool`` more reliable (lower ambiguity) and
-            therefore raise the bar for choosing ``synthesize_tool``.
-        insufficient_prior:
-            Initial belief mass on ``knowledge_insufficient``.  The
-            substrate should pass a higher value when its DMN reports high
-            epistemic uncertainty (e.g. the unified agent's normalized
-            policy posterior entropy).
-    """
-
-    pi = float(max(_EPS, min(1.0 - _EPS, insufficient_prior)))
-    A = _tool_foraging_likelihoods(n_existing_tools=int(n_existing_tools))
-    B = identity_transition(len(TOOL_FORAGING_ACTIONS), len(TOOL_FORAGING_STATES))
-    # We strongly prefer "info_gained"; "info_stagnant" is only mildly tolerable.
-    C = normalize([0.85, 0.15])
-    D = normalize([1.0 - pi, pi])
-    pomdp = CategoricalPOMDP(
-        list(A),
-        list(B),
-        list(C),
-        list(D),
-        list(TOOL_FORAGING_STATES),
-        list(TOOL_FORAGING_ACTIONS),
-        list(TOOL_FORAGING_OBSERVATIONS),
-    )
-    logger.debug(
-        "build_tool_foraging_pomdp: n_tools=%d insufficient_prior=%.4f coverage_signal=%.4f",
-        int(n_existing_tools),
-        pi,
-        1.0 - 1.0 / (1.0 + int(max(0, n_existing_tools))),
-    )
-    return pomdp
-
-
-def extend_pomdp_with_synthesize_tool(
-    pomdp: CategoricalPOMDP,
-    *,
-    n_existing_tools: int = 0,
-) -> CategoricalPOMDP:
-    """Return a new POMDP with the original action space *plus* ``synthesize_tool``.
-
-    Used when an existing causal/spatial POMDP needs to gain the
-    tool-synthesis option without rebuilding from scratch.  The new action
-    inherits the original transition/likelihood shapes (states unchanged)
-    and adds rows derived from :func:`_tool_foraging_likelihoods`.
-
-    Note: the original POMDP is not mutated; a new instance is returned.
-    """
-
-    n_states = pomdp.n_states
-    n_actions = pomdp.n_actions + 1
-    n_obs = pomdp.n_observations
-
-    # Build likelihood for the new action: spread mass across observations such that
-    # for each existing state, prefer the *highest-mass observation* of any existing
-    # action (i.e., synthesizing reproduces "the best known sensor" once it succeeds).
-    new_a_obs_by_state: list[list[float]] = []
-    coverage = 1.0 - 1.0 / (1.0 + int(max(0, n_existing_tools)))
-    for s in range(n_states):
-        # Find each observation's max likelihood across existing actions for this state.
-        per_obs = [
-            max(pomdp.A[a][o][s] for a in range(pomdp.n_actions))
-            for o in range(n_obs)
-        ]
-        # Synthesizing succeeds with at least the existing best, scaled by an exploration boost.
-        boosted = [(0.5 + 0.5 * coverage) * x + (1.0 - (0.5 + 0.5 * coverage)) * (1.0 / n_obs) for x in per_obs]
-        new_a_obs_by_state.append(boosted)
-    new_A_action = [[new_a_obs_by_state[s][o] for s in range(n_states)] for o in range(n_obs)]
-
-    A_new: list[list[list[float]]] = [
-        [[pomdp.A[a][o][s] for s in range(n_states)] for o in range(n_obs)]
-        for a in range(pomdp.n_actions)
-    ]
-    A_new.append(new_A_action)
-
-    B_new: list[list[list[float]]] = [
-        [[pomdp.B[a][sp][s] for s in range(n_states)] for sp in range(n_states)]
-        for a in range(pomdp.n_actions)
-    ]
-    # New action keeps the state space stationary (synthesizing a tool changes the
-    # *model*, not the latent world state — so the transition is identity).
-    B_new.append([[1.0 if sp == s else 0.0 for s in range(n_states)] for sp in range(n_states)])
-
-    return CategoricalPOMDP(
-        A_new,
-        B_new,
-        list(pomdp.C),
-        list(pomdp.D),
-        list(pomdp.state_names),
-        list(pomdp.action_names) + ["synthesize_tool"],
-        list(pomdp.observation_names),
-    )
-
-
-@dataclass
-class ToolForagingAgent:
-    """Active-inference agent specialised for the synthesize_tool decision.
-
-    Wraps an :class:`ActiveInferenceAgent` over :func:`build_tool_foraging_pomdp`
-    and exposes a single method, :meth:`should_synthesize`, that returns
-    ``True`` when the EFE-minimising action is ``synthesize_tool``.  This is
-    the entry point the DMN calls during idle ticks.
-    """
-
-    pomdp: CategoricalPOMDP
-    agent: ActiveInferenceAgent = field(init=False)
-
-    def __post_init__(self) -> None:
-        self.agent = ActiveInferenceAgent(self.pomdp, horizon=1, learn=False)
-
-    @classmethod
-    def build(
-        cls,
+    def build_tool_foraging_pomdp(
+        self,
         *,
         n_existing_tools: int = 0,
         insufficient_prior: float = 0.5,
-    ) -> "ToolForagingAgent":
-        return cls(
-            pomdp=build_tool_foraging_pomdp(
-                n_existing_tools=int(n_existing_tools),
-                insufficient_prior=float(insufficient_prior),
-            )
+    ) -> CategoricalPOMDP:
+        return self.tool_foraging_builder.build(
+            n_existing_tools=n_existing_tools,
+            insufficient_prior=insufficient_prior,
         )
 
-    def update_belief(self, *, insufficient_prior: float) -> None:
-        """Set the prior over ``knowledge_insufficient`` ahead of the next decision."""
+    def extend_pomdp_with_synthesize_tool(
+        self,
+        pomdp: CategoricalPOMDP,
+        *,
+        n_existing_tools: int = 0,
+    ) -> CategoricalPOMDP:
+        return self.pomdp_builder.with_synthesize_tool(
+            pomdp,
+            n_existing_tools=n_existing_tools,
+        )
 
-        pi = float(max(_EPS, min(1.0 - _EPS, insufficient_prior)))
-        self.pomdp.D = normalize([1.0 - pi, pi])
-        self.agent.qs = list(self.pomdp.D)
 
-    def decide(self) -> Decision:
-        return self.agent.decide()
+_FACADE = ActiveInferenceFacade()
+_EPS = _FACADE.epsilon
+MAX_POLICY_ENUMERATION = _FACADE.max_policy_enumeration
+TOOL_FORAGING_STATES = ToolForagingPOMDPBuilder.states
+TOOL_FORAGING_ACTIONS = ToolForagingPOMDPBuilder.actions
+TOOL_FORAGING_OBSERVATIONS = ToolForagingPOMDPBuilder.observations
 
-    def should_synthesize(self) -> bool:
-        d = self.decide()
-        return d.action_name == "synthesize_tool"
+normalize = _FACADE.normalize
+entropy = _FACADE.entropy
+kl = _FACADE.kl
+softmax_neg = _FACADE.softmax_neg
+build_causal_epistemic_pomdp = _FACADE.build_causal_epistemic_pomdp
+identity_transition = _FACADE.identity_transition
+derived_listen_channel_reliability = _FACADE.derived_listen_channel_reliability
+build_tiger_pomdp = _FACADE.build_tiger_pomdp
+run_episode = _FACADE.run_episode
+random_episode = _FACADE.random_episode
+_tool_foraging_likelihoods = _FACADE.tool_foraging_likelihoods
+build_tool_foraging_pomdp = _FACADE.build_tool_foraging_pomdp
+extend_pomdp_with_synthesize_tool = _FACADE.extend_pomdp_with_synthesize_tool
 
-    def observe(self, action_name: str, observation_name: str, *, lr: float = 1.0) -> list[float]:
-        """Update belief after seeing a real-world observation, e.g. ``info_gained`` or ``info_stagnant``."""
-
-        an = str(action_name)
-        on = str(observation_name)
-        if an not in self.pomdp.action_names:
-            raise ValueError(
-                f"observe: unknown action_name {an!r}; valid actions: {list(self.pomdp.action_names)}"
-            )
-        if on not in self.pomdp.observation_names:
-            raise ValueError(
-                f"observe: unknown observation_name {on!r}; valid observations: {list(self.pomdp.observation_names)}"
-            )
-        a = self.pomdp.action_names.index(an)
-        o = self.pomdp.observation_names.index(on)
-        return self.agent.update(a, o, lr=lr)
+__all__ = [
+    "ActiveInferenceAgent",
+    "ActiveInferenceFacade",
+    "CategoricalPOMDP",
+    "CoupledDecision",
+    "CoupledEFEAgent",
+    "Decision",
+    "DistributionMath",
+    "MAX_POLICY_ENUMERATION",
+    "POMDPBuilder",
+    "PolicyEvaluation",
+    "TOOL_FORAGING_ACTIONS",
+    "TOOL_FORAGING_OBSERVATIONS",
+    "TOOL_FORAGING_STATES",
+    "TigerDoorEnv",
+    "TigerEpisodeRunner",
+    "ToolForagingAgent",
+    "ToolForagingPOMDPBuilder",
+    "build_causal_epistemic_pomdp",
+    "build_tiger_pomdp",
+    "build_tool_foraging_pomdp",
+    "derived_listen_channel_reliability",
+    "entropy",
+    "extend_pomdp_with_synthesize_tool",
+    "identity_transition",
+    "kl",
+    "normalize",
+    "random_episode",
+    "run_episode",
+    "softmax_neg",
+]

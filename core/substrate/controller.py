@@ -12,22 +12,7 @@ from typing import Any, Callable, Mapping, Optional, Sequence
 
 import torch
 
-from ..comprehension import DeferredRelationIngest
-from ..comprehension.pipeline import ComprehensionPipeline
-from ..cognition.intent_gate import UtteranceIntent
-from ..cognition.observation import CognitiveObservation
-from ..dmn import CognitiveBackgroundWorker, DMNConfig
-from ..encoders.affect import AffectState
-from ..frame import CognitiveFrame, ParsedClaim
-from ..generation import PlanForcedGenerator
-from ..grafting.dynamic_grafts import CapturedActivationMode
-from ..host.hf_tokenizer_compat import HuggingFaceBrocaTokenizer
-from ..host.llama_broca_host import LlamaBrocaHost, load_llama_broca_host
-from ..idletime.chunking import CompiledMacro
-from ..idletime.macro_adapter import MacroAdapter
-from ..natives.native_tools import NativeTool
 from ..numeric import Probability
-from .facades import SubstrateRuntime
 
 
 logger = logging.getLogger(__name__)
@@ -82,6 +67,16 @@ class SubstrateController:
     @property
     def background_worker(self) -> CognitiveBackgroundWorker | None:
         return self.session.background_worker
+
+    @property
+    def _self_improve_worker(self) -> Any:
+        """Compatibility view for older callers; lifecycle state lives in session."""
+
+        return self.session.self_improve_worker
+
+    @_self_improve_worker.setter
+    def _self_improve_worker(self, worker: Any) -> None:
+        self.session.self_improve_worker = worker
 
     def deferred_relation_ingest_online(self) -> bool:
         return self.runtime.deferred_relations.is_online()
@@ -147,6 +142,8 @@ class SubstrateController:
         self.runtime.comprehension.remember_declarative_binding(out, utterance)
 
     def _frame_from_observation(self, observation: CognitiveObservation) -> CognitiveFrame:
+        from ..comprehension.pipeline import ComprehensionPipeline
+
         return ComprehensionPipeline.frame_from_observation(observation)
 
     def _commit_observation(self, observation: CognitiveObservation) -> CognitiveFrame:
@@ -207,6 +204,8 @@ class SubstrateController:
         )
 
     def macro_speech_features(self, macro: CompiledMacro) -> torch.Tensor:
+        from ..idletime.macro_adapter import MacroAdapter
+
         return MacroAdapter.speech_features(macro)
 
     def synthesize_activation_mode(self, **kwargs: Any) -> CapturedActivationMode:
@@ -258,9 +257,13 @@ class SubstrateController:
         self.runtime.comprehension.intrinsic_scan(toks)
 
     def _non_actionable_frame(self, intent: UtteranceIntent, affect: AffectState) -> CognitiveFrame:
+        from ..comprehension.pipeline import ComprehensionPipeline
+
         return ComprehensionPipeline.non_actionable_frame(intent, affect)
 
     def _attach_perception(self, frame: CognitiveFrame, intent: UtteranceIntent, affect: AffectState) -> None:
+        from ..comprehension.pipeline import ComprehensionPipeline
+
         ComprehensionPipeline.attach_perception(frame, intent, affect)
 
     def comprehend(self, utterance: str) -> CognitiveFrame:
@@ -286,6 +289,8 @@ class SubstrateController:
     def speak(self, frame: CognitiveFrame) -> str:
         plan_words = frame.speech_plan()
         broca_features = self.broca_features_from_frame(frame)
+        from ..generation import PlanForcedGenerator
+
         text, token_ids, inertia = PlanForcedGenerator.generate(
             self.host,
             self.tokenizer,

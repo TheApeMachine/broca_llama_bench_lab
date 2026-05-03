@@ -1,41 +1,66 @@
 from __future__ import annotations
 
-from sqlalchemy import Column, Index, LargeBinary
-from sqlmodel import Field, SQLModel
+from dataclasses import dataclass
+from typing import ClassVar
 
 
-class ActivationMemory(SQLModel, table=True):
-    """SQLite row for :class:`~core.memory.memory.SQLiteActivationMemory`."""
+@dataclass(slots=True)
+class ActivationMemory:
+    """Plain row object for persisted activation-memory entries."""
 
-    __tablename__ = "activation_memory"
-    __table_args__ = (Index("idx_activation_namespace_kind", "namespace", "kind"),)
-
-    id: int | None = Field(default=None, primary_key=True)
     namespace: str
     kind: str
     dim: int
-    key_blob: bytes = Field(sa_column=Column(LargeBinary, nullable=False))
-    value_blob: bytes = Field(sa_column=Column(LargeBinary, nullable=False))
+    key_blob: bytes
+    value_blob: bytes
     metadata_json: str
     confidence: float
-    access_count: int = Field(default=0)
     created_at: float
     updated_at: float
+    id: int | None = None
+    access_count: int = 0
 
-
-class ActivationAssociation(SQLModel, table=True):
-    """Directed edge keyed by unordered pair `(lo, hi)` with ``lo < hi``.
-
-    Mirrors the legacy composite primary key and covering indexes used by raw SQL.
+    table_name: ClassVar[str] = "activation_memory"
+    create_statement: ClassVar[str] = """
+        CREATE TABLE IF NOT EXISTS activation_memory (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            namespace TEXT NOT NULL,
+            kind TEXT NOT NULL,
+            dim INTEGER NOT NULL,
+            key_blob BLOB NOT NULL,
+            value_blob BLOB NOT NULL,
+            metadata_json TEXT NOT NULL,
+            confidence REAL NOT NULL,
+            access_count INTEGER NOT NULL DEFAULT 0,
+            created_at REAL NOT NULL,
+            updated_at REAL NOT NULL
+        )
     """
-
-    __tablename__ = "activation_association"
-    __table_args__ = (
-        Index("idx_activation_assoc_lo", "lo"),
-        Index("idx_activation_assoc_hi", "hi"),
+    index_statements: ClassVar[tuple[str, ...]] = (
+        "CREATE INDEX IF NOT EXISTS idx_activation_namespace_kind ON activation_memory(namespace, kind)",
     )
 
-    lo: int = Field(primary_key=True)
-    hi: int = Field(primary_key=True)
+
+@dataclass(slots=True)
+class ActivationAssociation:
+    """Plain row object for symmetric activation co-occurrence weights."""
+
+    lo: int
+    hi: int
     weight: float
     updated_at: float
+
+    table_name: ClassVar[str] = "activation_association"
+    create_statement: ClassVar[str] = """
+        CREATE TABLE IF NOT EXISTS activation_association (
+            lo INTEGER NOT NULL,
+            hi INTEGER NOT NULL,
+            weight REAL NOT NULL,
+            updated_at REAL NOT NULL,
+            PRIMARY KEY (lo, hi)
+        )
+    """
+    index_statements: ClassVar[tuple[str, ...]] = (
+        "CREATE INDEX IF NOT EXISTS idx_activation_assoc_lo ON activation_association(lo)",
+        "CREATE INDEX IF NOT EXISTS idx_activation_assoc_hi ON activation_association(hi)",
+    )

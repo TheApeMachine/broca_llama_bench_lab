@@ -1,8 +1,0 @@
-benchmark,passed,score,n_trials,duration_seconds
-semantic_memory_fidelity,True,1.0,100,0.011307001113891602
-
-detail_key,detail_value
-avg_confidence_error,0.0
-correct_recalls,100
-n_triples,100
-recall_rate,1.0

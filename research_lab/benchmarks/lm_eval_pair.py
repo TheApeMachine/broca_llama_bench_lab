@@ -208,5 +208,3 @@ def run_paired_lm_eval(
     pair["delta_host_parity_minus_baseline"] = deltas
 
     return _write_pair_json(pair, out_dir)
-
-

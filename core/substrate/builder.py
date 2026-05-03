@@ -127,7 +127,7 @@ class SubstrateBuilder:
         if preload is None:
             import torch
 
-            from . import controller as substrate_mod
+            from ..cognition import substrate as substrate_mod
 
             resolved_device = (
                 device if isinstance(device, torch.device) else pick_torch_device(device)

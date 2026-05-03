@@ -1,7 +1,0 @@
-benchmark,passed,score,n_trials,duration_seconds
-hopfield_retrieval_accuracy,True,0.7125,160,0.0317387580871582
-
-detail_key,detail_value
-d_model,256
-per_store_size,"{""10"": {""accuracy"": 1.0, ""avg_cosine"": 1.0, ""n_queries"": 10, ""correct"": 10}, ""50"": {""accuracy"": 0.72, ""avg_cosine"": 0.7402, ""n_queries"": 50, ""correct"": 36}, ""100"": {""accuracy"": 0.84, ""avg_cosine"": 0.8485, ""n_queries"": 50, ""correct"": 42}, ""500"": {""accuracy"": 0.52, ""avg_cosine"": 0.5783, ""n_queries"": 50, ""correct"": 26}}"
-store_sizes_tested,"[10, 50, 100, 500]"

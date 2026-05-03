@@ -1,6 +1,0 @@
-benchmark,passed,score,n_trials,duration_seconds
-vsa_algebraic_fidelity,True,1.0,150,0.07339811325073242
-
-detail_key,detail_value
-dims_tested,"[1000, 5000, 10000]"
-per_dimensionality,"{""1000"": {""accuracy"": 1.0, ""avg_cosine"": 0.5095, ""n_triples"": 50, ""correct"": 50}, ""5000"": {""accuracy"": 1.0, ""avg_cosine"": 0.5003, ""n_triples"": 50, ""correct"": 50}, ""10000"": {""accuracy"": 1.0, ""avg_cosine"": 0.5012, ""n_triples"": 50, ""correct"": 50}}"

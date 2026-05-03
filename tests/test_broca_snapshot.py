@@ -121,4 +121,3 @@ def test_snapshot_includes_last_chat_meta_when_set(tmp_path: Path, fake_host_loa
     assert snap["last_chat"] is not None
     assert snap["last_chat"]["intent"] == "memory_lookup"
     assert snap["last_chat"]["bias_token_count"] == 3
-

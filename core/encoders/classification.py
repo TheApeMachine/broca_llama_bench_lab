@@ -5,8 +5,6 @@ from __future__ import annotations
 import time
 from typing import Any, Sequence
 
-from transformers import AutoTokenizer
-
 from ..workspace import WorkspacePublisher
 from .base import BaseEncoder, EncoderOutput
 
@@ -33,6 +31,7 @@ class SemanticClassificationEncoder(BaseEncoder):
 
     def _load_model(self) -> None:
         from gliclass import GLiClassModel, ZeroShotClassificationPipeline
+        from transformers import AutoTokenizer
 
         self._model = GLiClassModel.from_pretrained(self._model_id)
         self._processor = AutoTokenizer.from_pretrained(self._model_id)
@@ -149,4 +148,3 @@ class SemanticClassificationEncoder(BaseEncoder):
                 axis_out[str(label)] = float(raw_axis[label])
             out[str(axis)] = axis_out
         return out
-

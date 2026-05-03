@@ -17,4 +17,3 @@ class Frontend(Protocol):
         not require swallowing exceptions).
         """
         ...
-
