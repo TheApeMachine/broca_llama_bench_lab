@@ -87,10 +87,13 @@ class HypothesisSynthesizer:
 
     def _synthesize_conjunction(self, a: str, b: str, name: str) -> Any:
         lo, hi = sorted((a, b))
+        # Tool functions follow the SCM equation contract: ``fn(values: dict) -> object``
+        # with parent values keyed by name. The sandbox / SCM evaluator calls
+        # ``fn(vals)`` with a single mapping argument, never positional args.
         source = textwrap.dedent(
             f"""
-            def {name}({lo}, {hi}):
-                return 1 if (int({lo}) == 1 and int({hi}) == 1) else 0
+            def {name}(values):
+                return 1 if (int(values[{lo!r}]) == 1 and int(values[{hi!r}]) == 1) else 0
             """
         ).strip()
         sample_inputs: Sequence[dict] = (
