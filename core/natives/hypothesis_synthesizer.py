@@ -87,11 +87,14 @@ class HypothesisSynthesizer:
 
     def _synthesize_conjunction(self, a: str, b: str, name: str) -> Any:
         lo, hi = sorted((a, b))
+        # NativeToolRegistry.verify / SCM callables use ``fn(values: dict)`` —
+        # a single mapping argument — not positional parents.
         source = textwrap.dedent(
-            f"""
-            def {name}({lo}, {hi}):
-                return 1 if (int({lo}) == 1 and int({hi}) == 1) else 0
-            """
+            f'''
+            def {name}(values):
+                v = dict(values)
+                return 1 if (int(v[{repr(lo)}]) == 1 and int(v[{repr(hi)}]) == 1) else 0
+            '''
         ).strip()
         sample_inputs: Sequence[dict] = (
             {lo: 0, hi: 0},
