@@ -11,7 +11,8 @@ from ..calibration.invariants import ConformalInvariants
 from ..causal.invariants import SCMInvariants
 from ..contracts import InvariantReport, InvariantViolation
 from .capabilities import CapabilityReport
-from .manifest import RuntimeManifest, manifest_for_profile
+from .manifest import RuntimeManifest
+from .profiles import manifest_for_profile
 
 
 @dataclass(frozen=True)

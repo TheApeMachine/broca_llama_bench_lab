@@ -39,10 +39,7 @@ class SubstrateWorkingMemory:
                 f"SubstrateWorkingMemory.write: vector last dim must be {self.dim}, got {vector.shape[-1]}"
             )
 
-        # SWM slots participate in VSA bind/bundle with :class:`VSACodebook` atoms,
-        # which are materialized on CPU. Keeping workspace vectors on CPU avoids
-        # mps:0 vs cpu mixed-device fft/matmul when encoders run on Metal.
-        flat = vector.detach().to(dtype=torch.float32).cpu().view(-1).contiguous()
+        flat = vector.detach().to(dtype=torch.float32).view(-1).contiguous()
 
         with self._lock:
             self._tick += 1

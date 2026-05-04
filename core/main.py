@@ -102,6 +102,18 @@ def _cmd_health(argv: list[str]) -> None:
     run_health_cli(argv)
 
 
+def _cmd_audit(argv: list[str]) -> None:
+    from .kernel.cli import run_audit_cli
+
+    run_audit_cli(argv)
+
+
+def _cmd_validate(argv: list[str]) -> None:
+    from .kernel.cli import run_validate_cli
+
+    run_validate_cli(argv)
+
+
 _COMMANDS: dict[str, tuple[str, Handler]] = {
     "chat": ("Streaming terminal chat (full stack; same substrate as chat-tui).", _cmd_chat),
     "chat-tui": ("Textual chat dashboard.", _cmd_chat_tui),
@@ -115,6 +127,8 @@ _COMMANDS: dict[str, tuple[str, Handler]] = {
     "manifest": ("Print declared runtime manifest/profile.", _cmd_manifest),
     "graph": ("Print declared runtime dependency graph.", _cmd_graph),
     "health": ("Build or statically inspect runtime health and invariants.", _cmd_health),
+    "audit": ("Print implementation-readiness gaps for a runtime profile.", _cmd_audit),
+    "validate": ("Run model-free math and implementation validation suites.", _cmd_validate),
 }
 
 

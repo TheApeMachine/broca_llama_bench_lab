@@ -14,7 +14,7 @@ import torch
 
 from core.cognition.intent_gate import UtteranceIntent
 from core.cognition.observation import CognitiveObservation
-from core.comprehension import DeferredRelationIngest
+from core.comprehension.deferred_relation_ingest import DeferredRelationIngest
 from core.dmn.background_worker import CognitiveBackgroundWorker
 from core.dmn.config import DMNConfig
 from core.encoders.affect import AffectState
@@ -25,8 +25,8 @@ from core.host.llama_broca_host import LlamaBrocaHost
 from core.idletime.chunking import CompiledMacro
 from core.natives.native_tools import NativeTool
 
-from .facades import SubstrateRuntime
 from ..numeric import Probability
+from .facades import SubstrateRuntime
 
 
 logger = logging.getLogger(__name__)

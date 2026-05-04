@@ -3,12 +3,10 @@
 from __future__ import annotations
 
 import argparse
-import sys
-from typing import Any
-
 from .capabilities import CapabilityReport
 from .builder import KernelBuilder
-from .manifest import PROFILE_BUILDERS, manifest_for_profile
+from .profiles import PROFILE_BUILDERS, manifest_for_profile
+from ..validation import ImplementationAuditor, StaticMathValidation
 
 
 def _profile_arg(parser: argparse.ArgumentParser) -> None:
@@ -96,4 +94,40 @@ def run_health_cli(argv: list[str] | None = None) -> None:
         raise SystemExit(1)
 
 
-__all__ = ["run_graph_cli", "run_health_cli", "run_manifest_cli"]
+def run_audit_cli(argv: list[str] | None = None) -> None:
+    parser = argparse.ArgumentParser(description="Print implementation-readiness gaps for a runtime profile.")
+    _profile_arg(parser)
+    parser.add_argument("--json", action="store_true", help="Emit JSON instead of text.")
+    args = parser.parse_args(argv or [])
+    scorecard = ImplementationAuditor().audit(args.profile)
+    if args.json:
+        print(scorecard.to_json(), flush=True)
+    else:
+        print("\n".join(scorecard.table_lines()), flush=True)
+
+
+def run_validate_cli(argv: list[str] | None = None) -> None:
+    parser = argparse.ArgumentParser(description="Run model-free validation suites for Mosaic math contracts.")
+    parser.add_argument(
+        "--no-tiger-metric",
+        action="store_true",
+        help="Skip the small active-vs-random Tiger POMDP smoke metric.",
+    )
+    parser.add_argument("--json", action="store_true", help="Emit JSON instead of text.")
+    args = parser.parse_args(argv or [])
+    report = StaticMathValidation.run(include_tiger_metric=not args.no_tiger_metric)
+    if args.json:
+        print(report.to_json(), flush=True)
+    else:
+        print("\n".join(report.table_lines()), flush=True)
+    if report.status == "fail":
+        raise SystemExit(1)
+
+
+__all__ = [
+    "run_audit_cli",
+    "run_graph_cli",
+    "run_health_cli",
+    "run_manifest_cli",
+    "run_validate_cli",
+]

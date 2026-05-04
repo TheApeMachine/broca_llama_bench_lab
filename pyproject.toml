@@ -48,9 +48,9 @@ testpaths = ["tests"]
 pythonpath = ["."]
 markers = [
     "real_encoders: opt out of automatic encoder stubbing; the test must load the real ExtractionEncoder / AffectEncoder model weights",
-    "slow: long-running tests excluded from fast default runs",
-    "integration: tests that require multiple runtime subsystems",
-    "real_model: tests that download or load real model weights",
+    "slow: tests that are too slow for the default fast unit-test lane",
+    "integration: tests that require multiple runtime subsystems or external services",
+    "real_model: tests that load real model weights",
     "benchmark: benchmark harness tests",
-    "security: sandbox and security-boundary tests",
+    "security: sandbox or adversarial security tests",
 ]

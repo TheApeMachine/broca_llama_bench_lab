@@ -6,7 +6,8 @@ import json
 from dataclasses import dataclass, field
 from typing import Any
 
-from .manifest import FacultySpec, RuntimeManifest, manifest_for_profile
+from .manifest import FacultySpec, RuntimeManifest
+from .profiles import manifest_for_profile
 
 
 @dataclass(frozen=True)

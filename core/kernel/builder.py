@@ -8,7 +8,8 @@ from typing import Any
 from .capabilities import CapabilityReport
 from .ablations import LegacyAblationApplier
 from .health import SystemHealth
-from .manifest import RuntimeManifest, manifest_for_profile
+from .manifest import RuntimeManifest
+from .profiles import manifest_for_profile
 
 
 @dataclass(frozen=True)
